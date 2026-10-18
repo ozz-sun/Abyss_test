@@ -415,7 +415,7 @@ class CudaContextLost(unittest.TestCase):
     """An ERR naming a sticky CUDA error ends the engine (2026-10-19: V4.1 past 16K tokens, then 125 empty answers)."""
 
     def test_classification(self):
-        from server import cuda_context_lost
+        from serve.server import cuda_context_lost
         self.assertTrue(cuda_context_lost("glm token completion: an illegal memory access was encountered"))
         self.assertTrue(cuda_context_lost("glm lending copies: unspecified launch failure"))
         self.assertFalse(cuda_context_lost("the prompt (70000 tokens) is longer than the context"))
