@@ -131,6 +131,20 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
 
+# CUDA errors after which the context is unusable: every later launch fails the same way, so an ERR with one of
+# these means the engine is as good as dead (2026-10-19: a DeepSeek V4.1 chat's 16,385th token -> "an illegal memory
+# access was encountered", then 125 answers of 0 tokens until the server was restarted by hand)
+CUDA_CONTEXT_LOST = ("illegal memory access", "unspecified launch failure", "illegal instruction", "misaligned address",
+                     "invalid address space", "invalid program counter", "launch timeout", "device-side assert",
+                     "uncorrectable ecc", "hardware stack error", "context is destroyed", "invalid pc")
+
+
+def cuda_context_lost(message: str) -> bool:
+    """Whether an engine's ERR line names a CUDA error that ends its context (the process stays up, useless)."""
+    m = message.lower()
+    return any(k in m for k in CUDA_CONTEXT_LOST)
+
+
 def client_stop_strings(req: dict | None) -> list[str]:
     """A request's own stop strings: OpenAI's "stop" (a string or a list) or Anthropic's "stop_sequences" (from
     Strata #454 - they were ignored, so a client that relied on them got text past its marker)."""
@@ -557,7 +571,11 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    msg = line[4:].strip()
+                    if cuda_context_lost(msg):          # its GPU context is gone: end it, the next request restarts it
+                        self._end(f"the engine's CUDA context is lost ({msg}); ending it")
+                        raise EngineDied(f"the engine's CUDA context is lost: {msg}")
+                    raise ValueError(msg)
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
@@ -593,7 +611,11 @@ class StrataEngine:
             if got.startswith(expect):
                 return got.strip()
             if got.startswith("ERR"):
-                raise ValueError(got[4:].strip())
+                msg = got[4:].strip()
+                if cuda_context_lost(msg):
+                    self._end(f"the engine's CUDA context is lost ({msg}); ending it")
+                    raise EngineDied(f"the engine's CUDA context is lost: {msg}")
+                raise ValueError(msg)
 
     def wrap(self):
         """The server is stopping: a request still thinking closes its reasoning at the next token and answers."""

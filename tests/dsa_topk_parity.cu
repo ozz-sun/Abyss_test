@@ -41,17 +41,22 @@ static std::vector<int> reference(const std::vector<float>& s, int top, int kpoo
 }
 
 int main() {
-    const int kpool = 4, top_max = 512;
     std::mt19937 rng(7);
-    const int sizes[] = {1, 2, 7, 511, 512, 513, 1000, 2000, 7500, 12288, 12289, 16000, 65536, 250000};
+    // DeepSeek V4's indexer (512 pools of 4 cells) and V4.1's candidate blocks (up to 2048 blocks, 1 a pool: the
+    // selection past 16K tokens that wrote out of range before 2026-10-19), with a width between
+    const int configs[][2] = {{4, 512}, {1, 1025}, {1, 2048}};   // {kpool, top_max}
+    const int sizes[] = {1, 2, 7, 511, 512, 513, 1000, 1024, 1025, 2000, 2047, 2048, 2049, 7500, 12288, 12289, 16000,
+                         65536, 250000};
     const char* kinds[] = {"random", "ties", "constant", "negative"};
     float* d_s = nullptr;
     int* d_c = nullptr;
     cudaMalloc(&d_s, 250000 * sizeof(float));
-    cudaMalloc(&d_c, top_max * kpool * sizeof(int));
+    cudaMalloc(&d_c, 2048 * 4 * sizeof(int));
     int bad = 0, cases = 0;
-    for (int n : sizes)
+    for (const auto& cfg : configs)
+      for (int n : sizes)
         for (int kind = 0; kind < 4; ++kind) {
+            const int kpool = cfg[0], top_max = cfg[1];
             std::vector<float> s(n);
             std::uniform_real_distribution<float> u(0.0f, 10.0f);
             std::uniform_int_distribution<int> q(0, 6);
@@ -68,10 +73,11 @@ int main() {
             const bool ok = e == cudaSuccess && got == reference(s, top, kpool);
             ++cases;
             bad += !ok;
-            if (!ok) std::printf("MISMATCH n=%d %s (%s)\n", n, kinds[kind], cudaGetErrorString(e));
+            if (!ok) std::printf("MISMATCH top %d kpool %d n=%d %s (%s)\n", top_max, kpool, n, kinds[kind], cudaGetErrorString(e));
         }
     std::printf("parity: %d of %d cases match the rank order\n", cases - bad, cases);
     // time at the context sizes of a chat: pools = context / 4
+    const int kpool = 4, top_max = 512;
     cudaEvent_t a, b;
     cudaEventCreate(&a);
     cudaEventCreate(&b);

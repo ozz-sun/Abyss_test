@@ -7,6 +7,24 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.32 - 2026-10-19
+
+**DeepSeek V4.1 crashed on the 16,385th token of a chat; the server now restarts an engine whose CUDA context is
+lost.** Found by a swe-bench run: a 15K-token reasoning ended in `an illegal memory access was encountered` (Xid 13,
+an out-of-range address), and the 125 attempts after it came back empty.
+- **The cause**: the DSA top-k selection (`dsa_topk.cuh`, shared with DeepSeek V4's indexer, which takes 512 pools)
+  held 1,024 winners, and V4.1's candidate blocks ask for up to 2,048 (`cand_blocks`, blocks of 8 tokens). Past 8K
+  tokens (more than 1,024 blocks) the selection ran from corrupt ranks - a quality loss nothing reported; past 16K
+  (2,048 winners among more blocks) it wrote the selection out of range, and every later launch failed the same way.
+  The winners' arrays now hold 2,048 and the rank and output loops cover them; the parity test runs the V4.1 widths
+  (1,025 and 2,048 winners, up to 250K pools: 228 of 228 cases match the reference order). Reproduced and fixed with
+  24,005 tokens through the decode path (crashed at 16,384 before; 24.9 ms/token after). DeepSeek V4 KL 0.005939 and
+  GLM-5.3-Flash S-v2 0.000000 unchanged (their selections take 512 or fewer).
+- **serve**: an engine `ERR` naming a CUDA error that ends the context (illegal memory access, unspecified launch
+  failure, device-side assert, ...) now ends the engine process, and the next request starts it again (as after a
+  crash, issue #27) instead of every request failing until someone restarts the server. The streamed error event is
+  unchanged (`{"error": {"type": "server_error", ...}}`, then `[DONE]`).
+
 ## v1.3.31 - 2026-10-18
 
 **The iGPU lane's multi-second stalls are gone, and a disk-landed expert reaches VRAM while the SSD is still

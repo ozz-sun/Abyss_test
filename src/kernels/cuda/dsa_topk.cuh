@@ -24,7 +24,13 @@ __device__ __forceinline__ unsigned score_key(float f) {
 }
 
 
-// cells[r * kpool + m] = p * kpool + m for the top `top` pools p of sc[0, n_vis) in rank order; 1 <= top <= 1024,
+// the most pools a call may select: DeepSeek V4's indexer takes 512 (2048 cells / 4), V4.1's candidate blocks 2048
+// (cand_blocks, 1 a pool).  Before 2026-10-19 the winners' arrays held 1024: V4.1 past 8K tokens (more blocks than
+// that) selected from corrupt ranks, and past 16K (top = 2048 with blocks left over) wrote the selection out of
+// range - an illegal address on the 16,385th token of every chat
+constexpr int kMaxTop = 2048;
+
+// cells[r * kpool + m] = p * kpool + m for the top `top` pools p of sc[0, n_vis) in rank order; 1 <= top <= kMaxTop,
 // top <= n_vis, blockDim.x == 1024.  Every thread of the block must call it.  (static: each kernel file that includes
 // this gets its own copy - an external symbol would be defined twice at link time)
 static __device__ void select_top_pools(const float* __restrict__ sc, int n_vis, int top, int kpool, int* __restrict__ cells) {
@@ -34,8 +40,8 @@ static __device__ void select_top_pools(const float* __restrict__ sc, int n_vis,
     __shared__ unsigned s_prefix, s_mask, s_eq_all;
     __shared__ int s_need, s_ngt, s_neq;
     __shared__ int s_eq[NT];
-    __shared__ unsigned long long s_win[NT];
-    __shared__ unsigned short s_rank[2][NT];
+    __shared__ unsigned long long s_win[kMaxTop];
+    __shared__ unsigned short s_rank[2][kMaxTop];
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     if (tid == 0) {
         s_prefix = 0u;
@@ -156,18 +162,20 @@ static __device__ void select_top_pools(const float* __restrict__ sc, int n_vis,
                 for (int j = j0; j < j1; ++j) r += s_win[j] > v;
                 s_rank[half][i] = (unsigned short) r;
             }
-        } else if (tid < top) {
-            const unsigned long long v = s_win[tid];
-            int r = 0;
-            for (int j = 0; j < top; ++j) r += s_win[j] > v;
-            s_rank[0][tid] = (unsigned short) r;
-            s_rank[1][tid] = 0;
+        } else {                                      // up to kMaxTop: a thread takes the winners tid, tid + NT, ...
+            for (int w = tid; w < top; w += NT) {
+                const unsigned long long v = s_win[w];
+                int r = 0;
+                for (int j = 0; j < top; ++j) r += s_win[j] > v;
+                s_rank[0][w] = (unsigned short) r;
+                s_rank[1][w] = 0;
+            }
         }
     }
     __syncthreads();
-    if (tid < top) {
-        const int r = s_rank[0][tid] + s_rank[1][tid];
-        const int p = (int) ~(unsigned) (s_win[tid] & 0xffffffffull);
+    for (int w = tid; w < top; w += NT) {
+        const int r = s_rank[0][w] + s_rank[1][w];
+        const int p = (int) ~(unsigned) (s_win[w] & 0xffffffffull);
         for (int m = 0; m < kpool; ++m) cells[r * kpool + m] = p * kpool + m;
     }
 }
