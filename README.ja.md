@@ -2,14 +2,14 @@
 
 # Abyss
 
-**284B の MoE モデル DeepSeek V4 Flash を、家庭用の GPU 1 枚で動かす。**
+**MoE モデルの DeepSeek V4 Flash（284B）と V4.1 Flash（1017）を、家庭用の GPU 1 枚で動かす。**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 ![CUDA](https://img.shields.io/badge/CUDA-13.x-76B900?logo=nvidia&logoColor=white)
 ![ROCm](https://img.shields.io/badge/ROCm-7%20(experimental)-ED1C24?logo=amd&logoColor=white)
 ![GPU](https://img.shields.io/badge/tested-RTX%205090%20%C2%B7%20RTX%203090%20%C2%B7%20Radeon%208060S-76B900)
-![Model](https://img.shields.io/badge/model-DeepSeek--V4--Flash-4D6BFE)
+![Model](https://img.shields.io/badge/model-DeepSeek--V4%20%2F%20V4.1--Flash-4D6BFE)
 [![Release](https://img.shields.io/github/v/release/zephel01/Abyss?label=release)](https://github.com/zephel01/Abyss/releases)
 
 [English](README.md) · **日本語**
@@ -25,20 +25,26 @@ Abyss は [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Fla
 動かす。よく使うエキスパートを VRAM に、次に使うものを pinned RAM に、残りを NVMe SSD に置き、会話に合わせて入れ替える。
 ブラウザのチャットと、OpenAI / Anthropic 互換の API（思考とツール呼び出しに対応）が、すべて手元のマシンだけで動く。
 
+**新しく対応: [DeepSeek V4.1 Flash（1017）](docs/deepseek41/README.md)**（v1.3.29〜1.3.32）— RTX 5090 + RAM 94 GB + NVMe と
+nazeshinjite の Q2 GGUF で、生成は SSD だけの下位エキスパートを省く設定で約 28 tok/s（省かなければ 17.7）、swe-bench の
+コーディング問題を通しで 51.6 tok/s。366 GB のうち約 200 GB は Engram の表で、SSD から行単位で読む。エキスパートも約 43% は
+SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPEC.md)。
+
 > [!NOTE]
 > Abyss は [Project Maya](https://github.com/mw00/project-maya) をコピーして作ったフォークで、Maya は
-> [Strata](https://github.com/Niko1221/Strata) から生まれたプロジェクト。Maya のエンジンに DeepSeek V4 への対応を足した。
+> [Strata](https://github.com/Niko1221/Strata) から生まれたプロジェクト。Maya のエンジンに DeepSeek V4 と V4.1 への対応を足した。
 > [クレジット](#-クレジット)を参照。
 
 ## ✨ 特長
 
 - **284B の MoE を GPU 1 枚で** — 層ごとに 256 個あるエキスパートを VRAM・pinned RAM・SSD に分けて置く。どれを先に載せるかは使い方から学ぶ
-- **生成は llama.cpp の約 3 倍、prompt の読み込みは約 5 倍**（同じ GGUF・同じマシン。llama.cpp は `-ncmoe` で調整した状態。エキスパートを CPU に置いた llama.cpp と比べると 10 倍以上）。prompt は約 1,600〜3,300 tok/s、生成は約 82〜84 tok/s
+- **DeepSeek V4.1 Flash にも対応** — 層ごとに 384 個のエキスパート、共有の圧縮 KV スロット、Engram の n-gram 表。表は GGUF から 1 トークン 48 行だけ読む。載りきらないエキスパートは SSD から読みながら VRAM に流し込む
+- **生成は llama.cpp の約 3 倍、prompt の読み込みは約 5 倍**（同じ GGUF・同じマシン。llama.cpp は `-ncmoe` で調整した状態。エキスパートを CPU に置いた llama.cpp と比べると 10 倍以上）。prompt は約 1,600〜3,300 tok/s、生成は約 92〜95 tok/s
 - **長いコンテキストでも落ちない** — lightning indexer と prompt の attention を tensor core で計算する。125K トークンの prompt を約 2,800 tok/s で読み、125K でも生成は約 65 tok/s
 - **AMD APU の内蔵 GPU を 2 本目のレーンに** — Ryzen AI Max では Radeon の内蔵 GPU が RAM 層のエキスパートをその場で計算する。生成でも prompt でも使う（ROCm。起動時に CPU より速ければ使う）
 - **ドラフトモデルなしの投機デコード** — prompt や応答に出てきた並び（n-gram）を候補にして、次のトークンと一緒に 1 回で確かめる。出力は同じで、コードで +10〜13%。既定でオン
 - **llama.cpp と照合済み** — 3,000 トークンで次トークンの的中率が同じ（KL 0.009）
-- **DeepSeek V4 のアテンションを全部実装** — スライディングウィンドウ、CSA/HCA 圧縮 KV、インデクサの top-512、sinks
+- **DeepSeek V4 / V4.1 のアテンションを全部実装** — スライディングウィンドウ、CSA/HCA 圧縮 KV（V4.1 は 4 つの共有スロットと 16K 超の候補ブロック）、インデクサの top-512、sinks
 - **思考とツール呼び出し** — 思考レベル `none` / `low` / `high` / `max`、DeepSeek の DSML 形式のツール呼び出し（同時呼び出しも可）
 - **OpenAI / Anthropic 互換 API** と、エキスパートの配置をリアルタイムで見られるブラウザのダッシュボード
 - **複数 GPU、AMD、V100** — NVIDIA の複数カードに層を分けて載せる。Radeon 向けの HIP ビルド（試験的）、CUDA 12 での sm_70 ビルド
@@ -47,13 +53,15 @@ Abyss は [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Fla
 ## 📊 性能
 
 unsloth の [DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) `UD-Q2_K_XL`
-（96.8 GB）、RTX 5090（32 GB、PCIe Gen4 x4）+ Ryzen AI Max+ 395（RAM 94 GB、iGPU レーンあり）、Linux、Abyss v1.3.16。
-llama.cpp（`bed0a8566`）は同じマシン・同じファイルで、いちばん速い設定（`-ngl 99 -ncmoe 32`）:
+（96.8 GB）、RTX 5090（32 GB、PCIe Gen4 x4）+ Ryzen AI Max+ 395（RAM 94 GB、iGPU レーンあり）、Linux。生成の行は
+Abyss v1.3.21〜1.3.27、prompt と 125K の行は v1.3.16〜1.3.18。llama.cpp（`bed0a8566`）は同じマシン・同じファイルで、
+いちばん速い設定（`-ngl 99 -ncmoe 32`）:
 
 | | Abyss | llama.cpp |
 | --- | :---: | :---: |
 | 生成（1,024 トークンの応答、文章 / コード） | **約 92〜95 tok/s** | 28〜30 tok/s |
 | 生成（swe-bench のコーディング問題 16 問 × 3、通し） | **約 100 tok/s** | – |
+| 生成（swe-bench のコーディング問題 60 問 × 5、通し） | **約 107 tok/s**（1 問 100.5〜114.5、60 問中 59 問解決） | – |
 | 生成（コンテキスト 125K トークン） | **約 65 tok/s** | – |
 | prompt（8K トークン） | **約 1,630〜1,760 tok/s** | 78（ubatch 512）〜 660（ubatch 8192） |
 | prompt（32K トークン） | **約 3,100〜3,270 tok/s** | – |
@@ -71,11 +79,31 @@ attention の射影を Q5_K にした「軽い dense pack」（マニュアル�
 | 構成 | 生成 | prompt 8K / 32K |
 | --- | :---: | :---: |
 | RTX 3090（USB4 ケース、約 3.8 GB/s）+ iGPU レーン | 約 49 tok/s | 約 690 / 約 1,010 tok/s |
-| RTX 5090 + RTX 3090（層を 27 / 16 に分割）+ iGPU レーン | 約 55〜57 tok/s | 約 1,500 / 約 1,990 tok/s |
+| RTX 5090 + RTX 3090（層を 33 / 10 に分割、`STRATA_GLM_SPLIT_KEEP=1`）+ iGPU レーン | 約 87〜90 tok/s | 約 1,420〜1,510 / 約 2,270〜2,350 tok/s |
 | Radeon 8060S 単体（HIP ビルド。エキスパートの一部は SSD から） | – | 7K の prompt 約 150 tok/s |
 
-遅い 2 枚目を足しても、今のところ RTX 5090 1 枚 + iGPU レーンには届かない。カード間の受け渡しと遅いリンクのコストが、
-RAM 層から減るエキスパートの分を上回る（投機デコードは v1.3.26 から分割時も使える）。
+遅い 2 枚目を足しても、RTX 5090 1 枚 + iGPU レーンには届かない。生成は 2 枚を順番に通るので、3090 の層（5090 の 1.64 倍
+遅い）の時間が、増えた VRAM で減る RAM 層の待ちを上回る。v1.3.25 からは `--layer-split auto` がこれを測り、
+`STRATA_GLM_SPLIT_KEEP=1` がなければ 5090 だけで動く（94〜95 tok/s）。投機デコードと prestage は v1.3.26 / v1.3.27 から
+分割時も使える。
+
+</details>
+
+<details>
+<summary><b>DeepSeek V4.1 Flash（1017）</b></summary>
+
+同じマシン、nazeshinjite の [Q2 GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)（366 GB）、
+RAM 層 60 GB、モデルは NVMe（3.4 GB/s）、Abyss v1.3.31:
+
+| | 生成 | 品質（量子化前の 1017 に対する KL、top-1 一致） |
+| --- | :---: | :---: |
+| SSD だけの 4〜6 位を省く（`STRATA_GLM_TAIL_SKIP=3` + `_DISK=1`） | 約 28 tok/s（1 トークン 35.9 ms、held-out の 8 本） | 0.241、78.9% |
+| ルーティングどおり | 17.7 tok/s | 0.229、79.2% |
+| swe-bench、60 問 × 5 のうち最初の 35 問（省く設定） | 通しで 51.6 tok/s、35 問中 34 問解決 | （DeepSeek V4 Flash: 107.2 tok/s、35 問） |
+
+速さは 1 トークンに SSD から読むエキスパートの数で決まる。ほとんど読まない回答は 65〜75 tok/s。60 問の実行は、v1.3.32 で
+直した 16K のバグで 35 問目に止まったので、測り直している。詳しくは
+[docs/deepseek41/README.md](docs/deepseek41/README.md)。
 
 </details>
 
@@ -119,7 +147,7 @@ curl http://127.0.0.1:8082/v1/chat/completions -H 'Content-Type: application/jso
 | OS | Linux（Ubuntu で確認） |
 | GPU | NVIDIA: RTX 5090 32 GB と RTX 3090 で測定。V100 は CUDA 12 でビルドできる（実機は未確認）。AMD Radeon は HIP で試験的に対応: Radeon 8060S で動作、単体カードは未確認 |
 | メモリ | 全エキスパートをメモリに置くには VRAM + RAM が約 100 GB 以上（少なくても SSD から読んで動く） |
-| ディスク | 空き約 100 GB の NVMe SSD |
+| ディスク | 空き約 100 GB の NVMe SSD（DeepSeek V4.1 は約 370 GB。速いほどよい） |
 | ツール | CUDA 13.x（`nvcc`。V100 は 12.9）、g++、Python 3.10 以上。AMD APU の iGPU レーンと AMD ビルドには ROCm 7（`hipcc`） |
 
 ## 🧠 しくみ
@@ -143,6 +171,31 @@ RAM 層のものはその場で計算する（APU の内蔵 GPU があればそ�
 トークンと一緒に確かめる。
 詳しくは [docs/deepseek4/PORT.md](docs/deepseek4/PORT.md)、計算の仕様は [docs/deepseek4/SPEC.md](docs/deepseek4/SPEC.md)。
 
+### DeepSeek V4.1 で変わるところ
+
+V4.1 Flash も同じ経路で動く。新しい部分と違う部分は次のとおり（[V4.1 の仕様](docs/deepseek41/SPEC.md)）:
+
+| | V4 Flash | V4.1 Flash（1017） |
+| --- | --- | --- |
+| 形 | 43 層、隠れ 4096、エキスパート 256 | 40 層、隠れ 5120、エキスパート 384（6 個を選ぶ） |
+| 圧縮 KV | 圧縮する層がそれぞれ自分で圧縮（比率 4 か 128） | 層 2 / 8 / 14 / 20 が 4 つの共有スロットに書き（比率 2 か 1）、ほかの層はそれを読む |
+| インデクサ | 比率 4 の層すべて、64 ヘッド | 8 つのインデックス層、32 ヘッド。間の層はその top-512 を使い回す。16K 超は候補ブロックで絞る |
+| hyper-connection | 同じ副層の `pre`、ゲートつきの head | 1 つ前の副層の `pre`、head のテンソルなし |
+| ルーター | 層 0〜2 はトークン ID で決める | すべての層でバイアスつき top-6 |
+| Engram | - | 2〜4-gram をハッシュした行（表 2 本、各約 101 GB）を層 1 と 14 の前に足す |
+
+```mermaid
+flowchart LR
+    T[トークン] --> E["Engram のハッシュ<br/>1 トークン 48 行"]
+    E -->|pread| G[("GGUF の表<br/>SSD 上に約 200 GB")]
+    G --> L1["層 1 / 14<br/>+ ゲートつきの n-gram 行"]
+    T --> L1
+    L1 --> S["KV ソース層 2 / 8 / 14 / 20<br/>4 つの共有スロットに書く"]
+    S --> RD["読む側の層<br/>スロットと top-512 を使い回す"]
+    RD --> M{"ルーター<br/>384 個から 6 個"}
+    M --> TI["VRAM / RAM / SSD の層<br/>SSD の読みは VRAM へ流し込む"]
+```
+
 ## ✅ 正しさの確認
 
 同じ GGUF で、llama.cpp の logits と比べた（`tools/dsv4_logits_dump.cpp`）:
@@ -152,6 +205,7 @@ RAM 層のものはその場で計算する（APU の内蔵 GPU があればそ�
 | 3,000 トークンの文書 | KL 0.009 · top-1 一致 94.5% · 次トークン的中率 60.35%（llama.cpp も 60.35%）· 位置が進んでもずれは増えない |
 | まとめ処理で 2,499 トークン → 500 トークン | KL 0.006 · top-1 一致 95.2% |
 | トークナイザー（`joyai-llm`） | `llama-tokenize` と同じ ID |
+| DeepSeek V4.1 Flash（1017）、llama.cpp の V4.1 PR と同じ GGUF、1,023 位置 | 量子化前の 1017 に対する KL 0.639（llama.cpp: 0.636）· nll 2.653（2.661） |
 
 速度の変更はすべて同じ方法で確かめ直している（リリースごとの KL は[更新履歴](CHANGELOG.md)）。tensor core のカーネルは
 FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークンずつの処理と同じ logits を返す。
@@ -164,22 +218,27 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 | [更新履歴](CHANGELOG.md) | 各リリースの内容と測定結果 |
 | [移植の記録](docs/deepseek4/PORT.md) | Abyss が足したものと、その確認方法 |
 | [仕様](docs/deepseek4/SPEC.md) | 実装した DeepSeek V4 の計算 |
+| [DeepSeek V4.1](docs/deepseek41/README.md) | V4.1 Flash（1017）: 読める GGUF、pack、動かし方、品質と速さ、設定（英語） |
+| [V4.1 の仕様](docs/deepseek41/SPEC.md) | V4 の計算から V4.1 で変わる点と、Abyss での実装箇所（英語） |
 | [Maya のドキュメント](docs/maya/README.md) | Maya の文書をそのまま残したもの: GLM-5.3-Flash、インストーラ（`./abyss.sh`）、チューニング、AMD、複数 GPU |
 
 ## 🗺️ ロードマップ
 
 - [x] DeepSeek V4 Flash: 1 トークンずつの処理、まとめ処理、会話の再利用
+- [x] DeepSeek V4.1 Flash（1017）: 1 トークンずつの処理、まとめ処理、会話の再利用、SSD から読む Engram
+- [x] DeepSeek V4.1 の 16K 超（候補ブロック、v1.3.32）、SSD の読みを VRAM へ流し込む転送（v1.3.31）
 - [x] 思考レベル、DSML のツール呼び出し、OpenAI / Anthropic 互換 API
 - [x] コマンド 1 つのセットアップと `Abyss-tools`
 - [x] iGPU レーン（Ryzen AI Max）。生成と prompt の両方
 - [x] 文章自体から候補を作る投機デコード（n-gram）。既定でオン
 - [x] 長いコンテキスト: indexer と prompt の attention を tensor core で（125K まで確認）
-- [x] NVIDIA の複数 GPU（層の分割。RTX 5090 + RTX 3090 で測定）
+- [x] NVIDIA の複数 GPU（層の分割。投機デコードと prestage も。RTX 5090 + RTX 3090 で測定）
 - [x] AMD（HIP、試験的）: Radeon 8060S で WMMA カーネルを使って動作
 - [x] V100（sm_70）を CUDA 12 でビルド
 - [ ] DSpark のドラフトモデル（この GGUF には MTP ブロックがない）
 - [ ] 会話のディスク保存
-- [ ] DeepSeek V4 での Windows（確認したのは Linux）
+- [ ] DeepSeek V4 での Windows（確認したのは Linux。RX 7900 XT でのコミュニティビルドは [AMD HIP](docs/maya/AMD_HIP.md)）
+- [ ] DeepSeek V4.1: 投機デコード（MTP / DSpark のドラフト）、prompt の attention のまとめ処理、層の分割、コマンド 1 つのセットアップ、SSD の読みを減らす（追い出し方の見直し、SSD から届いたエキスパートを lane で計算）
 - [ ] 複数カードでの速度: 分割時の prompt（ここでは RTX 5090 1 枚より 30% 遅い）、V100 の実機、単体の Radeon
 - [ ] 短い prompt のまとめ処理の調整（8K では RAM 層のエキスパートを GPU に送る時間が大半）
 
@@ -188,10 +247,12 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 Abyss は **[Project Maya](https://github.com/mw00/project-maya)**（MIT、mw00 とコントリビューター）をコピーして作った
 フォークで、Maya は **[Strata](https://github.com/Niko1221/Strata)**（MIT、Niko1221 と Strata のコントリビューター）から
 生まれた。Maya の GLM-5.3-Flash の実行部、エキスパートの配置、まとめ処理、サーバー、ダッシュボードはそのまま使い、そこに
-DeepSeek V4（llama.cpp の `deepseek4` アーキテクチャ）を GLM-5.3-Flash と並べて足した。Maya の README と文書は
+DeepSeek V4（llama.cpp の `deepseek4` アーキテクチャ）と V4.1（`deepseek41`）を GLM-5.3-Flash と並べて足した。Maya の README と文書は
 [docs/maya/](docs/maya/README.md) に残している。DeepSeek V4 の計算は [llama.cpp](https://github.com/ggml-org/llama.cpp) の
-実装に、量子化モデルは [unsloth](https://huggingface.co/unsloth) のものに拠っている。すべてに感謝する。
+実装に、量子化モデルは [unsloth](https://huggingface.co/unsloth) のものに拠っている。V4.1 の移植は antirez の DwarfStar（ds4）と
+llama.cpp の V4.1 プルリクエストに拠り、GGUF は nazeshinjite と mrfakename のもの、品質の基準は Lucebox の held-out セット。
+すべてに感謝する。
 
 ## 📄 ライセンス
 
-Maya・Strata と同じく MIT — [LICENSE](LICENSE)。モデルの重みはそれぞれのライセンスに従う（DeepSeek V4: MIT）。
+Maya・Strata と同じく MIT — [LICENSE](LICENSE)。モデルの重みはそれぞれのライセンスに従う（DeepSeek V4: MIT。V4.1 はモデルカードを確認）。

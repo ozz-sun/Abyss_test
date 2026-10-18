@@ -6,6 +6,9 @@ router + expert tiers (VRAM / pinned RAM / disk, CPU lane), the shared expert, t
 Maya's; the attention mixer, the routing function, the head and the packaging are new. The math is in
 [SPEC.md](SPEC.md) (transcribed from llama.cpp `src/models/deepseek4.cpp`).
 
+DeepSeek V4.1 Flash (`deepseek41`, v1.3.29) is a third architecture on the same path; what it changes and where is in
+[../deepseek41/SPEC.md](../deepseek41/SPEC.md), how to run it in [../deepseek41/README.md](../deepseek41/README.md).
+
 ## What is new
 
 | Piece | Where |
@@ -46,14 +49,15 @@ inside the 3000-token test.
 
 ## Speed (same machine; all 11008 experts fit VRAM 23 GB + pinned RAM 70 GB, warm-up 21 s)
 
-RTX 5090 on PCIe Gen4 x4 + Ryzen AI Max+ 395 (the Radeon 8060S as the iGPU lane), Abyss v1.3.16. llama.cpp
+RTX 5090 on PCIe Gen4 x4 + Ryzen AI Max+ 395 (the Radeon 8060S as the iGPU lane). Decode rows: Abyss v1.3.21-1.3.27
+with the Q5_K attention pack; prompt and 125K rows: v1.3.16-1.3.18 with the GGUF as published. llama.cpp
 `bed0a8566` on the same file: its best settings (`-ngl 99 -ncmoe 32 -lm none`), and with every expert on the CPU
 (`-ot exps=CPU`, the v1.0 comparison).
 
 | | Abyss | llama.cpp (`-ncmoe 32`) | llama.cpp (`-ot exps=CPU`) |
 | --- | :---: | :---: | :---: |
-| Decode, 1,024-token answers (prose / code, greedy) | ~82-84 tok/s (v1.2: 73, v1.1: 56-57, v1.0: 48) | 28-30 tok/s | 5-7 tok/s |
-| Decode, swe-bench coding prompts (sampled) | ~94 tok/s over 13 prompts (v1.2: 66, 78 with spec; v1.1: 51) | - | 5-7 tok/s |
+| Decode, 1,024-token answers (prose / code, greedy) | ~92-95 tok/s (v1.3.16: 82-84, v1.2: 73, v1.1: 56-57, v1.0: 48) | 28-30 tok/s | 5-7 tok/s |
+| Decode, swe-bench coding tasks (sampled, end to end) | ~107 tok/s over 60 tasks x 5, ~100 over 16 x 3 (v1.3.16: ~94 over 13 prompts; v1.2: 66, 78 with spec; v1.1: 51) | - | 5-7 tok/s |
 | Decode at a 125K-token context | ~65 tok/s | 28-30 to 32K | - |
 | Prompt, 8K tokens (server, second run) | ~1,630-1,760 tok/s (v1.1: ~1,000-1,090 at 5.6K; v1.0: ~690) | 78 (ubatch 512) - 660 (ubatch 8192) | 3-6 tok/s |
 | Prompt, 32K / 125K tokens | ~3,100-3,270 / ~2,800 tok/s (v1.3.1: 1,720 / 1,010) | - | - |
@@ -80,6 +84,12 @@ How it got there (each step's measurement and its KL check are in [CHANGELOG.md]
 - **v1.3.12-1.3.16:** Maya v1.1.7's sampler and CPU-row speedups, far fewer VRAM/RAM tier swaps (the 8 MB copies
   stalled the route over PCIe), the shared expert after the route so the lane's request goes out earlier, and a
   survey of the rest (23 candidates measured): decode 67-77 -> 82-84 tok/s, prompts +3-7%.
+- **v1.3.18-1.3.23:** the Q6_K GEMV split over 4 warps, the attention projections re-quantized to Q5_K (KL 0.0119,
+  the same swe-bench quality, the default pack), the token boundary without the copy engines (zero-copy), and the
+  opt-in expert deferral (`STRATA_GLM_DEFER=1`, +12-15% at KL 0.08): decode 82-84 -> 92-95 tok/s, swe-bench ~100.
+- **v1.3.24-1.3.27:** the layer split gets deferral, a fitted placement cost that runs on one card when that is faster,
+  speculative decoding and prestaging.
+- **v1.3.28:** the tier moves' copies paced through the MoE layers - the tokens right after a prompt 16-20 -> 11-13 ms.
 
 ## Build and pack
 
@@ -97,9 +107,10 @@ How it got there (each step's measurement and its KL check are in [CHANGELOG.md]
   the prompt and the answer instead (n-gram lookup, `STRATA_DS4_SPEC`).
 - File conversation slots (`STRATA_GLM_SLOTS`) - off for deepseek4; the live snapshot works.
 - Images.
-- A layer split runs without speculative decoding and without prestaging; a fast second card on a real PCIe slot, a
-  V100 and a discrete Radeon have not been run.
+- A layer split runs with speculative decoding and prestaging (v1.3.26 / v1.3.27), but a slower second card does not
+  beat one RTX 5090 + the iGPU lane, and its prompts are ~30% behind one card. A fast second card on a real PCIe slot,
+  a V100 and a discrete Radeon have not been run.
 - Short prompts: at 8K the staging of RAM-tier experts is still ~65% of the time (PCIe Gen4 x4). At 125K the GPU time
   is spread evenly over the indexer, the attention and the expert GEMMs.
-- Decode: what is left on this machine is the lane call (~114 us a layer, the iGPU's own time) and the dense Q8_0
-  GEMVs' bandwidth (~7 GB a token). Ideas and dead ends: the changelog's v1.3.16 entry.
+- Decode: what is left on this machine is the lane call (~114 us a layer, the iGPU's own time) and the dense GEMVs'
+  bandwidth (~5 GB a token with the Q5_K attention pack). Ideas and dead ends: the changelog's v1.3.16-1.3.23 entries.

@@ -1,10 +1,10 @@
 # Abyss manual
 
-How to build Abyss, set up DeepSeek V4 Flash, run it and tune it. Japanese: [MANUAL.ja.md](MANUAL.ja.md).
+How to build Abyss, set up DeepSeek V4 Flash (and V4.1 Flash), run it and tune it. Japanese: [MANUAL.ja.md](MANUAL.ja.md).
 
 Abyss is a fork of [Project Maya](https://github.com/mw00/project-maya) (MIT), itself grown out of
 [Strata](https://github.com/Niko1221/Strata) (MIT). The engine, the expert tiers, the server and the dashboard are
-Maya's; DeepSeek V4 support is what Abyss adds. Maya's own documentation (GLM-5.3-Flash, AMD, multi-GPU, the
+Maya's; DeepSeek V4 and V4.1 support is what Abyss adds. Maya's own documentation (GLM-5.3-Flash, AMD, multi-GPU, the
 installer) is kept under [docs/maya/](maya/README.md).
 
 - [What you need](#what-you-need)
@@ -14,6 +14,7 @@ installer) is kept under [docs/maya/](maya/README.md).
 - [Make the pack](#make-the-pack)
 - [Configure and start](#configure-and-start)
 - [Using it](#using-it)
+- [DeepSeek V4.1 Flash](#deepseek-v41-flash)
 - [Memory and speed](#memory-and-speed)
 - [Settings](#settings)
 - [Checking the output against llama.cpp](#checking-the-output-against-llamacpp)
@@ -321,6 +322,25 @@ the Ryzen AI Max's Radeon 8060S (gfx1151).
   `STRATA_DS4_IDX=1` keeps the older indexer kernels, and `STRATA_DS4_ATTN=1` the older attention.
 - **Limits:** mixing it with NVIDIA in one process (CUDA and HIP together) is not supported.
 
+## DeepSeek V4.1 Flash
+
+From v1.3.29 the same engine runs DeepSeek-V4.1-Flash-1017. It is set up by hand (the one-command setup installs V4
+only); [docs/deepseek41/README.md](deepseek41/README.md) has the GGUFs that load, the pack command, a config and the
+measurements, and [docs/deepseek41/SPEC.md](deepseek41/SPEC.md) what the model changes against V4. In short:
+
+- **Disk and memory.** nazeshinjite's Q2 GGUF is 366 GB: 153 GB of experts (384 a layer, 9.95 MB each), ~200 GB of
+  Engram tables and the dense weights. On an RTX 5090 + 94 GB RAM ~57% of the experts are resident (VRAM ~2,300, a
+  60 GB RAM tier ~6,500); the rest and every Engram row (48 a token, 264 bytes each) are read from the GGUF. Keep it
+  on the fastest NVMe you have, and leave ~25 GB of RAM to the page cache (`STRATA_GLM_RAM_GB=60` on a 94 GB box).
+- **Speed is the SSD's.** A token that reads no expert from the SSD takes 13-15 ms; each read adds ~3-4 ms at
+  3.4 GB/s. With `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1` (a route's 4th-6th experts left out when they
+  are only on disk; KL 0.229 -> 0.240 against the unquantized model) decode is ~28 tok/s, 17.7 without; swe-bench
+  coding tasks ran at 51.6 tok/s end to end. Prompts are slow (the attention runs a token at a time and the prompt's
+  experts come from the SSD).
+- **Start it in a memory-capped scope** (`systemd-run --user --scope -p MemoryMax=88G ...`): the page cache and the
+  pinned tier together can push systemd-oomd into killing the desktop session.
+- **Not yet:** speculative decoding, a layer split, conversation slots on disk, images.
+
 ## Memory and speed
 
 The engine fills the GPU's free VRAM with experts (after the dense weights, 6.2 GB for UD-Q2_K_XL, the caches and the
@@ -334,12 +354,13 @@ RAM 70 GB; the iGPU lane on):
 | --- | --- |
 | Decode, 1,024-token answers (prose / code, greedy) | ~92-95 tok/s (CPU lane instead of the iGPU: ~55-60) |
 | Decode, 16 swe-bench coding tasks x 3 (sampled, end to end) | ~100 tok/s (10.1 ms a token averaged over the run; 1,024-token answers: a single token 11.1 ms, the 2-token verify window 14.6) |
+| Decode, 60 swe-bench coding tasks x 5 (sampled, end to end) | ~107 tok/s (100.5-114.5 a task; v1.3.27) |
 | Decode at a 125K-token context | ~65 tok/s |
 | Prompt, 8K / 32K / 125K tokens (server, second run) | ~1,630-1,760 / ~3,100-3,270 / ~2,800 tok/s |
 | Start-up (weights + expert warm-up) | ~1 min |
 | Attention caches at 65536 tokens | 0.44 GB |
 
-(Decode rows: Abyss v1.3.20 with the Q5_K attention pack ("A lighter dense pack", above; the GGUF as published:
+(Decode rows: Abyss v1.3.21 with the Q5_K attention pack ("A lighter dense pack", above; the GGUF as published:
 ~82-84 and ~91-94). Prompt and 125K rows: v1.3.16-1.3.18, the GGUF as published. On the same machine and file
 llama.cpp `bed0a8566` with `-ngl 99 -ncmoe 32` decodes at 28-30 tok/s
 and reads prompts at 78 tok/s with ubatch 512, 660 with ubatch 8192.) The numbers of every release, and how each was
@@ -377,9 +398,11 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_WARM` | on | `0`: no warm-up at start (the tiers fill as experts are used; the first answers are slower) |
 | `STRATA_GLM_RAM_GB` | from free RAM | a fixed size of the pinned RAM tier in GB |
 | `STRATA_GLM_RAM_HEADROOM_GB` | 6 | RAM left free for the system when the RAM tier is sized |
+| `STRATA_GLM_STREAM_FETCH` | on | an expert read from the SSD is copied to VRAM chunk by chunk as the reads land, the PCIe copy running behind the SSD (v1.3.31; DeepSeek V4.1 -9% a token); `0`: the whole expert after the read |
 | `STRATA_GLM_RAM_THP` | on (Linux) | the RAM tier in transparent huge pages, as far as the free 2 MB blocks go (an APU lane re-validates 512x fewer pages: no multi-second lane stalls); `0`: the driver's pinned pages |
 | `STRATA_GLM_RESERVE_MB` | 700 | VRAM left free beside the expert pool |
 | `STRATA_GLM_CPU_LANE` | one thread per physical core | CPU threads computing RAM-tier experts; `0` = off |
+| `STRATA_GLM_CPU_PIN` | off | `<CPU list>` (e.g. `0-15`, `0,2,4-7`): pin the CPU lane's workers to those CPUs and cap their count at the list's size, one GPU or a split, Linux and Windows (v1.3.29); `1` / `0`: a split's per-part pools pinned or not, as before |
 | `STRATA_GLM_PCIE_SHARE` | measured at start | the share of RAM-tier experts copied over PCIe instead of computed on the CPU (`0` = all on the CPU, `1` = none) |
 | `STRATA_GLM_PREFILL` / `--prefill` | `auto` | the prompt chunk: `auto`, a number of tokens, or `0` (token by token) |
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | your expert usage between starts; `0` = off |
@@ -395,13 +418,16 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_ZERO_COPY` | on | the token boundary without the copy engines (v1.3.21): the table edits, the embedding row (a pinned copy of `token_embd`, Q8_0 / Q5_K) and the token are read and written host-mapped by the kernels. `0`: the copies, as before |
 | `STRATA_GLM_GAP_PROF` | off | `1`: a `glm gap prof` line after each answer - where the time between two tokens goes (host laps, the GPU's idle gap by timing events) |
 | `STRATA_GLM_TAIL_SKIP` / `_W` | off | a route's experts past rank r (or below a probability share) that are not in VRAM are left out - faster on a slow CPU lane, changes the answers (KL ~0.01-0.02) |
+| `STRATA_GLM_TAIL_SKIP_DISK` | off | `1`: the tail skip leaves out only experts that are on the SSD alone (v1.3.29). With `STRATA_GLM_TAIL_SKIP=3` the DeepSeek V4.1 speed setting: 56.6 -> 34.2 ms a token, KL 0.229 -> 0.240; changes nothing when every expert is in VRAM + RAM |
 | `STRATA_GLM_DEFER` | off | expert deferral: the CPU lane's part of a layer's MoE is not waited for at the layer's end but written into the residual after the next layer's attention (with its own layer's weights) - the GPU never idles for the lane: single tokens 10.9 -> 9.5 ms, the 2-token verify window 14.4 -> 13.1, +12-15% tok/s on an RTX 5090 + Radeon 8060S; changes the answers more than the tail skip (KL 0.08 against the Q8_0 reference, 0.012 without; swe-bench L7 16 tasks x 3: 107.2 tok/s and resolved 13 of 16 against 100.9 and 14 with it off). With a layer split each part defers within its own layers (its last layer waits for its own part) |
 | `STRATA_DS4_IDX`, `STRATA_DS4_ATTN` | 0 | `1`: the older FP32 kernels for the lightning indexer / the prompt attention instead of the tensor-core ones (A/B checks) |
 | `STRATA_GLM_MMQ_GLU` | on | the prompt path's expert gate/up product writes the SwiGLU itself (NVIDIA Turing and newer); `0`: the separate SwiGLU kernel, bit-identical to older builds |
 | `STRATA_GLM_CPU_MT` | on | CPU experts shared by several tokens (prompts, verify windows) decode each weight row once for all of them, bit-identical to ggml's dot; `0` off |
 | `STRATA_GLM_CPU_1T` | on | cheaper one-token IQ3_S / IQ3_XXS rows on the CPU lane, bit-identical to ggml's dot; `0` off |
 | `STRATA_GLM_VRAM_EVICT` | counts | `lru`: the VRAM tier's refill evicts the least recently used expert (for cache studies) |
-| `STRATA_GLM_DISK_READERS` | off | prompts read SSD-held experts with this many threads (try it on a DRAM-less NVMe) |
+| `STRATA_GLM_DISK_READERS` | off | prompts read SSD-held experts with this many threads (try it on a DRAM-less NVMe; DeepSeek V4.1: `8`, a 1K-token prompt 33 -> 27 s) |
+| `STRATA_GLM_DISK_LANE` | off | `1`: an expert read from the SSD into RAM is computed there by the CPU / iGPU lane instead of being copied to VRAM (v1.3.29; -5% on V4.1 with Q2_K/Q3_K experts, nothing with the smaller Q2 ones) |
+| `STRATA_DS41_ENGRAM_CACHE_MB` / `_THREADS` | 256 / 15 | DeepSeek V4.1: the Engram raw-row cache and the row readers (v1.3.29) |
 | `STRATA_DS4_SPEC` | 1 (on) | speculative decoding from the prompt and the answer: draft tokens a step (1-3; 1 is the fastest measured); `0` off |
 | `STRATA_DS4_SPEC_GATE` | on | drop a draft while the request's acceptance does not pay for the verify window; `0`: always draft |
 | `STRATA_DS4_SPEC_MIN` | 3 | the tokens a draft's lookup matches (2-4) |
@@ -437,4 +463,8 @@ KL 0.009 over 3000 tokens, with the same next-token accuracy.
 - No images (DeepSeek V4 Flash is text-only here).
 - Several GPUs: the layer split runs (see "Several GPUs"), and a slower second card
   does not beat one fast card with the iGPU lane - `auto` then runs on the fast card alone. Windows is untested for DeepSeek V4.
-- `./abyss.sh` (Maya's installer) is for GLM; DeepSeek V4 is set up with `./setup-deepseek.sh`.
+- `./abyss.sh` (Maya's installer) is for GLM; DeepSeek V4 is set up with `./setup-deepseek.sh`; DeepSeek V4.1 by hand
+  ([docs/deepseek41/README.md](deepseek41/README.md)).
+- DeepSeek V4.1: no speculative decoding (no GGUF carries its MTP layers), no layer split, no conversation slots on
+  disk, the prompt's attention a token at a time. Up to v1.3.31 it crashed on the 16,385th token of a context (and
+  chose its attention rows wrongly past 8K); use v1.3.32 or later for long chats.

@@ -7,6 +7,27 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.33 - 2026-10-19
+
+**Docs: DeepSeek V4.1 and what it changes against V4; the documents brought up to date.** No code change.
+- **[docs/deepseek41/SPEC.md](docs/deepseek41/SPEC.md)** (new): V4.1 Flash's forward pass as a delta against V4's
+  spec - the layer roles (four shared KV slots from layers 2 / 8 / 14 / 20, eight index sources whose top-512 the
+  layers between reuse), the ratio-2 / ratio-1 compressors, the candidate blocks past 16K, the Engram hash, row format
+  and gate, the lagged hyper-connection pre, the head without `output_hc_*`, the router without hash layers, the chat
+  tokens - each with where Abyss implements it, what it does not run yet, and where ds4 and llama.cpp's PR disagree.
+- **[docs/deepseek41/README.md](docs/deepseek41/README.md)**: a V4 / V4.1 comparison table and diagram, how to run it
+  (a config with the speed settings, the memory-capped scope), v1.3.31's numbers (8 held-out texts 35.9 ms a token,
+  KL 0.241; swe-bench's first 35 tasks 51.6 tok/s, 34 of 35 resolved), the v1.3.31 switches, the options measured
+  worse.
+- **README / README.ja**: V4.1 in the title, highlights, performance (its own table), how it works (what changes, a
+  diagram), correctness, docs and roadmap; the 60-task swe-bench row for V4 (~107 tok/s); the RTX 5090 + RTX 3090
+  row at the v1.3.26-1.3.27 split (87-90 tok/s); the Japanese README had no V4.1 at all and still said 82-84 tok/s.
+- **MANUAL / MANUAL.ja**: a DeepSeek V4.1 section; settings rows for `STRATA_GLM_STREAM_FETCH`,
+  `STRATA_GLM_CPU_PIN` lists, `STRATA_GLM_TAIL_SKIP_DISK`, `STRATA_GLM_DISK_LANE` and the Engram cache / readers;
+  V4.1's limits (and that long chats need v1.3.32).
+- **docs/deepseek4/PORT.md**: the speed table at v1.3.21-1.3.27, the steps from v1.3.18 to v1.3.28, the open items
+  (the layer split has speculative decoding and prestaging since v1.3.26 / v1.3.27).
+
 ## v1.3.32 - 2026-10-19
 
 **DeepSeek V4.1 crashed on the 16,385th token of a chat; the server now restarts an engine whose CUDA context is

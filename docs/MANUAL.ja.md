@@ -1,10 +1,10 @@
 # Abyss マニュアル
 
-Abyss のビルド、DeepSeek V4 Flash の準備、起動と調整の手順。English: [MANUAL.md](MANUAL.md)
+Abyss のビルド、DeepSeek V4 Flash（と V4.1 Flash）の準備、起動と調整の手順。English: [MANUAL.md](MANUAL.md)
 
 Abyss は [Project Maya](https://github.com/mw00/project-maya)（MIT）をコピーして作ったフォークで、Maya は
 [Strata](https://github.com/Niko1221/Strata)（MIT）から生まれたプロジェクト。エンジン、エキスパートの配置の仕組み、
-サーバー、ダッシュボードは Maya のもので、Abyss はそこに DeepSeek V4 への対応を足した。Maya の元のドキュメント
+サーバー、ダッシュボードは Maya のもので、Abyss はそこに DeepSeek V4 と V4.1 への対応を足した。Maya の元のドキュメント
 （GLM-5.3-Flash、AMD、複数 GPU、インストーラ）は [docs/maya/](maya/README.md) にそのまま残している。
 
 - [必要なもの](#必要なもの)
@@ -14,6 +14,7 @@ Abyss は [Project Maya](https://github.com/mw00/project-maya)（MIT）をコピ
 - [pack を作る](#pack-を作る)
 - [設定と起動](#設定と起動)
 - [使い方](#使い方)
+- [DeepSeek V4.1 Flash](#deepseek-v41-flash)
 - [メモリと速度](#メモリと速度)
 - [設定項目](#設定項目)
 - [llama.cpp との照合](#llamacpp-との照合)
@@ -317,6 +318,24 @@ Radeon 8060S（gfx1151）。
   `STRATA_DS4_IDX=1` で indexer を、`STRATA_DS4_ATTN=1` で attention を従来のカーネルに戻せる。
 - **制限:** NVIDIA との組み合わせ（1 つのプロセスで CUDA と HIP の両方）には対応していない。
 
+## DeepSeek V4.1 Flash
+
+v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。準備は手作業（まとめてセットアップが入れるのは V4 だけ）。
+読める GGUF、pack の作り方、設定例、測定結果は [docs/deepseek41/README.md](deepseek41/README.md)、V4 から変わった計算は
+[docs/deepseek41/SPEC.md](deepseek41/SPEC.md)（どちらも英語）。要点:
+
+- **ディスクとメモリ。** nazeshinjite の Q2 GGUF は 366 GB。エキスパートが 153 GB（層ごとに 384 個、1 個 9.95 MB）、Engram
+  の表が約 200 GB、残りが密な重み。RTX 5090 + RAM 94 GB では、エキスパートの約 57% が常駐する（VRAM に約 2,300 個、60 GB
+  の RAM 層に約 6,500 個）。残りと Engram の行（1 トークン 48 行、1 行 264 バイト）は GGUF から読む。いちばん速い NVMe に
+  置き、RAM は約 25 GB をページキャッシュに残す（94 GB の機械なら `STRATA_GLM_RAM_GB=60`）。
+- **速さは SSD で決まる。** SSD からエキスパートを読まないトークンは 13〜15 ms。読むたびに 3.4 GB/s で約 3〜4 ms 増える。
+  `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1`（ルートの 4〜6 位が SSD にしかないときは計算しない。量子化前の
+  モデルに対する KL は 0.229 → 0.240）で生成は約 28 tok/s、なしで 17.7 tok/s。swe-bench のコーディング問題は通しで
+  51.6 tok/s。prompt は遅い（アテンションを 1 トークンずつ計算し、prompt のエキスパートも SSD から読む）。
+- **メモリ上限つきのスコープで起動する**（`systemd-run --user --scope -p MemoryMax=88G ...`）。ページキャッシュと pinned の
+  層が重なると、systemd-oomd がデスクトップのセッションを止めることがある。
+- **まだできないこと:** 投機デコード、層の分割、会話のディスク保存、画像。
+
 ## メモリと速度
 
 エンジンは、密な重み（UD-Q2_K_XL で 6.2 GB）、キャッシュ、prompt 用のバッファを置いた残りの VRAM をエキスパートで
@@ -330,12 +349,13 @@ VRAM 23 GB + RAM 70 GB に載った状態、iGPU レーンあり）:
 | --- | --- |
 | 生成（1,024 トークンの応答、文章 / コード、greedy） | 約 92〜95 tok/s（iGPU の代わりに CPU レーンなら約 55〜60） |
 | 生成（swe-bench のコーディング問題 16 問 × 3、サンプリングあり、通し） | 約 100 tok/s（通しで 1 トークン平均 10.1 ms。1,024 トークンの応答では単発 1 トークン 11.1 ms、2 トークンの検証窓 14.6） |
+| 生成（swe-bench のコーディング問題 60 問 × 5、サンプリングあり、通し） | 約 107 tok/s（1 問 100.5〜114.5。v1.3.27） |
 | 生成（コンテキスト 125K トークン） | 約 65 tok/s |
 | prompt（8K / 32K / 125K トークン、サーバー、2 回目） | 約 1,630〜1,760 / 約 3,100〜3,270 / 約 2,800 tok/s |
 | 起動（重み + エキスパートの読み込み） | 約 1 分 |
 | 65536 トークン分のアテンションキャッシュ | 0.44 GB |
 
-（生成の行: Abyss v1.3.20、Q5_K の attention pack（上の「軽い dense pack」。配布 GGUF のままなら約 82〜84 と約 91〜94）。
+（生成の行: Abyss v1.3.21、Q5_K の attention pack（上の「軽い dense pack」。配布 GGUF のままなら約 82〜84 と約 91〜94）。
 prompt と 125K の行: v1.3.16〜1.3.18、配布 GGUF のまま。同じマシン・同じファイルで llama.cpp `bed0a8566` は `-ngl 99 -ncmoe 32` で生成 28〜30 tok/s、
 prompt は ubatch 512 で 78 tok/s、ubatch 8192 で 660 tok/s。）各リリースの数値と測り方は
 [CHANGELOG.md](../CHANGELOG.md) にある。
@@ -370,9 +390,11 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 | `STRATA_GLM_WARM` | オン | `0`: 起動時に読み込まない（使われたエキスパートから載っていく。最初の応答が遅い） |
 | `STRATA_GLM_RAM_GB` | 空き RAM から | pinned の RAM 層の大きさを GB で固定 |
 | `STRATA_GLM_RAM_HEADROOM_GB` | 6 | RAM 層を決めるとき、システムのために空けておく RAM |
+| `STRATA_GLM_STREAM_FETCH` | オン | SSD から読んだエキスパートを、読めた塊から順に VRAM へコピーする。PCIe のコピーが SSD の読みのすぐ後ろを走る（v1.3.31。DeepSeek V4.1 で 1 トークン −9%）。`0` で読み終わってからまとめてコピー |
 | `STRATA_GLM_RAM_THP` | オン（Linux） | RAM 層を透過的ヒュージページに置く（空きの 2 MB ブロックの範囲で。APU のレーンが再検証するページが 512 分の 1 になり、数秒の停止が消える）。`0` でドライバの pinned ページ |
 | `STRATA_GLM_RESERVE_MB` | 700 | エキスパート用プールの横に空けておく VRAM |
 | `STRATA_GLM_CPU_LANE` | 物理コアごとに 1 スレッド | RAM 層のエキスパートを計算する CPU スレッド数。`0` で無効 |
+| `STRATA_GLM_CPU_PIN` | オフ | `<CPU の並び>`（例 `0-15`、`0,2,4-7`）: CPU レーンのワーカーをその CPU に固定し、スレッド数を並びの数までにする。GPU 1 枚でも分割でも、Linux でも Windows でも効く（v1.3.29）。`1` / `0` は従来どおり、分割の各部のプールを固定するかどうか |
 | `STRATA_GLM_PCIE_SHARE` | 起動時に測定 | RAM 層のエキスパートのうち、CPU で計算せずに PCIe で GPU に送る割合（`0` = すべて CPU、`1` = すべて GPU） |
 | `STRATA_GLM_PREFILL` / `--prefill` | `auto` | prompt のまとめ処理の大きさ: `auto`、トークン数、`0`（1 トークンずつ） |
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | 起動をまたいで残すエキスパートの使用記録。`0` で無効 |
@@ -388,13 +410,16 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 | `STRATA_GLM_ZERO_COPY` | オン | copy engine を使わない token の境目（v1.3.21）: 表の更新・埋め込み行（`token_embd` の pinned コピー、Q8_0 / Q5_K）・トークンを、カーネルが host-mapped で直接読み書きする。`0`: 従来どおり memcpy |
 | `STRATA_GLM_GAP_PROF` | オフ | `1`: 答えごとに `glm gap prof` の行を出す。トークンとトークンの間の時間の内訳（host 側のラップと、timing event で測った GPU の空き） |
 | `STRATA_GLM_TAIL_SKIP` / `_W` | オフ | ルートの r 位より下（または確率の割合が閾値より下）で VRAM にないエキスパートを計算しない。CPU レーンが遅い環境で速くなるが、答えが変わる（KL 0.01〜0.02 程度） |
+| `STRATA_GLM_TAIL_SKIP_DISK` | オフ | `1`: 上の省略を、SSD にしかないエキスパートだけに限る（v1.3.29）。`STRATA_GLM_TAIL_SKIP=3` と合わせて DeepSeek V4.1 の速度設定: 1 トークン 56.6 → 34.2 ms、KL 0.229 → 0.240。全エキスパートが VRAM + RAM に載るなら何も変わらない |
 | `STRATA_GLM_DEFER` | オフ | expert deferral: 層の MoE のうち CPU レーン側の分を層の終わりで待たず、次の層の attention の後に（元の層の重みで）residual に足す。GPU がレーンを待たなくなる: RTX 5090 + Radeon 8060S で単発 1 トークン 10.9 → 9.5 ms、2 トークンの検証窓 14.4 → 13.1、tok/s +12〜15%。答えの変化は tail skip より大きい（Q8_0 参照に対する KL 0.08、オフなら 0.012。swe-bench L7 16 問 × 3: 107.2 tok/s、resolved 16 問中 13。オフなら 100.9、14）。層分割でも各 part の中で遅らせる（part の最後の層は自分の分を待つ） |
 | `STRATA_DS4_IDX`, `STRATA_DS4_ATTN` | 0 | `1`: lightning indexer / prompt の attention を tensor core 版ではなく従来の FP32 カーネルで計算する（A/B 確認用） |
 | `STRATA_GLM_MMQ_GLU` | オン | prompt の expert の gate/up の積で SwiGLU まで済ませる（NVIDIA Turing 以降）。`0` で別カーネル（以前のビルドとビット一致） |
 | `STRATA_GLM_CPU_MT` | オン | 複数トークンが同じ expert を使うとき（prompt、検証窓）、CPU は重みの行を 1 回だけ展開する。ggml の内積とビット一致。`0` で無効 |
 | `STRATA_GLM_CPU_1T` | オン | CPU レーンの 1 トークン用 IQ3_S / IQ3_XXS の行を軽くする。ggml の内積とビット一致。`0` で無効 |
 | `STRATA_GLM_VRAM_EVICT` | 使用回数 | `lru`: VRAM 層の入れ替えで、最も長く使われていない expert を追い出す（キャッシュの調査用） |
-| `STRATA_GLM_DISK_READERS` | オフ | prompt 処理で SSD 上の expert をこの数のスレッドで読む（DRAM なしの NVMe 向け。環境ごとに測ること） |
+| `STRATA_GLM_DISK_READERS` | オフ | prompt 処理で SSD 上の expert をこの数のスレッドで読む（DRAM なしの NVMe 向け。環境ごとに測ること。DeepSeek V4.1 は `8` で 1K トークンの prompt が 33 → 27 秒） |
+| `STRATA_GLM_DISK_LANE` | オフ | `1`: SSD から RAM に読んだエキスパートを、VRAM に送らずその場で CPU / iGPU レーンが計算する（v1.3.29。V4.1 の Q2_K/Q3_K エキスパートで −5%、小さい Q2 では効果なし） |
+| `STRATA_DS41_ENGRAM_CACHE_MB` / `_THREADS` | 256 / 15 | DeepSeek V4.1: Engram の行キャッシュと、行を読むスレッド数（v1.3.29） |
 | `STRATA_DS4_SPEC` | 1（オン） | prompt と応答から作る投機デコード。1 回に試す候補トークン数（1〜3。実測では 1 が最速）。`0` でオフ |
 | `STRATA_DS4_SPEC_GATE` | オン | リクエストの採用率が検証窓の分に見合わない間は候補を出さない。`0`: 常に出す |
 | `STRATA_DS4_SPEC_MIN` | 3 | 候補を探すときに一致させるトークン数（2〜4） |
@@ -429,4 +454,8 @@ prompt）まで測った。アテンションのキャッシュは小さい（65
 - 画像は扱わない（ここでは DeepSeek V4 Flash はテキストのみ）。
 - 複数 GPU: 層の分割は動く（「複数の GPU」）が、遅い 2 枚目を足しても速い 1 枚 + iGPU レーンには
   届かない。そのとき `auto` は速いカード 1 枚で動かす。Windows は DeepSeek V4 では未確認。
-- `./abyss.sh`（Maya から引き継いだインストーラ）は GLM 用。DeepSeek V4 は `./setup-deepseek.sh`。
+- `./abyss.sh`（Maya から引き継いだインストーラ）は GLM 用。DeepSeek V4 は `./setup-deepseek.sh`。DeepSeek V4.1 は手作業
+  （[docs/deepseek41/README.md](deepseek41/README.md)）。
+- DeepSeek V4.1: 投機デコード（MTP 層を持つ GGUF がない）、層の分割、会話のディスク保存はまだない。prompt のアテンションは
+  1 トークンずつ。v1.3.31 までは、コンテキストの 16,385 トークン目で落ちた（8K を超えるとアテンションの行選びも崩れていた）。
+  長い会話には v1.3.32 以降を使う。
