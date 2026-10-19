@@ -2223,6 +2223,7 @@ struct RouteArgs {
                                 // selection score - its weight stays its own probability.  LOSSY (0: off)
     float affinity_ram;         // STRATA_GLM_ROUTE_AFFINITY_RAM: the same for an expert in the RAM tier (not on disk
                                 // only); a VRAM one gets the larger of the two.  LOSSY (0: off)
+    int prof;                   // STRATA_GLM_ROUTE_PROF: per-phase cycle sums (diagnostics)
 };
 // the request's xq (x's q8_1 as the device computed it: 36-byte blocks, copied as words) and its flag; the system
 // fence before the request's seq covers it as it does x
@@ -2272,6 +2273,26 @@ __device__ void warp_topk(const float* sel, int E, int k, int* out) {
     }
 }
 
+// STRATA_GLM_ROUTE_PROF=1 (diagnostics, CUDA): thread 0 of the route block sums SM cycles per phase (0 start, 1 x / prev
+// error, 2 scores, 3 top-k, 4 next-layer prediction, 5 lookahead + table loads, 6 plan, 7 request + fence, 8 the seq
+// publish) and prints the means every 43,000 routes
+#if !defined(STRATA_USE_HIP)
+__device__ unsigned long long g_route_prof[10];
+#define ROUTE_PROF(i)                                                                                         \
+    if (a.prof && tid == 0) {                                                                                 \
+        const unsigned long long t_ = clock64();                                                             \
+        if ((i) > 0) atomicAdd(&g_route_prof[(i)], t_ - prof_t);                                              \
+        prof_t = t_;                                                                                          \
+        if ((i) == 8 && (atomicAdd(&g_route_prof[0], 1ull) + 1) % 43000ull == 0ull) {                         \
+            const double n = (double) g_route_prof[0];                                                        \
+            printf("route prof (cycles a route, %.0f routes): x %.0f | scores %.0f | topk %.0f | pred %.0f | ahead+tab %.0f | plan %.0f | rq+fence %.0f | publish %.0f\n", n, \
+                   g_route_prof[1] / n, g_route_prof[2] / n, g_route_prof[3] / n, g_route_prof[4] / n,         \
+                   g_route_prof[5] / n, g_route_prof[6] / n, g_route_prof[7] / n, g_route_prof[8] / n);       \
+        }                                                                                                     \
+    }
+#else
+#define ROUTE_PROF(i)
+#endif
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_constant__ RouteArgs a) {
     const int tid = threadIdx.x, lane = tid & 31;
     if (blockIdx.x > 0) {
@@ -2284,6 +2305,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         return;
     }
     const int E = a.n_expert;
+    unsigned long long prof_t = 0;
+    ROUTE_PROF(0)
     __shared__ float s_p[512], s_sel[512];
     __shared__ int s_ids[8];
     __shared__ float s_w[8];
@@ -2307,6 +2330,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         route_put_xq(a, rqe, tid);
     }
     __syncthreads();
+    ROUTE_PROF(1)
     // the CPU lane's frequency counts age: every 4096 routes all of them halve (the whole block, before any use)
     if (a.cpu_plan != 0ull && a.d.dcnt != nullptr && ((*a.d.seq + 1) & 4095u) == 0u)
         for (int i = tid; i < a.d.n_keys; i += ROUTE_THREADS) a.d.dcnt[i] >>= 1;
@@ -2324,6 +2348,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     __syncthreads();
+    ROUTE_PROF(2)
     if (a.hash_ids != nullptr) {
         if (tid < a.k) s_ids[tid] = a.hash_ids[tid];
         __syncthreads();
@@ -2336,6 +2361,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
+    ROUTE_PROF(3)
     // the next layer's predicted top-k (same selection rule, its own bias)
     __shared__ int s_pred[8];
     if (tid < 8) s_pred[tid] = -1;
@@ -2352,6 +2378,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             for (int i = 0; i < a.k; ++i)
                 if (s_pred[i] < 0 || s_pred[i] >= E) atomicMax(&bad, 2);
     }
+    ROUTE_PROF(4)
     // LOOKAHEAD: one warp per later layer, its top-k in registers (E <= 512; the same selection rule and ties)
     __shared__ short s_ah[kAhead][8];
     if ((tid >> 5) < a.n_ahead) {
@@ -2411,6 +2438,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     if (tid == 32) s_seq0 = *a.d.seq;
     if (tid == 0 && prev_err != 0) atomicMax(&bad, 1);
     __syncthreads();
+    ROUTE_PROF(5)
     if (bad != 0) {
         if (tid == 0) {
             // No probability/table lookup or DMA for an invalid route. Still publish and retire its sequence.
@@ -2603,6 +2631,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         }
     }
     __syncthreads();
+    ROUTE_PROF(6)
     MoeRequest* rq = (MoeRequest*) a.d.ring + (s_seq % kRingSize);
     if ((s_cpu != 0u || (a.promote_min < 0 && s_mask != 0u)) && !a.early_x) {   // (the disk lane reads x too)
         for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq->x[e] = a.x[e];
@@ -2633,6 +2662,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     }
     __threadfence_system();
     __syncthreads();
+    ROUTE_PROF(7)
     if (tid == 0) {
         __threadfence_system();
         rq->seq = s_seq;
@@ -2642,6 +2672,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         __threadfence_system();
 #endif
     }
+    ROUTE_PROF(8)
 }
 
 __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
@@ -3846,6 +3877,8 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     }();
     a.affinity = affinity;
     a.affinity_ram = affinity_ram;
+    static const int prof = [] { const char* v = getenv("STRATA_GLM_ROUTE_PROF"); return v != nullptr && std::atoi(v) != 0; }();
+    a.prof = prof;
     // STRATA_GLM_ROUTE_EARLY=1: x written at the route kernel's start (float4, beside the scores and the plan);
     // default 0: after the plan, as before - measured the same on an RTX 5090 + iGPU lane (the system fence, not the
     // store, is what the request waits for): 3 x 2 answers, 83.4 / 85.6 against 83.6 / 91.2 tok/s
