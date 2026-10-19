@@ -1549,6 +1549,9 @@ void Glm5Model::fast_igpu_setup() {
         if (std::atoi(pk) == 0) F->igpu_poke = nullptr;
     F->igpu_rows = (abyss_igpu_rows_fn) dlsym(lib, "abyss_igpu_rows");
     F->igpu_x3 = (abyss_igpu_experts_x3_fn) dlsym(lib, "abyss_igpu_experts_x3");
+    F->igpu_x3s = (abyss_igpu_x3_start_fn) dlsym(lib, "abyss_igpu_x3_start");
+    F->igpu_x3f = (abyss_igpu_x3_finish_fn) dlsym(lib, "abyss_igpu_x3_finish");
+    if (F->igpu_x3f == nullptr) F->igpu_x3s = nullptr;
     F->igpu_reg = rg;
     F->igpu_unreg = (abyss_igpu_unregister_fn) dlsym(lib, "abyss_igpu_unregister");
     if (F->igpu_unreg == nullptr) F->igpu_rows = nullptr;
@@ -1558,6 +1561,190 @@ void Glm5Model::fast_igpu_setup() {
 #endif
 }
 
+// EXL3 on the CPU lane, one (token, expert) entry's rows: the gate and up inputs xh = H(x * suh) and their 128-value
+// block sums, the down input and its block sums, the expert's output, and the byte-sum products of the split-K pieces:
+// gate/up in pieces of kX3GuIn inputs, down in pieces of kX3DnIn = 128 (one gate/up band), each over every column (the
+// tile rows in memory order: exl3_cpu_rows_acc).  The pieces are fixed, so an entry's answer does not depend on how a
+// pool cuts the work (Maya e62ff8a / #188 by @needmorevram)
+namespace {
+constexpr int kX3GuIn = 256, kX3DnIn = 128;
+struct X3Rows {
+    float* p;
+    int E, FF;
+    static size_t floats(int E, int FF) {
+        return 3 * (size_t) E + FF + 2 * (size_t) (E / kX3GuIn) * FF + (size_t) (FF / kX3DnIn) * E +
+               2 * (size_t) (E / 128) + (size_t) FF / 128;
+    }
+    float* x(int r) const { return p + (size_t) r * E; }
+    float* xd() const { return p + 2 * (size_t) E; }
+    float* dn() const { return p + 2 * (size_t) E + FF; }
+    float* gu(int r, int q) const { return p + 3 * (size_t) E + FF + ((size_t) r * (E / kX3GuIn) + q) * FF; }
+    float* dp(int q) const { return gu(2, 0) + (size_t) q * E; }
+    float* xsb(int r) const { return dp(FF / kX3DnIn) + (size_t) r * (E / 128); }
+    float* xds() const { return xsb(2); }
+};
+
+// matrix r (0 gate, 1 up, 2 down) of an EXL3 expert blob
+strata::kernels::cpu::Exl3Part x3_part(const uint8_t* blob, const strata::kernels::exl3::ExpertLayout& xl, int r,
+                                       int E, int FF) {
+    strata::kernels::cpu::Exl3Part p;
+    p.trellis = (const uint32_t*) (blob + xl.trellis[r]);
+    p.suh = (const uint16_t*) (blob + xl.suh[r]);
+    p.svh = (const uint16_t*) (blob + xl.svh[r]);
+    p.k = r < 2 ? E : FF;
+    p.n = r < 2 ? FF : E;
+    p.K = xl.K[r];
+    return p;
+}
+
+// piece q of matrix r (0 gate, 1 up) for the entries R[0..n) of one expert: their inputs' blocks of that piece (x[i]:
+// entry i's token input) - once a piece, before any of its columns' runs
+void x3_gate_up_prep(const X3Rows* R, const float* const* x, int n, const strata::kernels::cpu::Exl3Part& p, int r,
+                     int q) {
+    namespace kc = strata::kernels::cpu;
+    for (int i = 0; i < n; ++i)
+        for (int b = q * (kX3GuIn / 128); b < (q + 1) * (kX3GuIn / 128); ++b)
+            R[i].xsb(r)[b] = kc::exl3_cpu_prepare_block(p.suh + b * 128, x[i] + b * 128, R[i].x(r) + b * 128);
+}
+
+// ... then the piece's byte-sum products over the columns [c0, c1), the tile rows decoded once for all n
+void x3_gate_up_rows(const X3Rows* R, int n, const strata::kernels::cpu::Exl3Part& p, int r, int q, int c0, int c1) {
+    constexpr int kN = 16;   // (entries of one expert a call: 1 on the decode lane)
+    const float* xh[kN];
+    float* acc[kN];
+    for (int i = 0; i < n; ++i) {
+        xh[i] = R[i].x(r);
+        acc[i] = R[i].gu(r, q);
+    }
+    strata::kernels::cpu::exl3_cpu_rows_acc_cols_n(p, xh, n, q * (kX3GuIn / 16), (q + 1) * (kX3GuIn / 16), c0, c1, acc);
+}
+
+// band b of the gate and up outputs from their pieces, the clamped swiglu, and that block of the down input
+void x3_gate_up_block(const X3Rows& R, const strata::kernels::cpu::Exl3Part* pt, int b, float lim) {
+    namespace kc = strata::kernels::cpu;
+    float y[2][128], a[128];
+    for (int r = 0; r < 2; ++r) {
+        for (int j = 0; j < 128; ++j) a[j] = 0.0f;
+        for (int q = 0; q < R.E / kX3GuIn; ++q) {
+            const float* aq = R.gu(r, q) + b * 128;
+            for (int j = 0; j < 128; ++j) a[j] += aq[j];
+        }
+        double xs = 0.0;   // (exl3_cpu_prepare's sum)
+        for (int k = 0; k < R.E / 128; ++k) xs += R.xsb(r)[k];
+        kc::exl3_cpu_band_out(pt[r], a, (float) xs, b * 128, y[r]);
+    }
+    float hb[128];
+    for (int j = 0; j < 128; ++j) {
+        float gv = y[0][j], uv = y[1][j];
+        if (lim > 0.0f) {
+            gv = std::min(gv, lim);
+            uv = std::min(std::max(uv, -lim), lim);
+        }
+        hb[j] = gv / (1.0f + std::exp(-gv)) * uv;
+    }
+    R.xds()[b] = kc::exl3_cpu_prepare_block(pt[2].suh + b * 128, hb, R.xd() + (size_t) b * 128);
+}
+
+// down piece q's input (gate/up band q) for the entries R[0..n) of one expert - once a piece, before its columns' runs
+void x3_down_prep(const X3Rows* R, int n, const strata::kernels::cpu::Exl3Part* pt, int q, float lim) {
+    static_assert(kX3DnIn == 128, "a down piece's input is one gate/up band");
+    for (int i = 0; i < n; ++i) x3_gate_up_block(R[i], pt, q, lim);
+}
+
+// ... then the piece's byte-sum products over the columns [c0, c1), decoded once for all n
+void x3_down_rows(const X3Rows* R, int n, const strata::kernels::cpu::Exl3Part& pd, int q, int c0, int c1) {
+    constexpr int kN = 16;   // (entries of one expert a call: 1 on the decode lane)
+    const float* xh[kN];
+    float* acc[kN];
+    for (int i = 0; i < n; ++i) {
+        xh[i] = R[i].xd();
+        acc[i] = R[i].dp(q);
+    }
+    strata::kernels::cpu::exl3_cpu_rows_acc_cols_n(pd, xh, n, q * (kX3DnIn / 16), (q + 1) * (kX3DnIn / 16), c0, c1, acc);
+}
+
+// band b of the down output from its pieces
+void x3_down_block(const X3Rows& R, const strata::kernels::cpu::Exl3Part& pd, int b) {
+    float a[128];
+    for (int j = 0; j < 128; ++j) a[j] = 0.0f;
+    for (int q = 0; q < R.FF / kX3DnIn; ++q) {
+        const float* aq = R.dp(q) + b * 128;
+        for (int j = 0; j < 128; ++j) a[j] += aq[j];
+    }
+    float s = 0.0f;
+    for (int j = 0; j < R.FF / 128; ++j) s += R.xds()[j];
+    strata::kernels::cpu::exl3_cpu_band_out(pd, a, s, b * 128, R.dn() + (size_t) b * 128);
+}
+
+// n experts through their gate/up pieces, down pieces and output bands as ONE batch of jobs in that order: expert i's
+// down pieces wait for its own gate/up columns, its bands for its down columns, never for another expert's - so the
+// phases overlap, where a batch each waited for its slowest job (40 threads, ~6 RAM-tier experts: the down pieces' ~100
+// jobs took three rounds for two and a third rounds' work).  A piece is cut by columns too, into as many runs as one
+// round of the pool's threads holds (a lone expert's 16 down pieces left 20 of 36 threads idle for half its time): the
+// first run of a piece prepares its input (gu_prep / dn_prep), the others wait for that; a down piece needs only the
+// gate/up run holding its band, a band only the down runs holding its columns.  Each column's sums are the uncut
+// piece's, so the answers do not depend on the cut.  A job waits only for jobs claimed before it, which run, so the
+// pool cannot deadlock
+template <class GP, class GR, class DP, class DR, class BandOut>
+void x3_jobs(glmfast::Workers& pool, int n, int E, int FF, const GP& gu_prep, const GR& gu_rows, const DP& dn_prep,
+             const DR& dn_rows, const BandOut& out) {
+    constexpr int kRuns = 16;
+    const int GQ = E / kX3GuIn, DQ = FF / kX3DnIn, DB = E / 128, GB = FF / 128;
+    const int T = std::max(1, pool.active());
+    const int CG = std::max(1, std::min({kRuns, GB, T / std::max(1, 2 * GQ * n)}));
+    const int CD = std::max(1, std::min({kRuns, DB, T / std::max(1, DQ * n)}));
+    // run c of C over B bands holds the bands [B c / C, B (c + 1) / C); band k is in run ((k + 1) C - 1) / B
+    const auto run_of = [](int k, int C, int B) { return (int) (((int64_t) (k + 1) * C - 1) / B); };
+    // the counters (a run's finished pieces) and flags (a piece's input prepared): the caller's, reused call to call
+    static thread_local std::unique_ptr<std::atomic<int>[]> flags;
+    static thread_local size_t n_flags = 0;
+    const size_t per = (size_t) (CG + CD + 2 * GQ + DQ), need = (size_t) n * per;
+    if (n_flags < need) {
+        flags.reset(new std::atomic<int>[need]);
+        n_flags = need;
+    }
+    for (size_t k = 0; k < need; ++k) flags[k].store(0, std::memory_order_relaxed);
+    std::atomic<int>* const fl = flags.get();
+    const auto c_gu = [&](int i, int c) -> std::atomic<int>& { return fl[(size_t) i * per + c]; };
+    const auto c_dn = [&](int i, int c) -> std::atomic<int>& { return fl[(size_t) i * per + CG + c]; };
+    const auto f_gu = [&](int i, int r, int q) -> std::atomic<int>& { return fl[(size_t) i * per + CG + CD + r * GQ + q]; };
+    const auto f_dn = [&](int i, int q) -> std::atomic<int>& { return fl[(size_t) i * per + CG + CD + 2 * GQ + q]; };
+    const auto spin = [](const std::atomic<int>& v, int want) {
+        while (v.load(std::memory_order_acquire) < want) glmfast::cpu_relax();
+    };
+    const int a = n * 2 * GQ * CG, b = a + n * DQ * CD;
+    pool.run(b + n * DB, [&](int job) {
+        if (job < a) {
+            const int c = job % CG, q = job / CG % GQ, r = job / CG / GQ % 2, i = job / CG / GQ / 2;
+            if (c == 0) {
+                gu_prep(i, r, q);
+                f_gu(i, r, q).store(1, std::memory_order_release);
+            } else {
+                spin(f_gu(i, r, q), 1);
+            }
+            gu_rows(i, r, q, 128 * (GB * c / CG), 128 * (GB * (c + 1) / CG));
+            c_gu(i, c).fetch_add(1, std::memory_order_release);
+        } else if (job < b) {
+            const int c = (job - a) % CD, q = (job - a) / CD % DQ, i = (job - a) / CD / DQ;
+            if (c == 0) {
+                // gate/up band q: the gate/up run holding its columns, gate and up, every piece
+                spin(c_gu(i, run_of(q, CG, GB)), 2 * GQ);
+                dn_prep(i, q);
+                f_dn(i, q).store(1, std::memory_order_release);
+            } else {
+                spin(f_dn(i, q), 1);
+            }
+            dn_rows(i, q, 128 * (DB * c / CD), 128 * (DB * (c + 1) / CD));
+            c_dn(i, c).fetch_add(1, std::memory_order_release);
+        } else {
+            const int i = (job - b) / DB, k = (job - b) % DB;
+            spin(c_dn(i, run_of(k, CD, DB)), DQ);
+            out(i, k);
+        }
+    });
+}
+}  // namespace
+
 void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -1565,6 +1752,64 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     const auto& nf = F->cpu_fmt[(size_t) il];
     namespace kc = strata::kernels::cpu;
     const int n_ff = g.n_ff_exp, n_embd = g.n_embd;
+    // an EXL3 layer's experts on the CPU threads (bl[0..nx): the blobs, wv their weights): o = their weighted sum
+    const auto x3_cpu = [&](int nx, const uint8_t* const* bl, const float* wv, float* o) {
+        // EXL3 (mul1), in split-K pieces of 128-256 K weights (X3Rows), one batch of jobs (x3_jobs): per expert,
+        // matrix and piece of the inputs, those inputs' blocks and the piece's byte-sum products over every column;
+        // per expert and down piece, its gate/up band finished (the clamped swiglu, that block of the down input) and
+        // the piece's products; per expert and band of 128 outputs, the down rows; then the weighted sum in i order
+        const int E = n_embd, FF = n_ff;
+        const size_t per = X3Rows::floats(E, FF);
+        float* x3 = F->cpu_x3.data();
+        const auto rows = [&](int i) { return X3Rows{x3 + (size_t) i * per, E, FF}; };
+        const auto part = [&](int i, int r) { return x3_part(bl[i], Ly.xl, r, E, FF); };
+        x3_jobs(*F->cpu_pool, nx, E, FF, [&](int i, int r, int q) {
+            const X3Rows R = rows(i);
+            x3_gate_up_prep(&R, &x, 1, part(i, r), r, q);
+        }, [&](int i, int r, int q, int c0, int c1) {
+            const X3Rows R = rows(i);
+            x3_gate_up_rows(&R, 1, part(i, r), r, q, c0, c1);
+        }, [&](int i, int q) {
+            const X3Rows R = rows(i);
+            const kc::Exl3Part pt[3] = {part(i, 0), part(i, 1), part(i, 2)};
+            x3_down_prep(&R, 1, pt, q, g.swiglu_exp);
+        }, [&](int i, int q, int c0, int c1) {
+            const X3Rows R = rows(i);
+            x3_down_rows(&R, 1, part(i, 2), q, c0, c1);
+        }, [&](int i, int b) { x3_down_block(rows(i), part(i, 2), b); });
+        for (int r = 0; r < E; ++r) {
+            float m = 0.0f;
+            for (int i = 0; i < nx; ++i) m += wv[i] * rows(i).dn()[r];
+            o[r] = m;
+        }
+    };
+    // EXL3 on the iGPU AND the CPU threads at once (F->x3_frac > 0, set by the lane's start-up timing): the CPU's share
+    // of the route (the first experts) while the iGPU computes the rest - EXL3's trellis decode costs both about the
+    // same (Radeon 8060S 0.088 ms an expert, 16 Zen 5 threads 0.118), where a ggml type's is 2.5x apart.  A late or
+    // failed iGPU call: its experts on the CPU threads after (the same answer)
+    if (Ly.exl3 && F->x3_frac > 0.0f && F->igpu_experts != nullptr && F->igpu_x3s != nullptr && ne >= 2) {
+        const int nc = std::max(1, std::min(ne - 1, (int) std::lround(ne * F->x3_frac)));
+        const size_t off9[9] = {Ly.xl.suh[0], Ly.xl.suh[1], Ly.xl.suh[2], Ly.xl.svh[0], Ly.xl.svh[1],
+                                Ly.xl.svh[2], Ly.xl.trellis[0], Ly.xl.trellis[1], Ly.xl.trellis[2]};
+        if (F->igpu_x3s(Ly.xl.K, Ly.xl.cb, off9, n_embd, n_ff, g.swiglu_exp, ne - nc, (const void* const*) (blob + nc),
+                        w + nc, x) == 0) {
+            x3_cpu(nc, blob, w, out);
+            float* go = F->x3_gout.data();
+            const int rc = F->igpu_x3f(go, n_embd);
+            if (rc != 0) {
+                if (rc < 0) {
+                    std::fprintf(stderr, "glm fast: CUDA%d iGPU lane failed - the CPU lane takes over\n", dev_);
+                    F->igpu_experts = nullptr;
+                }
+                F->igpu_falls.fetch_add(1, std::memory_order_relaxed);
+                x3_cpu(ne - nc, blob + nc, w + nc, go);
+            } else {
+                F->igpu_calls.fetch_add(1, std::memory_order_relaxed);
+            }
+            for (int r = 0; r < n_embd; ++r) out[r] += go[r];
+            return;
+        }
+    }
     // the iGPU lane: the same sum from the registered RAM tier (an EXL3 layer through abyss_igpu_experts_x3, when the
     // library has it - else the CPU threads below)
     if (F->igpu_experts != nullptr && (!Ly.exl3 || F->igpu_x3 != nullptr)) {
@@ -1613,73 +1858,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         return v ? std::max(1, std::min(64, std::atoi(v))) : 0;
     }();
     if (Ly.exl3) {
-        // EXL3 (mul1), in jobs of ~260K weights so a route's few experts still fill the pool: (1) each expert's gate
-        // and up inputs; (2) per expert, matrix, band of 128 columns and half of the inputs, the byte-sum products;
-        // (3) per expert and band, gate and up finished, the clamped swiglu, and that block of the down input; (4) per
-        // expert and band of 128 outputs, the down rows; the weighted sum in i order
-        const int E = n_embd, FF = n_ff, GB = FF / 128, DB = E / 128, KH = E / 32;   // KH: 16-row slices a half
-        // per expert: xg[E] xu[E] xd[FF] dn[E] acc[2 GB 2 128] xds[GB]
-        const size_t per = 3 * (size_t) E + (size_t) FF + 2 * (size_t) GB * 2 * 128 + (size_t) GB;
-        float* buf = F->cpu_x3.data();
-        const auto part = [&](int i, int r) {
-            kc::Exl3Part p;
-            p.trellis = (const uint32_t*) (blob[i] + Ly.xl.trellis[r]);
-            p.suh = (const uint16_t*) (blob[i] + Ly.xl.suh[r]);
-            p.svh = (const uint16_t*) (blob[i] + Ly.xl.svh[r]);
-            p.k = r < 2 ? E : FF;
-            p.n = r < 2 ? FF : E;
-            p.K = Ly.xl.K[r];
-            return p;
-        };
-        const auto xg = [&](int i) { return buf + (size_t) i * per; };
-        const auto xd = [&](int i) { return buf + (size_t) i * per + 2 * (size_t) E; };
-        const auto dn = [&](int i) { return buf + (size_t) i * per + 2 * (size_t) E + FF; };
-        const auto acc = [&](int i, int r, int b, int h) {
-            return buf + (size_t) i * per + 3 * (size_t) E + FF + (((size_t) r * GB + b) * 2 + h) * 128;
-        };
-        const auto xds = [&](int i) { return buf + (size_t) i * per + 3 * (size_t) E + FF + 2 * (size_t) GB * 2 * 128; };
-        F->cpu_pool->run(2 * ne, [&](int job) {
-            const int i = job >> 1, r = job & 1;
-            F->cpu_x3s[i][r] = kc::exl3_cpu_prepare(part(i, r), x, xg(i) + (size_t) r * E);
-        });
-        F->cpu_pool->run(ne * 2 * GB * 2, [&](int job) {
-            const int h = job & 1, b = (job >> 1) % GB, r = (job >> 1) / GB % 2, i = (job >> 1) / GB / 2;
-            kc::exl3_cpu_band_acc(part(i, r), xg(i) + (size_t) r * E, b * 128, h * KH, (h + 1) * KH, acc(i, r, b, h));
-        });
-        const float lim = g.swiglu_exp;
-        F->cpu_pool->run(ne * GB, [&](int job) {
-            const int i = job / GB, b = job % GB;
-            float y[2][128], a[128];
-            for (int r = 0; r < 2; ++r) {
-                const float* a0 = acc(i, r, b, 0);
-                const float* a1 = acc(i, r, b, 1);
-                for (int j = 0; j < 128; ++j) a[j] = a0[j] + a1[j];
-                kc::exl3_cpu_band_out(part(i, r), a, F->cpu_x3s[i][r], b * 128, y[r]);
-            }
-            float hb[128];
-            for (int j = 0; j < 128; ++j) {
-                float gv = y[0][j], uv = y[1][j];
-                if (lim > 0.0f) {
-                    gv = std::min(gv, lim);
-                    uv = std::min(std::max(uv, -lim), lim);
-                }
-                hb[j] = gv / (1.0f + std::exp(-gv)) * uv;
-            }
-            xds(i)[b] = kc::exl3_cpu_prepare_block(part(i, 2).suh + b * 128, hb, xd(i) + (size_t) b * 128);
-        });
-        F->cpu_pool->run(ne * DB, [&](int job) {
-            const int i = job / DB, b = job % DB;
-            float s = 0.0f, a[128];
-            for (int j = 0; j < GB; ++j) s += xds(i)[j];
-            const kc::Exl3Part pd = part(i, 2);
-            kc::exl3_cpu_band_acc(pd, xd(i), b * 128, 0, FF / 16, a);
-            kc::exl3_cpu_band_out(pd, a, s, b * 128, dn(i) + (size_t) b * 128);
-        });
-        for (int r = 0; r < E; ++r) {
-            float m = 0.0f;
-            for (int i = 0; i < ne; ++i) m += w[i] * dn(i)[r];
-            out[r] = m;
-        }
+        x3_cpu(ne, blob, w, out);
         return;
     }
     const int threads = F->cpu_pool->active();
@@ -1984,8 +2163,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     F->cpu_ff.assign((size_t) 8 * g.n_ff_exp, 0.0f);
     F->cpu_dn.assign((size_t) 8 * g.n_embd, 0.0f);
     if (exl3_)   // (fast_cpu_experts' EXL3 layout, per expert)
-        F->cpu_x3.assign((size_t) 8 * (3 * (size_t) g.n_embd + (size_t) g.n_ff_exp + 4 * (size_t) g.n_ff_exp +
-                                       (size_t) g.n_ff_exp / 128), 0.0f);
+        F->cpu_x3.assign((size_t) 8 * X3Rows::floats(g.n_embd, g.n_ff_exp), 0.0f);
     // the service thread is the pool's last worker; idle workers spin 20 ms (a decode's routes come ~1 ms apart)
     if (shared) {
         F->cpu_pool = shared_cpu_pool(threads);
@@ -2084,6 +2262,22 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                          dev_, waited(), threads);
         if (keep && clean) c_ms = ig_ms;   // (not clean: the split below is planned on the CPU's time)
         else if (!keep) F->igpu_experts = nullptr;
+        // an EXL3 pack, opt-in: the iGPU and the CPU threads share each route (STRATA_GLM_X3_SPLIT=<the CPU's fraction>,
+        // or "auto" by their speeds).  Off by default: on a Ryzen AI Max+ 395 the two share the package's power and
+        // heat, and GLM-5.3-Flash sc_2.10bpw's glm_ids4k ran 22.7 ms a token on the iGPU alone against 23.5 (CPU 46%
+        // on 8 threads), 25.1 (25% on 4) and 31.6-32.6 (16 threads)
+        const char* xs = getenv("STRATA_GLM_X3_SPLIT");
+        if (exl3_ && xs != nullptr && F->igpu_experts != nullptr && F->igpu_x3s != nullptr && clean) {
+            const double fr = std::strcmp(xs, "auto") == 0 ? ig_ms / (ig_ms + cpu_ms) : std::atof(xs);
+            F->x3_frac = (float) std::max(0.0, std::min(0.9, fr));
+            if (F->x3_frac > 0.0f) {
+                F->x3_gout.assign((size_t) g.n_embd, 0.0f);
+                c_ms = ig_ms * cpu_ms / (ig_ms + cpu_ms);
+                std::fprintf(stderr, "glm fast: CUDA%d EXL3 lane: the CPU threads take %.0f%% of each route's RAM-tier "
+                                     "experts, the iGPU the rest (an expert %.3f ms together)\n", dev_,
+                             100.0 * F->x3_frac, c_ms);
+            }
+        }
     }
     const size_t blob = F->L[(size_t) il_cal].blob;
     cudaEvent_t e0 = nullptr, e1 = nullptr;

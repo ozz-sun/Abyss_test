@@ -536,7 +536,6 @@ struct Glm5Model::FastState {
     std::vector<uint8_t> cpu_act, cpu_hq;                    // x's activation quant; 8 h quants
     std::vector<float> cpu_ff, cpu_dn;                       // 8 x n_ff; 8 x n_embd
     std::vector<float> cpu_x3;                               // EXL3: per expert gate / up inputs, h, down input, out
-    float cpu_x3s[8][3] = {};                                // ... and the three prepared inputs' sums
     std::atomic<uint64_t> cpu_experts{0}, cpu_routes{0}, cpu_us{0};
     std::atomic<uint64_t> dlane_experts{0}, dlane_us{0};   // the disk lane's experts and its time
     uint64_t dlane_evict = 0;                              // ... and its evictions at the miss (service thread)
@@ -545,6 +544,10 @@ struct Glm5Model::FastState {
     void* igpu_lib = nullptr;
     abyss_igpu_experts_fn igpu_experts = nullptr;
     abyss_igpu_experts_x3_fn igpu_x3 = nullptr;   // an EXL3 layer's (abyss_igpu_experts_x3; absent: the CPU takes them)
+    abyss_igpu_x3_start_fn igpu_x3s = nullptr;     // ... in two halves, the CPU threads computing a share between them
+    abyss_igpu_x3_finish_fn igpu_x3f = nullptr;
+    float x3_frac = 0.0f;                          // the CPU's share of an EXL3 route's lane experts (0: one of the two)
+    std::vector<float> x3_gout;                    // the iGPU's share's sum
     abyss_igpu_poke_fn igpu_poke = nullptr;   // the service thread's keep-alive while a decode runs
     // the prompt path's host experts on the iGPU (abyss_igpu_rows; STRATA_GLM_PREFILL_IGPU=0: the CPU threads)
     abyss_igpu_rows_fn igpu_rows = nullptr;

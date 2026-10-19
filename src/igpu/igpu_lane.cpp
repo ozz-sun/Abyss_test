@@ -350,14 +350,17 @@ __attribute__((visibility("default"))) int abyss_igpu_experts(int gu_type, int d
 
 // the same for an EXL3 layer (exllamav3's trellis experts, src/kernels/cuda/exl3.cu): the blob layout in off9 (suh,
 // svh, trellis byte offsets of gate, up, down) and K3 / cb; F32 input, no q8_1.  The same queue, deadline and late-call
-// rule as abyss_igpu_experts
-__attribute__((visibility("default"))) int abyss_igpu_experts_x3(const int* K3, int cb, const size_t* off9, int n_embd,
-                                                                 int n_ff, float limit, int ne, const void* const* blobs,
-                                                                 const float* w, const float* x, float* out) {
+// rule as abyss_igpu_experts.  In two halves so the caller's CPU threads compute another share of the route meanwhile:
+// abyss_igpu_x3_start queues the kernels and keeps the lane (0; 1: busy, nothing queued), abyss_igpu_x3_finish waits
+// up to the deadline and copies the sum out (0), or leaves the late call pending and returns 1 (the caller computes
+// those experts itself); either way it releases the lane
+__attribute__((visibility("default"))) int abyss_igpu_x3_start(const int* K3, int cb, const size_t* off9, int n_embd,
+                                                               int n_ff, float limit, int ne, const void* const* blobs,
+                                                               const float* w, const float* x) {
     namespace x3 = strata::kernels::exl3;
     if (!L.open || ne < 1 || ne > 8 || n_embd > L.n_embd || n_ff > L.n_ff) return 1;
-    std::unique_lock<std::mutex> lk(L.mu, std::try_to_lock);
-    if (!lk.owns_lock()) return 1;
+    if (!L.mu.try_lock()) return 1;
+    std::unique_lock<std::mutex> lk(L.mu, std::adopt_lock);
     if (L.pending) {
         if (hipStreamQuery(L.s) != hipSuccess) {
             ++L.on_cpu;
@@ -368,7 +371,7 @@ __attribute__((visibility("default"))) int abyss_igpu_experts_x3(const int* K3, 
         L.on_cpu = 0;
     }
     static const bool ready = x3::prepare(L.s);
-    if (!ready) return -1;
+    if (!ready) return 1;
     for (int i = 0; i < ne; ++i) {
         const unsigned long long d = dev_of(blobs[i]);
         if (d == 0ull) return 1;
@@ -393,17 +396,24 @@ __attribute__((visibility("default"))) int abyss_igpu_experts_x3(const int* K3, 
     xa.limit = limit;
     x3::moe_gate_up(xa, L.x_d, nullptr, L.s);
     x3::moe_down(xa, nullptr, nullptr, L.out_d, L.s);
+    L.t_pend = std::chrono::steady_clock::now();
+    lk.release();   // (the lane stays held until abyss_igpu_x3_finish)
+    return 0;
+}
+
+__attribute__((visibility("default"))) int abyss_igpu_x3_finish(float* out, int n_embd) {
+    namespace x3 = strata::kernels::exl3;
+    std::unique_lock<std::mutex> lk(L.mu, std::adopt_lock);
     static const double timeout_ms = [] {
         const char* v = getenv("STRATA_GLM_IGPU_TIMEOUT_MS");
         return v != nullptr ? std::max(0.0, std::atof(v)) : 20.0;
     }();
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto t0 = L.t_pend;
     hipError_t e;
     while ((e = hipStreamQuery(L.s)) == hipErrorNotReady) {
         if (timeout_ms > 0.0 &&
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > timeout_ms) {
             L.pending = true;
-            L.t_pend = t0;
             L.t_busy = std::chrono::steady_clock::now();
             L.on_cpu = 0;
             std::fprintf(stderr, "iGPU lane: an EXL3 call is still running after %.0f ms - the CPU lane takes the calls "
@@ -417,6 +427,14 @@ __attribute__((visibility("default"))) int abyss_igpu_experts_x3(const int* K3, 
     }
     std::memcpy(out, L.out_h, (size_t) n_embd * sizeof(float));
     return 0;
+}
+
+// both halves at once (the whole route on the iGPU)
+__attribute__((visibility("default"))) int abyss_igpu_experts_x3(const int* K3, int cb, const size_t* off9, int n_embd,
+                                                                 int n_ff, float limit, int ne, const void* const* blobs,
+                                                                 const float* w, const float* x, float* out) {
+    const int rc = abyss_igpu_x3_start(K3, cb, off9, n_embd, n_ff, limit, ne, blobs, w, x);
+    return rc != 0 ? rc : abyss_igpu_x3_finish(out, n_embd);
 }
 
 __attribute__((visibility("default"))) void abyss_igpu_unregister(const void* host) {
