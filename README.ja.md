@@ -49,6 +49,9 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 - **OpenAI / Anthropic 互換 API** と、エキスパートの配置をリアルタイムで見られるブラウザのダッシュボード
 - **複数 GPU、AMD、V100** — NVIDIA の複数カードに層を分けて載せる。Radeon 向けの HIP ビルド（試験的）、CUDA 12 での sm_70 ビルド
 - **コマンド 1 つでセットアップ** — エンジン、モデル、pack、設定、運用スクリプトの `Abyss-tools` まで
+- **EXL3 量子化（GLM-5.3-Flash、試験的）** — exllamav3 のトレリス量子化をそのまま読む。turboderp の sc_2.10bpw は
+  Maya-S-v2 より 8 GB 小さく、文章の予測が良い（nll 1.59 対 1.63）。APU の lane では生成が約 2/3 の速さになる。
+  どちらが合うかはインストーラが PC を見て示す（[EXL3](docs/exl3/README.md)）
 
 ## 📊 性能
 
@@ -220,6 +223,7 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 | [仕様](docs/deepseek4/SPEC.md) | 実装した DeepSeek V4 の計算 |
 | [DeepSeek V4.1](docs/deepseek41/README.md) | V4.1 Flash（1017）: 読める GGUF、pack、動かし方、品質と速さ、設定（英語） |
 | [V4.1 の仕様](docs/deepseek41/SPEC.md) | V4 の計算から V4.1 で変わる点と、Abyss での実装箇所（英語） |
+| [EXL3](docs/exl3/README.md) | GLM-5.3-Flash の exllamav3 量子化: 向いている PC、選べる量子化、pack、測定結果、設定（英語） |
 | [Maya のドキュメント](docs/maya/README.md) | Maya の文書をそのまま残したもの: GLM-5.3-Flash、インストーラ（`./abyss.sh`）、チューニング、AMD、複数 GPU |
 
 ## 🗺️ ロードマップ
@@ -235,6 +239,8 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 - [x] NVIDIA の複数 GPU（層の分割。投機デコードと prestage も。RTX 5090 + RTX 3090 で測定）
 - [x] AMD（HIP、試験的）: Radeon 8060S で WMMA カーネルを使って動作
 - [x] V100（sm_70）を CUDA 12 でビルド
+- [x] GLM-5.3-Flash の EXL3 量子化（exllamav3）: GPU、iGPU lane、CPU lane で計算。インストーラが PC ごとにおすすめを表示
+- [ ] DeepSeek V4 / V4.1 の EXL3 量子化、RDNA 向けに調整した iGPU のトレリス計算
 - [ ] DSpark のドラフトモデル（この GGUF には MTP ブロックがない）
 - [ ] 会話のディスク保存
 - [ ] DeepSeek V4 での Windows（確認したのは Linux。RX 7900 XT でのコミュニティビルドは [AMD HIP](docs/maya/AMD_HIP.md)）
@@ -251,7 +257,9 @@ DeepSeek V4（llama.cpp の `deepseek4` アーキテクチャ）と V4.1（`deep
 [docs/maya/](docs/maya/README.md) に残している。DeepSeek V4 の計算は [llama.cpp](https://github.com/ggml-org/llama.cpp) の
 実装に、量子化モデルは [unsloth](https://huggingface.co/unsloth) のものに拠っている。V4.1 の移植は antirez の DwarfStar（ds4）と
 llama.cpp の V4.1 プルリクエストに拠り、GGUF は nazeshinjite と mrfakename のもの、品質の基準は Lucebox の held-out セット。
-すべてに感謝する。
+EXL3 対応は Maya（@needmorevram）のもので、[exllamav3](https://github.com/turboderp-org/exllamav3) の形式・コードブック・
+カーネルに拠る（MIT、Copyright (c) 2025 Turboderp。[third_party/exllamav3/LICENSE](third_party/exllamav3/LICENSE)）。EXL3 の
+量子化モデルは turboderp のもの。すべてに感謝する。
 
 ## 📄 ライセンス
 

@@ -56,6 +56,9 @@ experts stay on the SSD. What changed from V4: [the V4.1 spec](docs/deepseek41/S
 - **Several GPUs, AMD, V100** — a layer split across NVIDIA cards, an experimental HIP build for Radeon, and an sm_70
   build with CUDA 12.
 - **One-command setup** — engine, model, pack, config and the `Abyss-tools` helper scripts.
+- **EXL3 quants (GLM-5.3-Flash, experimental)** — exllamav3's trellis quants read in place: turboderp's sc_2.10bpw
+  predicts text better than Maya-S-v2 at 8 GB less (nll 1.59 vs 1.63), decoding at ~2/3 its speed on an APU lane; the
+  installer says which suits your PC ([EXL3](docs/exl3/README.md)).
 
 ## 📊 Performance
 
@@ -228,6 +231,7 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 | [Spec](docs/deepseek4/SPEC.md) | DeepSeek V4's forward pass as implemented |
 | [DeepSeek V4.1](docs/deepseek41/README.md) | V4.1 Flash (1017): which GGUFs load, packing, running it, quality and speed, its options |
 | [V4.1 spec](docs/deepseek41/SPEC.md) | what V4.1 changes against V4's forward pass, and where Abyss implements it |
+| [EXL3](docs/exl3/README.md) | exllamav3 quants of GLM-5.3-Flash: which PCs they suit, the quants offered, packing, measurements, settings |
 | [Maya docs](docs/maya/README.md) | Maya's documentation, unchanged: GLM-5.3-Flash, its installer (`./abyss.sh`), tuning, AMD, multi-GPU |
 
 ## 🗺️ Roadmap
@@ -243,6 +247,8 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 - [x] Several NVIDIA GPUs (layer split with speculative decoding and prestaging; RTX 5090 + RTX 3090 measured)
 - [x] AMD (HIP, experimental): runs on the Radeon 8060S with WMMA kernels
 - [x] V100 (sm_70) builds with CUDA 12
+- [x] EXL3 quants of GLM-5.3-Flash (exllamav3), on the GPU, the iGPU lane and the CPU lane; a per-PC recommendation in the installer
+- [ ] EXL3 quants of DeepSeek V4 / V4.1; an RDNA-tuned iGPU trellis kernel
 - [ ] A DSpark drafter (this GGUF has no MTP block)
 - [ ] Conversation slots on disk
 - [ ] Windows for DeepSeek V4 (Linux tested; community builds on an RX 7900 XT, see [AMD HIP](docs/maya/AMD_HIP.md))
@@ -260,7 +266,10 @@ Maya's GLM-5.3-Flash runner, expert tiers, prompt path, server and dashboard are
 [docs/maya/](docs/maya/README.md). The DeepSeek V4 math follows [llama.cpp](https://github.com/ggml-org/llama.cpp)'s
 implementation, and the quantized model is [unsloth](https://huggingface.co/unsloth)'s. The V4.1 port follows
 antirez's DwarfStar (ds4) and llama.cpp's V4.1 pull request; its GGUFs are nazeshinjite's and mrfakename's, and its
-quality reference is Lucebox's held-out set. Thanks to all of them.
+quality reference is Lucebox's held-out set. EXL3 support is Maya's (@needmorevram), after
+[exllamav3](https://github.com/turboderp-org/exllamav3)'s format, codebooks and kernels (MIT, Copyright (c) 2025
+Turboderp; [third_party/exllamav3/LICENSE](third_party/exllamav3/LICENSE)); the EXL3 quants are turboderp's. Thanks to
+all of them.
 
 ## 📄 License
 

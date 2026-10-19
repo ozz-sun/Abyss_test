@@ -7,6 +7,32 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.35 - 2026-10-19
+
+**EXL3 quants of GLM-5.3-Flash (exllamav3), experimental; the installer says which quant suits the PC.**
+- **The engine reads EXL3** - exllamav3's trellis-coded quants, in place from their safetensors - with Project Maya's
+  EXL3 support (by @needmorevram, after exllamav3's format and kernels; Maya 25cbbf3, the kernels at v1.1.15): the
+  packer (`tools/exl3_pack.py`), the GPU kernels (tensor-core tile decode on RTX 30+, CUDA cores before), the prompt
+  path (light experts on the tensor-core kernels, the rest decoded to FP16 for cuBLAS with their rows rotated) and the
+  CPU lane's split-K AVX-512 / AVX2 kernels (0.118 ms an expert on 16 Zen 5 threads).
+- **The iGPU lane computes EXL3 experts** (new in Abyss): `libabyss_igpu.so` builds the EXL3 kernels for the APU and
+  `abyss_igpu_experts_x3` runs a route's RAM-tier experts on the registered RAM tier (0.088 ms an expert on a Radeon
+  8060S). An EXL3 expert never reaches the ggml-type kernels; a path without EXL3 kernels uses the CPU's.
+- **Measured** (RTX 5090 + Radeon 8060S lane + 94 GB RAM, glm_ids4k's last 1,000 tokens): turboderp's sc_2.10bpw
+  (88.3 GB) nll 1.591-1.598, top-1 63.3-63.7%, 22.4-22.7 ms a token; Maya-S-v2-IQ2_XXS (96.5 GB) 1.634 / 62.3% /
+  14.8 ms. Better text at 8 GB less, at about two thirds of the decode speed on this lane.
+- **The installer** (`./abyss.sh --setup`) offers `EXL3-sc_2.10bpw` (new, pinned to 8d2eca0e) and `EXL3-3.05bpw`
+  beside the GGUFs, every file checked by size and sha256, and says what each suits on this PC: recommended (and the
+  default) when RTX 30+ cards hold 80% of it, a quality option with an APU iGPU or an AVX-512 CPU for the RAM tier,
+  not for a CPU with AVX2 only, or "experts would come from the SSD". Each quant has its own config and start script,
+  so a GGUF and an EXL3 install sit side by side. NVIDIA only in the setup.
+- **`STRATA_GLM_X3_SPLIT`** (opt-in): the CPU threads compute a share of each EXL3 route while the iGPU computes the
+  rest. Slower on a Ryzen AI Max+ 395, whose CPU and iGPU share power and heat (22.7 ms alone vs 23.5-32.6 split).
+- GGUF models are unchanged: GLM-5.3-Flash Maya-S-v2 KL 0.000000 against v1.3.34's logits, DeepSeek V4 KL 0.005939 as
+  before.
+- Docs: [docs/exl3/README.md](docs/exl3/README.md), an EXL3 section in the manuals; exllamav3's MIT notice in
+  `third_party/exllamav3/LICENSE`.
+
 ## v1.3.34 - 2026-10-19
 
 **DeepSeek V4.1 on Windows: the Engram tables build and read (issue #6).**

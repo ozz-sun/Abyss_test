@@ -15,6 +15,7 @@ installer) is kept under [docs/maya/](maya/README.md).
 - [Configure and start](#configure-and-start)
 - [Using it](#using-it)
 - [DeepSeek V4.1 Flash](#deepseek-v41-flash)
+- [EXL3 quants (GLM-5.3-Flash)](#exl3-quants-glm-53-flash)
 - [Memory and speed](#memory-and-speed)
 - [Settings](#settings)
 - [Checking the output against llama.cpp](#checking-the-output-against-llamacpp)
@@ -341,6 +342,24 @@ measurements, and [docs/deepseek41/SPEC.md](deepseek41/SPEC.md) what the model c
   pinned tier together can push systemd-oomd into killing the desktop session.
 - **Not yet:** speculative decoding, a layer split, conversation slots on disk, images.
 
+## EXL3 quants (GLM-5.3-Flash)
+
+From v1.3.35 the engine also reads [exllamav3](https://github.com/turboderp-org/exllamav3)'s EXL3 quants of
+GLM-5.3-Flash, in place from their safetensors; [docs/exl3/README.md](exl3/README.md) has the details. In short:
+
+- **Installing.** `./abyss.sh --setup` lists turboderp's `EXL3-sc_2.10bpw` (88.3 GB) and `EXL3-3.05bpw` (125.3 GB)
+  beside Maya's GGUFs and says what each suits on this PC: recommended when RTX 30+ cards hold 80% of it, a quality
+  option with an APU iGPU or an AVX-512 CPU for the RAM tier, not for a CPU with AVX2 only. `--model EXL3-sc_2.10bpw`
+  skips the question. NVIDIA GPUs only in the setup.
+- **Switching.** Each quant gets its own config and start script (`maya-exl3-sc_2.10bpw.json`,
+  `run-maya-exl3-sc_2.10bpw.sh`); a GGUF install and an EXL3 install sit side by side. The engine knows an EXL3 pack by
+  its `pack/exl3.txt` - no setting.
+- **By hand.** `.venv/bin/python tools/exl3_pack.py --model <dir>` (~5 s) writes `<dir>/maya-exl3.gguf` and
+  `<dir>/pack/`; start with `--glm-pack <dir>/pack`.
+- **What to expect** (RTX 5090 + Radeon 8060S lane + 94 GB RAM, 1,000 scored tokens): sc_2.10bpw nll 1.591-1.598 and
+  top-1 63.3-63.7% against Maya-S-v2-IQ2_XXS's 1.634 / 62.3%, at 22.4-22.7 ms a token against 14.8 - an EXL3 expert
+  costs the iGPU lane 0.088 ms against 0.041.
+
 ## Memory and speed
 
 The engine fills the GPU's free VRAM with experts (after the dense weights, 6.2 GB for UD-Q2_K_XL, the caches and the
@@ -402,6 +421,8 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_RAM_THP` | on (Linux) | the RAM tier in transparent huge pages, as far as the free 2 MB blocks go (an APU lane re-validates 512x fewer pages: no multi-second lane stalls); `0`: the driver's pinned pages |
 | `STRATA_GLM_RESERVE_MB` | 700 | VRAM left free beside the expert pool |
 | `STRATA_GLM_CPU_LANE` | one thread per physical core | CPU threads computing RAM-tier experts; `0` = off |
+| `STRATA_GLM_X3_SPLIT` | off | an EXL3 pack: the CPU threads compute this fraction of each route's RAM-tier experts while the iGPU computes the rest (`auto`: by their timings); slower on a Ryzen AI Max+ 395 (shared power and heat), see [EXL3](exl3/README.md#settings) |
+| `STRATA_GLM_EXL3_DECODE` | by GPU | an EXL3 pack: `new` (tensor-core tiles, RTX 30+) or `legacy` (CUDA cores) on any GPU |
 | `STRATA_GLM_CPU_PIN` | off | `<CPU list>` (e.g. `0-15`, `0,2,4-7`): pin the CPU lane's workers to those CPUs and cap their count at the list's size, one GPU or a split, Linux and Windows (v1.3.29); `1` / `0`: a split's per-part pools pinned or not, as before |
 | `STRATA_GLM_PCIE_SHARE` | measured at start | the share of RAM-tier experts copied over PCIe instead of computed on the CPU (`0` = all on the CPU, `1` = none) |
 | `STRATA_GLM_PREFILL` / `--prefill` | `auto` | the prompt chunk: `auto`, a number of tokens, or `0` (token by token) |

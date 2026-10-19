@@ -15,6 +15,7 @@ Abyss は [Project Maya](https://github.com/mw00/project-maya)（MIT）をコピ
 - [設定と起動](#設定と起動)
 - [使い方](#使い方)
 - [DeepSeek V4.1 Flash](#deepseek-v41-flash)
+- [EXL3 量子化（GLM-5.3-Flash）](#exl3-量子化glm-53-flash)
 - [メモリと速度](#メモリと速度)
 - [設定項目](#設定項目)
 - [llama.cpp との照合](#llamacpp-との照合)
@@ -336,6 +337,24 @@ v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。準�
   層が重なると、systemd-oomd がデスクトップのセッションを止めることがある。
 - **まだできないこと:** 投機デコード、層の分割、会話のディスク保存、画像。
 
+## EXL3 量子化（GLM-5.3-Flash）
+
+v1.3.35 から、エンジンは [exllamav3](https://github.com/turboderp-org/exllamav3) の EXL3 量子化の GLM-5.3-Flash も、
+safetensors からそのまま読む。詳しくは [docs/exl3/README.md](exl3/README.md)（英語）。要点:
+
+- **インストール。** `./abyss.sh --setup` のモデル選択に、Maya の GGUF と並んで turboderp の `EXL3-sc_2.10bpw`（88.3 GB）と
+  `EXL3-3.05bpw`（125.3 GB）が出る。それぞれにこの PC での向き不向きを表示する: RTX 30 以降のカードに 8 割以上載るなら
+  おすすめ、APU の iGPU か AVX-512 の CPU が RAM 層を計算できるなら品質優先の選択肢、AVX2 だけの CPU には向かない。
+  `--model EXL3-sc_2.10bpw` で質問を飛ばせる。セットアップでは NVIDIA の GPU のみ。
+- **切り替え。** 量子化ごとに設定ファイルと起動スクリプトができる（`maya-exl3-sc_2.10bpw.json`、
+  `run-maya-exl3-sc_2.10bpw.sh`）。GGUF と EXL3 を両方入れておき、起動するスクリプトで選ぶ。エンジンは
+  `pack/exl3.txt` があれば EXL3 として読むので、設定項目は要らない。
+- **手作業で。** `.venv/bin/python tools/exl3_pack.py --model <dir>`（約 5 秒）で `<dir>/maya-exl3.gguf` と `<dir>/pack/`
+  ができる。起動は `--glm-pack <dir>/pack`。
+- **目安**（RTX 5090 + Radeon 8060S の lane + RAM 94 GB、採点 1,000 トークン）: sc_2.10bpw は nll 1.591〜1.598、1 位一致
+  63.3〜63.7%（Maya-S-v2-IQ2_XXS は 1.634 / 62.3%）。1 トークン 22.4〜22.7 ms（同 14.8 ms）。iGPU lane でのエキスパート
+  1 個は 0.088 ms（GGUF は 0.041 ms）。
+
 ## メモリと速度
 
 エンジンは、密な重み（UD-Q2_K_XL で 6.2 GB）、キャッシュ、prompt 用のバッファを置いた残りの VRAM をエキスパートで
@@ -394,6 +413,8 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 | `STRATA_GLM_RAM_THP` | オン（Linux） | RAM 層を透過的ヒュージページに置く（空きの 2 MB ブロックの範囲で。APU のレーンが再検証するページが 512 分の 1 になり、数秒の停止が消える）。`0` でドライバの pinned ページ |
 | `STRATA_GLM_RESERVE_MB` | 700 | エキスパート用プールの横に空けておく VRAM |
 | `STRATA_GLM_CPU_LANE` | 物理コアごとに 1 スレッド | RAM 層のエキスパートを計算する CPU スレッド数。`0` で無効 |
+| `STRATA_GLM_X3_SPLIT` | オフ | EXL3 の pack で、各ルートの RAM 層エキスパートのうちこの割合を CPU スレッドが、残りを iGPU が同時に計算する（`auto`: 起動時の計測から）。Ryzen AI Max+ 395 では電力と熱を共有するため遅くなる（[EXL3](exl3/README.md#settings)） |
+| `STRATA_GLM_EXL3_DECODE` | GPU による | EXL3 の pack で、`new`（tensor core のタイル、RTX 30 以降）か `legacy`（CUDA コア）をどの GPU でも選ぶ |
 | `STRATA_GLM_CPU_PIN` | オフ | `<CPU の並び>`（例 `0-15`、`0,2,4-7`）: CPU レーンのワーカーをその CPU に固定し、スレッド数を並びの数までにする。GPU 1 枚でも分割でも、Linux でも Windows でも効く（v1.3.29）。`1` / `0` は従来どおり、分割の各部のプールを固定するかどうか |
 | `STRATA_GLM_PCIE_SHARE` | 起動時に測定 | RAM 層のエキスパートのうち、CPU で計算せずに PCIe で GPU に送る割合（`0` = すべて CPU、`1` = すべて GPU） |
 | `STRATA_GLM_PREFILL` / `--prefill` | `auto` | prompt のまとめ処理の大きさ: `auto`、トークン数、`0`（1 トークンずつ） |
