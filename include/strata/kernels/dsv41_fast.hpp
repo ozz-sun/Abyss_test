@@ -52,6 +52,8 @@ void candidate_mask(float* score, int n_vis, int block, const unsigned char* kee
 /// qn / kn = [4][n_embd] norm weights; per stream h: s = rms(R_h) * qn_h . rms(key_h) * kn_h / sqrt(n_embd),
 /// g = sigmoid(sign(s) sqrt(max(|s|, 1e-6))), R_h += g * value.
 void engram_add(float* R, const float* kv, const float* qn, const float* kn, int n_embd, float eps, cudaStream_t s);
+/// Waits on the device until the host-pinned *flag == want, then copies n floats from the pinned src to dst.
+void engram_wait(const unsigned int* flag, unsigned int want, const float* src, float* dst, int n, cudaStream_t s);
 
 /// The head's prologue (spec 6.2): h = sum_s pre_s R_s (the last sublayer's pre), x = rms(h) * norm_w -> x (f32) and
 /// xq (q8_1).

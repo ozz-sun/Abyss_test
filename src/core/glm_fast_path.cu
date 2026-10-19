@@ -3326,7 +3326,7 @@ void Glm5Model::fast_service() {
                 //      one the LOOKAHEAD already read (or is reading) is answered from its RAM slot
                 const auto t0 = std::chrono::steady_clock::now();
                 const int cls = F->layer_rc[(size_t) il];
-                int nm = 0, mi[8], nr = 0, rd[8], nw = 0, wt[8], ns = 0, sl[8], nev = 0, evk[8];
+                int nm = 0, mi[8], nr = 0, rd[8], nw = 0, wt[8], wm[8], ns = 0, sl[8], nev = 0, evk[8];
                 uint64_t stv[8];
                 uint8_t* dst[8];
                 for (int i = 0; i < K; ++i)
@@ -3345,6 +3345,7 @@ void Glm5Model::fast_service() {
                                 stv[ns++] = (v & ~(uint64_t) 3u) | 2u;
                                 ++F->ah_stolen;
                             } else if ((v & 3u) != 2u) {
+                                wm[nw] = m;
                                 wt[nw++] = rs;   // a reader has it in hand
                             }
                             ++F->ah_used;
@@ -3435,11 +3436,17 @@ void Glm5Model::fast_service() {
                                        F->cpu_fmt[(size_t) il].n_ff > 0;
                 gf::MoeResponse* Rp = F->resp_h + (next % gf::kCpuAnswers);
                 // STREAMED fetch: the response goes out now, before the reads; the reads below set ready[] bit by bit
-                // and the device's fetch kernel copies each chunk as it lands (the lookahead's in-flight slots are
-                // waited for first - they land outside this call's jobs)
-                const bool stream = F->stream_fetch && !dlane_now && nr > 0;
+                // and the device's fetch kernel copies each chunk as it lands.  The lookahead's in-flight slots go out
+                // as streamed entries too and get all their bits once their reader is done - after this call's own
+                // reads, which so run alongside them (they used to wait for them first: a lookahead read that was
+                // late by most of a read then cost a read and a half).  STRATA_GLM_AHEAD_MERGE=0: the old order
+                static const bool ah_merge = [] {
+                    const char* v = getenv("STRATA_GLM_AHEAD_MERGE");
+                    return v == nullptr || std::atoi(v) != 0;
+                }();
+                const bool stream = F->stream_fetch && !dlane_now && (nr > 0 || (ah_merge && nw > 0));
                 if (stream) {
-                    if (nw > 0) {
+                    if (nw > 0 && !ah_merge) {
                         const auto tw = std::chrono::steady_clock::now();
                         for (int i = 0; i < nw; ++i)
                             while ((F->rload[(size_t) cls][(size_t) wt[i]].load(std::memory_order_acquire) & 3u) != 2u)
@@ -3467,6 +3474,11 @@ void Glm5Model::fast_service() {
                         Rp->ready[mi[rd[r2]]] = 0u;
                         Rp->stream_mask |= 1u << mi[rd[r2]];
                     }
+                    if (ah_merge)
+                        for (int i = 0; i < nw; ++i) {
+                            Rp->ready[mi[wm[i]]] = 0u;
+                            Rp->stream_mask |= 1u << mi[wm[i]];
+                        }
                     std::atomic_thread_fence(std::memory_order_release);
                     Rp->seq = next;
                 }
@@ -3479,6 +3491,19 @@ void Glm5Model::fast_service() {
                     }
                 });
                 for (int i = 0; i < ns; ++i) F->rload[(size_t) cls][(size_t) sl[i]].store(stv[i], std::memory_order_release);
+                if (nw > 0 && stream && ah_merge) {   // the lookahead's in-flight slots: all their chunks once landed
+                    const auto tw = std::chrono::steady_clock::now();
+                    for (int i = 0; i < nw; ++i) {
+                        while ((F->rload[(size_t) cls][(size_t) wt[i]].load(std::memory_order_acquire) & 3u) != 2u)
+                            cpu_relax();
+                        std::atomic_thread_fence(std::memory_order_release);
+                        std::atomic_ref<unsigned int>(Rp->ready[mi[wm[i]]]).store(0xffffffffu, std::memory_order_release);
+                    }
+                    F->ah_waited += (uint64_t) nw;
+                    F->ah_wait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                                std::chrono::steady_clock::now() - tw).count(),
+                                            std::memory_order_relaxed);
+                }
                 if (nw > 0 && !stream) {
                     const auto tw = std::chrono::steady_clock::now();
                     for (int i = 0; i < nw; ++i)

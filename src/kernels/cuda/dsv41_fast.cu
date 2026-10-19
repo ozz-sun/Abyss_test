@@ -266,6 +266,26 @@ void candidate_mask(float* score, int n_vis, int block, const unsigned char* kee
     check("candidate_mask");
 }
 
+// the token's Engram rows of one table, once the host's reader has landed them in pinned memory (*flag == want):
+// copied into the device rows by zero-copy reads (no memcpy on the stream - it would queue behind the expert DMAs)
+__global__ void engram_wait_kernel(const volatile unsigned int* flag, unsigned int want, const float* src, float* dst,
+                                   int n) {
+    if (threadIdx.x == 0) {
+        const long long t0 = clock64();
+        while (*flag != want)
+            if (clock64() - t0 > (1ll << 36)) break;   // (a failed read: the host reports it at the next token)
+        __threadfence_system();
+    }
+    __syncthreads();
+    const volatile float* vs = (const volatile float*) src;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = vs[i];
+}
+
+void engram_wait(const unsigned int* flag, unsigned int want, const float* src, float* dst, int n, cudaStream_t s) {
+    engram_wait_kernel<<<8, 256, 0, s>>>(flag, want, src, dst, n);
+    check("engram_wait");
+}
+
 void engram_add(float* R, const float* kv, const float* qn, const float* kn, int n_embd, float eps, cudaStream_t s) {
     engram_kernel<<<4, 512, 0, s>>>(R, kv, qn, kn, n_embd, eps);
     check("engram");

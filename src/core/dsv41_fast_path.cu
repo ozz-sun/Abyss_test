@@ -141,6 +141,25 @@ struct V41Engram {
     std::mutex stripe[256];
     std::atomic<uint64_t> hits{0}, misses{0};
     std::unique_ptr<EngPool> pool;
+    // the token's rows in the BACKGROUND (STRATA_DS41_ENGRAM_ASYNC, default on): a decode token's 48 row reads used to
+    // hold the host before layer 0's launch while the GPU idled (the token is known only once the last one ended);
+    // now one thread reads table 0's 24 rows, flags them, then table 1's, and the device waits at layers 1 / 14
+    std::mutex am;
+    std::condition_variable acv;
+    bool a_have = false, a_busy = false, a_bad = false;
+    std::string a_err;
+    uint64_t a_rows[2 * kEngCols] = {};
+    float* a_dst = nullptr;
+    unsigned int* a_flag = nullptr;
+    unsigned int a_seq = 0;
+    std::thread a_th;
+    // a prompt chunk's rows PREFETCHED into the row cache (table 0's while layer 0 runs, then table 1's for layer 14)
+    // (STRATA_DS41_ENGRAM_PREFETCH, default on; needs the row cache): its own few threads, stopped at the next chunk or
+    // token - the rows are read the same way, so the prompt's sums are unchanged
+    std::unique_ptr<EngPool> ppool;
+    std::thread p_th;
+    std::atomic<bool> p_stop{false};
+    std::atomic<uint64_t> p_reads{0};
 };
 
 float e4m3(uint8_t b) {
@@ -422,6 +441,12 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
         err = "deepseek41: the Engram staging buffer did not allocate";
         return false;
     }
+    if (cudaMallocHost(&F->v41_eng_flag, 2 * sizeof(unsigned int)) != cudaSuccess) {
+        cudaGetLastError();
+        F->v41_eng_flag = nullptr;   // (the rows are then read before layer 0, as before)
+    } else {
+        F->v41_eng_flag[0] = F->v41_eng_flag[1] = 0u;
+    }
     std::fprintf(stderr, "deepseek41: CUDA%d attention caches %.2f GB for %lld tokens (KV slots of ratio %d/%d/%d/%d)\n",
                  dev_, (double) bytes / 1073741824.0, (long long) ctx, slot_ratio[0], slot_ratio[1], slot_ratio[2],
                  slot_ratio[3]);
@@ -431,9 +456,9 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
 void Glm5Model::dsv41_engram_report() const {
     if (const auto* E = (const V41Engram*) v41_eng_) {
         const uint64_t h = E->hits.load(), m = E->misses.load();
-        std::fprintf(stderr, "deepseek41 Engram CUDA%d: %llu rows, %.1f%% from the row cache, %llu read\n", dev_,
-                     (unsigned long long) (h + m), 100.0 * (double) h / (double) std::max<uint64_t>(1, h + m),
-                     (unsigned long long) m);
+        std::fprintf(stderr, "deepseek41 Engram CUDA%d: %llu rows, %.1f%% from the row cache, %llu read (+%llu prefetched)\n",
+                     dev_, (unsigned long long) (h + m), 100.0 * (double) h / (double) std::max<uint64_t>(1, h + m),
+                     (unsigned long long) m, (unsigned long long) E->p_reads.load());
     }
 }
 
@@ -547,6 +572,68 @@ bool engram_row(V41Engram& E, int k, uint64_t row, float* dst, std::string& err)
     return true;
 }
 
+bool engram_rows_par(V41Engram& E, int n, const uint64_t* rows, int kk, const int* ks, float* dst, std::string& err);
+
+// the background reader's loop (started on the first async token; lives as long as the process, as the pool does)
+void engram_async_loop(V41Engram* E) {
+    for (;;) {
+        std::unique_lock<std::mutex> l(E->am);
+        E->acv.wait(l, [&] { return E->a_have; });
+        E->a_have = false;
+        uint64_t rows[2 * kEngCols];
+        std::memcpy(rows, E->a_rows, sizeof rows);
+        float* dst = E->a_dst;
+        unsigned int* flag = E->a_flag;
+        const unsigned int seq = E->a_seq;
+        l.unlock();
+        std::string e;
+        bool ok = true;
+        for (int k = 0; k < 2; ++k) {
+            if (ok && !engram_rows_par(*E, kEngCols, rows + (size_t) k * kEngCols, k, nullptr,
+                                       dst + (size_t) k * kEngCols * kEngDim, e))
+                ok = false;
+            std::atomic_thread_fence(std::memory_order_release);
+            std::atomic_ref<unsigned int>(flag[k]).store(seq, std::memory_order_release);   // (even on a failure)
+        }
+        l.lock();
+        if (!ok && !E->a_bad) { E->a_bad = true; E->a_err = e; }
+        E->a_busy = false;
+        E->acv.notify_all();
+    }
+}
+
+// a row's raw bytes into the row cache unless there (the prefetch: no decode, no error - a failed read stays a miss)
+void engram_cache_row(V41Engram& E, int k, uint64_t row) {
+    uint8_t raw[kEngRowMax];
+    const int RB = E.row_bytes;
+    const uint64_t key = (((uint64_t) k << 63) | row) + 1;
+    const uint64_t slot = (row * 0x9E3779B97F4A7C15ull ^ (uint64_t) k) & E.cmask;
+    {
+        std::lock_guard<std::mutex> l(E.stripe[slot & 255]);
+        if (E.tag[slot] == key) return;
+    }
+    if (!engram_read(E, k, E.off[k] + row * (uint64_t) RB, raw, (size_t) RB)) return;
+    E.p_reads.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> l(E.stripe[slot & 255]);
+    E.tag[slot] = key;
+    std::memcpy(E.cache.data() + slot * (uint64_t) RB, raw, (size_t) RB);
+}
+
+void engram_pf_stop(V41Engram& E) {
+    if (!E.p_th.joinable()) return;
+    E.p_stop.store(true, std::memory_order_relaxed);
+    E.p_th.join();
+    E.p_stop.store(false, std::memory_order_relaxed);
+}
+
+// waits for the background reader to be idle; its failure, if any, is this call's
+bool engram_sync(V41Engram& E, std::string& err) {
+    std::unique_lock<std::mutex> l(E.am);
+    E.acv.wait(l, [&] { return !E.a_busy; });
+    if (E.a_bad) { err = E.a_err.empty() ? "deepseek41: Engram row read failed" : E.a_err; return false; }
+    return true;
+}
+
 // n rows (table of each: k[j] or kk for all) -> dst rows, across the Engram pool
 bool engram_rows_par(V41Engram& E, int n, const uint64_t* rows, int kk, const int* ks, float* dst, std::string& err) {
     std::atomic<bool> bad{false};
@@ -567,8 +654,31 @@ bool Glm5Model::dsv41_engram_token(int32_t tok, std::string& err) {
     FastState* F = fast_;
     auto* E = (V41Engram*) v41_eng_;
     if (E == nullptr) { err = "deepseek41: Engram is not open"; return false; }
+    static const bool async = [] {
+        const char* v = getenv("STRATA_DS41_ENGRAM_ASYNC");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (!engram_sync(*E, err)) return false;
+    engram_pf_stop(*E);
     uint64_t rows[2 * kEngCols];
     if (!engram_rows(*E, tok, pos_ - 1, rows, err)) return false;   // (pos_ has moved past this token already)
+    F->v41_eng_async = async && F->v41_eng_flag != nullptr;
+    if (F->v41_eng_async) {
+        if (++F->v41_eng_seq == 0u) F->v41_eng_seq = 1u;
+        std::lock_guard<std::mutex> l(E->am);
+        std::memcpy(E->a_rows, rows, sizeof rows);
+        E->a_dst = F->v41_eng_h;
+        E->a_flag = F->v41_eng_flag;
+        E->a_seq = F->v41_eng_seq;
+        E->a_have = true;
+        E->a_busy = true;
+        if (!E->a_th.joinable()) {
+            E->a_th = std::thread(engram_async_loop, E);
+            E->a_th.detach();
+        }
+        E->acv.notify_all();
+        return true;
+    }
     int ks[2 * kEngCols];
     for (int j = 0; j < 2 * kEngCols; ++j) ks[j] = j / kEngCols;
     if (!engram_rows_par(*E, 2 * kEngCols, rows, 0, ks, F->v41_eng_h, err)) return false;
@@ -579,9 +689,28 @@ bool Glm5Model::dsv41_engram_token(int32_t tok, std::string& err) {
 bool Glm5Model::dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::string& err) {
     auto* E = (V41Engram*) v41_eng_;
     if (E == nullptr) { err = "deepseek41: Engram is not open"; return false; }
+    if (!engram_sync(*E, err)) return false;   // (the pool is the background reader's too)
+    engram_pf_stop(*E);
     E->chunk.resize((size_t) T * 2 * kEngCols);
     for (int t = 0; t < T; ++t)
         if (!engram_rows(*E, toks[t], p0 + t, E->chunk.data() + (size_t) t * 2 * kEngCols, err)) return false;
+    static const int pf_threads = [] {
+        const char* v = getenv("STRATA_DS41_ENGRAM_PREFETCH");
+        return v == nullptr ? 8 : std::max(0, std::min(16, std::atoi(v)));   // (1 = on: 8 threads; 0 = off)
+    }();
+    // table 0's rows (layer 1 reads them right after layer 0), then table 1's (layer 14's), as many tokens as half
+    // of the direct-mapped cache holds without crowding it out
+    const int tn = (int) std::min<uint64_t>((uint64_t) T, (E->cmask + 1) / 4 / kEngCols);
+    if (pf_threads > 0 && E->cmask != 0 && tn > 0) {
+        if (!E->ppool) E->ppool = std::make_unique<EngPool>(pf_threads == 1 ? 7 : pf_threads - 1);
+        E->p_th = std::thread([E, tn] {
+            E->ppool->run(2 * tn * kEngCols, [E, tn](int j) {
+                if (E->p_stop.load(std::memory_order_relaxed)) return;
+                const int k = j / (tn * kEngCols), t = (j / kEngCols) % tn, c = j % kEngCols;
+                engram_cache_row(*E, k, E->chunk[(size_t) t * 2 * kEngCols + (size_t) k * kEngCols + c]);
+            });
+        });
+    }
     return true;
 }
 
@@ -613,7 +742,12 @@ bool Glm5Model::dsv41_engram_add(int il, float* R, std::string& err, const float
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
-    if (rows == nullptr) rows = F->v41_eng + (size_t) Ly.eng * kEngCols * kEngDim;
+    if (rows == nullptr) {   // a decode token's rows
+        rows = F->v41_eng + (size_t) Ly.eng * kEngCols * kEngDim;
+        if (F->v41_eng_async)
+            d41::engram_wait(F->v41_eng_flag + Ly.eng, F->v41_eng_seq, F->v41_eng_h + (size_t) Ly.eng * kEngCols * kEngDim,
+                             (float*) rows, kEngCols * kEngDim, F->cs);
+    }
     const void* rq = nullptr;   // (a quantized engram_kv - mrfakename's Q2_K - takes the rows as Q8_1)
     if (Ly.eng_kv.type != gf::kTypeBF16 && Ly.eng_kv.type != gf::kTypeF32) {
         rq = (const uint8_t*) F->v41_eng_q + (size_t) Ly.eng * kEngCols * kEngDim / 32 * 36;

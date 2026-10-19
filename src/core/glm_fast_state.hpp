@@ -366,6 +366,9 @@ struct Glm5Model::FastState {
     int* v41_bsel = nullptr;                                    // the selected candidate blocks
     unsigned char* v41_keep = nullptr;                          // the candidate mask of this token (ctx / 8)
     float *v41_eng = nullptr, *v41_eng_h = nullptr;             // Engram rows (2 x 24 x 256 f32, device / pinned)
+    unsigned int* v41_eng_flag = nullptr;                        // pinned: a table's rows landed for token v41_eng_seq
+    unsigned int v41_eng_seq = 0;
+    bool v41_eng_async = false;                                  // this token's rows come from the background reader
     float* v41_eng_kv = nullptr;                                // engram_kv's output (5 x n_embd)
     void* v41_eng_q = nullptr;                                  // the Engram rows as Q8_1 (a quantized engram_kv)
     float *v41_pblk = nullptr, *v41_pblk_h = nullptr;           // the prompt path's block of rows (256 tokens' 24 x 256)
