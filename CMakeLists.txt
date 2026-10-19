@@ -246,6 +246,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dsv4_fast.cu
                           src/kernels/cuda/dsv41_fast.cu
                           src/kernels/cuda/exl3.cu
+                          src/kernels/cuda/exl3_legacy.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -392,10 +393,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                 -I${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hip_compat
                 -include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hip_compat/cuda_runtime.h
                 -x hip ${CMAKE_CURRENT_SOURCE_DIR}/src/igpu/igpu_lane.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/igpu/igpu_fused.cu
-                ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/exl3.cu
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/exl3.cu ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/exl3_legacy.cu
                 -o "${_strata_igpu_so}"
         DEPENDS src/igpu/igpu_lane.cpp src/igpu/igpu_fused.cu src/igpu/igpu_fused.h src/kernels/cuda/glm_fast.cu include/strata/kernels/glm_fast.hpp
-                src/kernels/cuda/exl3.cu include/strata/kernels/exl3.hpp
+                src/kernels/cuda/exl3.cu src/kernels/cuda/exl3_legacy.cu include/strata/kernels/exl3.hpp
                 include/strata/igpu/igpu_lane.h
         COMMENT "Building the iGPU lane (libabyss_igpu.so, ${STRATA_IGPU_ARCH})"
         VERBATIM)
@@ -1020,6 +1021,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+  # the EXL3 CPU lane's tiers on random experts: a band's compute speed, and an expert's time on T threads from DRAM
+  # in the engine's jobs (what the start-up timing compares with a copy over PCIe) - a benchmark, not a test
+  add_executable(exl3_cpu_bench src/kernels/cpu/exl3_cpu_bench.cpp)
+  target_link_libraries(exl3_cpu_bench PRIVATE strata_kernels_cpu)
 
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
