@@ -19,8 +19,10 @@
 #include "ggml.h"
 #include <cuda_runtime.h>
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -114,7 +116,11 @@ struct EngPool {
 struct V41Engram {
     int gtype = -1;            // llama.cpp's layout: a ggml row type (Q8_0 / Q2_K ...) decoded by ggml; ds4: e4m3 + e8m0 rows (264)
     int row_bytes = 264;
+#ifdef _WIN32
+    HANDLE h[2] = {INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE};   // the tables' files, overlapped
+#else
     int fd[2] = {-1, -1};
+#endif
     uint64_t off[2] = {0, 0}, rows[2] = {0, 0};
     int layer[2] = {-1, -1};
     uint32_t primes[2][kEngCols] = {};
@@ -175,9 +181,17 @@ bool engram_open(const std::string& pack, V41Engram& E, std::string& err) {
             std::getline(is, path);
             path.erase(0, path.find_first_not_of(' '));
             if (k < 0 || k > 1 || path.empty()) { err = "deepseek41: engram.txt: bad table line"; return false; }
+#ifdef _WIN32
+            // overlapped: Windows runs the reads of a synchronous handle one at a time, and the pool reads from 16
+            // threads (issue #6)
+            E.h[k] = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED, nullptr);
+            if (E.h[k] == INVALID_HANDLE_VALUE) { err = "deepseek41: cannot open the Engram table in " + path; return false; }
+#else
             E.fd[k] = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
             if (E.fd[k] < 0) { err = "deepseek41: cannot open the Engram table in " + path; return false; }
             posix_fadvise(E.fd[k], 0, 0, POSIX_FADV_RANDOM);   // (264-byte rows at random: no readahead)
+#endif
             E.off[k] = off;
             E.rows[k] = rows;
             E.layer[k] = il;
@@ -457,6 +471,39 @@ bool engram_rows(V41Engram& E, int32_t tok, int64_t p, uint64_t* rows, std::stri
     return true;
 }
 
+// n bytes of table k's file at byte at (64-bit: the tables sit past 100 GB) -> dst
+static bool engram_read(V41Engram& E, int k, uint64_t at, uint8_t* dst, size_t n) {
+    size_t done = 0;
+#ifdef _WIN32
+    // each read waits on this thread's own event; closed when its thread ends
+    struct Ev {
+        HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        ~Ev() { if (ev != nullptr) CloseHandle(ev); }
+    };
+    static thread_local Ev ev;
+    if (ev.ev == nullptr) return false;
+    while (done < n) {
+        OVERLAPPED ov{};
+        ov.Offset = (DWORD) (at + done);
+        ov.OffsetHigh = (DWORD) ((at + done) >> 32);
+        ov.hEvent = ev.ev;
+        DWORD r = 0;
+        if (!ReadFile(E.h[k], dst + done, (DWORD) (n - done), nullptr, &ov) && GetLastError() != ERROR_IO_PENDING)
+            return false;
+        if (!GetOverlappedResult(E.h[k], &ov, &r, TRUE) || r == 0) return false;
+        done += (size_t) r;
+    }
+#else
+    while (done < n) {
+        const ssize_t r = pread(E.fd[k], dst + done, n - done, (off_t) (at + done));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        done += (size_t) r;
+    }
+#endif
+    return true;
+}
+
 // table k's 24 rows (row numbers rows[0..23]) -> dst, 24 x 256 floats
 // one row of table k -> dst (256 floats), through the raw row cache
 bool engram_row(V41Engram& E, int k, uint64_t row, float* dst, std::string& err) {
@@ -476,13 +523,9 @@ bool engram_row(V41Engram& E, int k, uint64_t row, float* dst, std::string& err)
     if (hit) {
         E.hits.fetch_add(1, std::memory_order_relaxed);
     } else {
-        const uint64_t at = E.off[k] + row * (uint64_t) RB;
-        size_t done = 0;
-        while (done < (size_t) RB) {
-            const ssize_t n = pread(E.fd[k], raw + done, RB - done, (off_t) (at + done));
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) { err = "deepseek41: Engram row read failed"; return false; }
-            done += (size_t) n;
+        if (!engram_read(E, k, E.off[k] + row * (uint64_t) RB, raw, (size_t) RB)) {
+            err = "deepseek41: Engram row read failed";
+            return false;
         }
         E.misses.fetch_add(1, std::memory_order_relaxed);
         if (E.cmask != 0) {

@@ -7,6 +7,19 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.34 - 2026-10-19
+
+**DeepSeek V4.1 on Windows: the Engram tables build and read (issue #6).**
+- `src/core/dsv41_fast_path.cu` used POSIX calls only (`<unistd.h>`, `O_CLOEXEC`, `posix_fadvise`, `pread`), so it
+  did not compile with MSVC / TheRock ROCm, and with them patched over, the `(off_t)` offset cast cut the tables'
+  offsets (162 GB / 264 GB into nazeshinjite's Q2) to Windows' 32-bit `off_t`: rows came from the wrong place and the
+  engine stopped with "an invalid Engram row (NaN code or scale)". On Windows the tables are now opened with
+  `CreateFileA` (`FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED`) and read with an overlapped `ReadFile` at the full
+  64-bit offset, each reader thread waiting on its own event - the 16 Engram readers run at once, as the expert reads
+  do (a synchronous handle would read one at a time). Linux is unchanged: on Lucebox's held-out sequence 0 the same
+  logits as v1.3.33 (KL 0.184819, 49,104 rows read) and the same speed (55.9-56.6 against 56.2-56.8 ms a token,
+  cooled SSD, alternating runs). Thanks to @ozz-sun for the analysis and the Windows run (RX 7900 XT, 10.55 tok/s).
+
 ## v1.3.33 - 2026-10-19
 
 **Docs: DeepSeek V4.1 and what it changes against V4; the documents brought up to date.** No code change.
