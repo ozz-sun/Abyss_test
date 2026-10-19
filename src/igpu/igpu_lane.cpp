@@ -73,7 +73,95 @@ __global__ void __launch_bounds__(256) lane_down_kernel(const unsigned long long
         if (threadIdx.x == 0) atomicAdd(done, 1u);
     }
 }
+// The lane's Q2_K down (DeepSeek V4.1's experts): 8 lanes a row, lane j on q8_1 block j of each 256-value super-block,
+// so a 2304-wide row is 9 steps with no lane idle (rows_dot's 16 calls a block over 32 lanes leave half of them idle in
+// the last of 5).  A block's 32 values are 8 ints of one 32-byte qs run at shift 2 * (j % 4), with scales 2j / 2j + 1:
+// the products and the min terms stay integer, one float multiply-add a block instead of 8.  Not bit-identical to
+// rows_dot (another sum order).  NR rows a lane group: 4 * NR rows a warp
+template<int NR>
+__global__ void __launch_bounds__(256) lane_down_q2k_kernel(const unsigned long long* plan_ptr, const float* plan_w,
+                                                            int k, int n_ff, size_t down_off,
+                                                            const block_q8_1* __restrict__ hq, float* __restrict__ out,
+                                                            unsigned int* done) {
+    __shared__ unsigned long long s_ptr[8];
+    __shared__ float s_w[8];
+    if (threadIdx.x < 8) {
+        s_ptr[threadIdx.x] = (int) threadIdx.x < k ? plan_ptr[threadIdx.x] : 0ull;
+        s_w[threadIdx.x] = (int) threadIdx.x < k ? plan_w[threadIdx.x] : 0.0f;
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 3, j = lane & 7;
+    const int r0 = ((blockIdx.x * 8 + warp) * 4 + g) * NR;
+    const int nsb = n_ff / 256;
+    const size_t drb = (size_t) nsb * sizeof(block_q2_K);
+    const int sh = 2 * (j & 3), qo = (j >> 2) * 32;
+    float m[NR];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) m[r] = 0.0f;
+    for (int i = 0; i < k; ++i) {
+        if (s_ptr[i] == 0ull) continue;
+        const block_q2_K* rows[NR];
+#pragma unroll
+        for (int r = 0; r < NR; ++r)
+            rows[r] = (const block_q2_K*) ((const uint8_t*) s_ptr[i] + down_off + (size_t) (r0 + r) * drb);
+        const block_q8_1* x = hq + (size_t) i * (n_ff / 32) + j;
+        float acc[NR];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) acc[r] = 0.0f;
+        for (int sb = 0; sb < nsb; ++sb) {
+            const block_q8_1* xb = x + sb * 8;
+            int u[8];
+#pragma unroll
+            for (int l = 0; l < 8; ++l) u[l] = get_int_b4(xb->qs, l);
+            const float d8 = __low2float(xb->ds);
+            int xs0 = 0, xs1 = 0;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                xs0 = __dp4a(0x01010101, u[l], xs0);
+                xs1 = __dp4a(0x01010101, u[4 + l], xs1);
+            }
+#pragma unroll
+            for (int r = 0; r < NR; ++r) {
+                const block_q2_K* b = rows[r] + sb;
+                const uint8_t* q = b->qs + qo;
+                int s0 = 0, s1 = 0;
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    s0 = __dp4a((get_int_b4(q, l) >> sh) & 0x03030303, u[l], s0);
+                    s1 = __dp4a((get_int_b4(q, 4 + l) >> sh) & 0x03030303, u[4 + l], s1);
+                }
+                const uint32_t sc = ((const uint16_t*) b->scales)[j];
+                const int sd = (int) (sc & 0xF) * s0 + (int) ((sc >> 8) & 0xF) * s1;
+                const int sm = (int) ((sc >> 4) & 0xF) * xs0 + (int) (sc >> 12) * xs1;
+                const float2 dm = __half22float2(b->dm);
+                acc[r] += d8 * (dm.x * (float) sd - dm.y * (float) sm);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            float v = acc[r];
+            v += __shfl_xor_sync(0xffffffffu, v, 4);
+            v += __shfl_xor_sync(0xffffffffu, v, 2);
+            v += __shfl_xor_sync(0xffffffffu, v, 1);
+            m[r] += s_w[i] * v;
+        }
+    }
+    if (j == 0)
+#pragma unroll
+        for (int r = 0; r < NR; ++r) out[r0 + r] = m[r] + 0.0f;
+    if (done != nullptr) {
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) atomicAdd(done, 1u);
+    }
+}
 }  // namespace
+
+// ABYSS_IGPU_Q2K_NR: the Q2_K down's rows a lane group (1 / 2 / 4; 0: rows_dot as before)
+static int lane_q2k_nr() {
+    static const int nr = [] { const char* v = getenv("ABYSS_IGPU_Q2K_NR"); return v != nullptr ? std::atoi(v) : 1; }();
+    return nr == 1 || nr == 2 || nr == 4 ? nr : 0;
+}
 
 // The RDNA dot (rows_dot_rdna: the signs expanded in registers, the grid in LDS) at 2 rows a warp for the i-quants it
 // has (16 / 18 / 22), else rows_dot at DOWN_ROWS.  lane_bench on the Radeon 8060S, 4 experts a call: IQ2_S (GLM-5.3
@@ -84,12 +172,27 @@ static bool lane_dn_rdna(int d_type) {
     return !legacy && (d_type == 16 || d_type == 18 || d_type == 22);
 }
 int lane_down_blocks(int d_type, int n_embd) {
+    if (d_type == 10 && lane_q2k_nr() > 0) {
+        const int rows = 32 * lane_q2k_nr();
+        return n_embd % rows == 0 ? n_embd / rows : 0;
+    }
     const int nr = lane_dn_rdna(d_type) ? 2 : DOWN_ROWS;
     return n_embd % (8 * nr) == 0 ? n_embd / (8 * nr) : 0;
 }
 bool lane_down(int d_type, const unsigned long long* plan_ptr, const float* plan_w, int k, int n_embd, int n_ff,
                size_t down_off, const void* hq, float* out, unsigned int* done, hipStream_t s) {
     const auto* H = (const block_q8_1*) hq;
+    if (d_type == 10 && lane_q2k_nr() > 0 && n_ff % 256 == 0) {
+        const int nr = lane_q2k_nr();
+        if (n_embd % (32 * nr) != 0) return false;
+        const int blocks = n_embd / (32 * nr);
+        switch (nr) {
+            case 1: lane_down_q2k_kernel<1><<<blocks, 256, 0, s>>>(plan_ptr, plan_w, k, n_ff, down_off, H, out, done); break;
+            case 2: lane_down_q2k_kernel<2><<<blocks, 256, 0, s>>>(plan_ptr, plan_w, k, n_ff, down_off, H, out, done); break;
+            default: lane_down_q2k_kernel<4><<<blocks, 256, 0, s>>>(plan_ptr, plan_w, k, n_ff, down_off, H, out, done); break;
+        }
+        return hipGetLastError() == hipSuccess;
+    }
     if (lane_dn_rdna(d_type)) {
         if (n_embd % 16 != 0) return false;
         const int blocks = n_embd / 16;
