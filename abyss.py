@@ -22,12 +22,12 @@ What the first run does (each step is skipped when it is already done):
      on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
-     Maya-S24, Maya-M or Maya-L)
+     Maya-S24, Maya-M or Maya-L; or turboderp's EXL3 quant, experimental)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
      and the size - and starts only after you answer y (or pass --download-model)
-  6. builds the pack (the engine's index of the GGUF files) inside the model folder
+  6. builds the pack (the engine's index of the model files) inside the model folder
   7. images: compiles the vision encoder (`build-vision/bin/strata-vision`) and fetches the model's vision files
      (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
   8. writes maya-<model>.json and run-maya-<model>.sh (.bat on Windows) - with the settings tuned for this PC
@@ -179,6 +179,159 @@ MODELS = {
         "vision": {
             "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
             "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # turboderp's EXL3 (exllamav3) quant, read in place from its safetensors: the pack (tools/exl3_pack.py) puts a
+    # small GGUF of the unquantized tensors beside them.  "files": every file of the branch with its size (what is
+    # downloaded, and how a download is known whole); "revision": the branch's commit the hashes belong to.
+    "EXL3-sc_2.10bpw": {
+        "about": "turboderp's self-calibrated EXL3 quant at 2.10 bits per weight (exllamav3's trellis format, "
+                 "which the engine reads in place): GGUF-sized, better text prediction than Maya-S-v2 on our "
+                 "test text, slower on an APU's iGPU lane; no MTP draft block - experimental, NVIDIA GPUs only",
+        "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "sc_2.10bpw",
+        "revision": "8d2eca0ed5b695108249308bcdc2af0636d5045f", "folder": "", "download_gb": 88.3,
+        "files": {
+            "LICENSE": 1070, "README.md": 7238, "chat_template.jinja": 8617, "config.json": 86529,
+            "generation_config.json": 194, "model-00001-of-00012.safetensors": 8567975136,
+            "model-00002-of-00012.safetensors": 7765742994, "model-00003-of-00012.safetensors": 7765756986,
+            "model-00004-of-00012.safetensors": 7765756986, "model-00005-of-00012.safetensors": 7765756986,
+            "model-00006-of-00012.safetensors": 7765756986, "model-00007-of-00012.safetensors": 7765756986,
+            "model-00008-of-00012.safetensors": 7765756986, "model-00009-of-00012.safetensors": 7765756986,
+            "model-00010-of-00012.safetensors": 7765756986, "model-00011-of-00012.safetensors": 6303367524,
+            "model-00012-of-00012.safetensors": 3427783643, "model.safetensors.index.json": 16343097,
+            "processor_config.json": 909, "quantization_config.json": 47905716, "tokenizer.json": 20217442,
+            "tokenizer_config.json": 761},
+        "sha256": {
+            "LICENSE":
+                "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1",
+            "README.md":
+                "4f46db37e6a7cbe3a494d6d7f616a96f4fffe6d1de68be361199a715c8d928fc",
+            "chat_template.jinja":
+                "41cff9af7b3a86c96751b107a8444f245fbda0bd5320b636a5bb1f7f4ba1a5c3",
+            "config.json":
+                "31146dd4192fb1dce263cb14d27f8684fe3ed17f7acd355e8d1ae237c7b024cb",
+            "generation_config.json":
+                "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+            "model-00001-of-00012.safetensors":
+                "4cb1891ae8eb9ab0269f049d0ba5e324141b488c8413155943435c77fd1bed72",
+            "model-00002-of-00012.safetensors":
+                "107a5539bf0c324abb4b5417ef6c6207c5b3df8b84c5a78326caefb9df5ca4a1",
+            "model-00003-of-00012.safetensors":
+                "a38b16e3754ea271e300bff75a3123e695b25412760127b6d8e47ec0791bd3da",
+            "model-00004-of-00012.safetensors":
+                "1ef9a817cccbbc803fa0113ffd9ca1a9aed86ac990d95cc1550335175e9bc569",
+            "model-00005-of-00012.safetensors":
+                "31547000b3892d3469a61aa234b974dcfd4067f70c18b815d00efcf7399b8de5",
+            "model-00006-of-00012.safetensors":
+                "cf6b42119f6ef7c8af98b00a4c778ae879d04b938872a6e8f401bedfd95018d7",
+            "model-00007-of-00012.safetensors":
+                "6a6d8a2314409a7ee5281740ab31a85ca9fee0882e159f2d207a74186b88d452",
+            "model-00008-of-00012.safetensors":
+                "55318a0b50e8dcff5da17336055008494f21790fc58125a53cbc19df98376526",
+            "model-00009-of-00012.safetensors":
+                "6576557ce2bcba599eed092d420916d299ca09cc6bf0b860c7cd49a8c857fe33",
+            "model-00010-of-00012.safetensors":
+                "08f2437835c29a31b1f9203d0bd4b6ab47b67711656bf4ad4005683d6e868b00",
+            "model-00011-of-00012.safetensors":
+                "3135e401817587e188b9137a364cf73534e45224dd2a061285b3377c52f86330",
+            "model-00012-of-00012.safetensors":
+                "a2b5957a6b398778f1edc09df925e8c57416756cb2b0569bb82abbe13d1b753d",
+            "model.safetensors.index.json":
+                "d0721e726249ab0f9e10a3c5e3329bb2f1af4de31cd20865386ece9866f4c337",
+            "processor_config.json":
+                "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+            "quantization_config.json":
+                "c92193014ed160c5aff709b7fc53bb8378982e4e6f9e4fb2397d6b7a6b87c1af",
+            "tokenizer.json":
+                "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+            "tokenizer_config.json":
+                "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"},
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "vision",
+            "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf", "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    "EXL3-3.05bpw": {
+        "about": "turboderp's EXL3 quant at 3.05 bits per weight (exllamav3's trellis format, which the engine reads "
+                 "in place from its safetensors), with the MTP draft block - experimental, NVIDIA GPUs only",
+        "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "3.05bpw",
+        "revision": "332ab457b709b7ba30dd9a448be5de03b80a7ac9", "folder": "", "download_gb": 125.3,
+        "files": {
+            "config.json": 86509, "LICENSE": 1070, "README.md": 7238, "chat_template.jinja": 8617,
+            "generation_config.json": 194, "kpool_aux.safetensors": 11548768,
+            "model-00001-of-00015.safetensors": 8589636152, "model-00002-of-00015.safetensors": 8588356452,
+            "model-00003-of-00015.safetensors": 8590179904, "model-00004-of-00015.safetensors": 8588365508,
+            "model-00005-of-00015.safetensors": 8588365508, "model-00006-of-00015.safetensors": 8588365500,
+            "model-00007-of-00015.safetensors": 8590186912, "model-00008-of-00015.safetensors": 8588365508,
+            "model-00009-of-00015.safetensors": 8588365508, "model-00010-of-00015.safetensors": 8588365500,
+            "model-00011-of-00015.safetensors": 8590186912, "model-00012-of-00015.safetensors": 8588365508,
+            "model-00013-of-00015.safetensors": 8588365508, "model-00014-of-00015.safetensors": 8590694168,
+            "model-00015-of-00015.safetensors": 2059162376, "model.safetensors.index.json": 15960981,
+            "mtp.safetensors": 2862645889, "processor_config.json": 909, "quantization_config.json": 47905678,
+            "tokenizer.json": 20217442, "tokenizer_config.json": 761},
+        "sha256": {
+            "config.json":
+                "0bef79e79b28fa9c51d57c49bd53adc59005c916832879ad3f0862e284a7bc06",
+            "LICENSE":
+                "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1",
+            "README.md":
+                "4f46db37e6a7cbe3a494d6d7f616a96f4fffe6d1de68be361199a715c8d928fc",
+            "chat_template.jinja":
+                "41cff9af7b3a86c96751b107a8444f245fbda0bd5320b636a5bb1f7f4ba1a5c3",
+            "generation_config.json":
+                "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+            "kpool_aux.safetensors":
+                "39053cd051c75e81b7e608818111a4b4c3c57da540599089419fe11b51ca02d3",
+            "model-00001-of-00015.safetensors":
+                "6b6b96190a5114a55d058e3f4ae8a4350ac334dfcf804f61c39d5c6e40340ba4",
+            "model-00002-of-00015.safetensors":
+                "29fda4953918a156758169afa120929fdd35407860eddf5cad0cb747f65475ed",
+            "model-00003-of-00015.safetensors":
+                "9844130df84df3138706a0a708775c8d010a7ed370539880e327cac6bec7f2b7",
+            "model-00004-of-00015.safetensors":
+                "4f2a6fb68fb6cceab231d9c4a54b96174b4ec2b1bbf5cf042a6e4be37c739e29",
+            "model-00005-of-00015.safetensors":
+                "73cd6d0b5ba7f6d0ce23982729c6342d38114dd89d8a884a2fa08133ef52b47a",
+            "model-00006-of-00015.safetensors":
+                "160fcfc258b61c7aa7cbc27c4d6a33daee8bfe6dbb0e7dd5e73ce901789f391e",
+            "model-00007-of-00015.safetensors":
+                "a94f480c4256b7e5311b5384574471caff4f4fc0def8c3e1c57c411222cb1ce4",
+            "model-00008-of-00015.safetensors":
+                "e513ba853f8b8cb7dac8f17ff9f281787a63cc67daea15fc288591f93eec62f5",
+            "model-00009-of-00015.safetensors":
+                "825928573f534c09dc8e157356359bc525e883933777fa0d09d7a30a3f13d8b0",
+            "model-00010-of-00015.safetensors":
+                "f82170395c010c1b40b3695bcca439ac54445b268936ee71eb48c28f347d0d0d",
+            "model-00011-of-00015.safetensors":
+                "240ece46708e5c41aaf365bb2659ed7da2134bc12d9fa9b5393555c103228c6f",
+            "model-00012-of-00015.safetensors":
+                "2738042b40d05e144e54ed3c1013831d7dc156b694a1d68a49d55b25369ac8d9",
+            "model-00013-of-00015.safetensors":
+                "cf097956efdf8c307a6e560786445f1715c7bba9b2bddfb300f7346b1e1eb3ba",
+            "model-00014-of-00015.safetensors":
+                "1add7e6d8f4866e5aeecf77ac9ca2aacce3f071455fa9c167fa9bc678551c923",
+            "model-00015-of-00015.safetensors":
+                "d14a0087710b04a680f2d2a8769fa26f4e53dd3c1d5ce5391798ba25da1947f4",
+            "model.safetensors.index.json":
+                "559538d5006f757c809ef0a545062c2f79abb0140667399d590af0da96f26735",
+            "mtp.safetensors":
+                "7274f06d75842edfa258830c836fd790a19324513134e05cd1e931929c4c384d",
+            "processor_config.json":
+                "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+            "quantization_config.json":
+                "308d9a4b28407e2ada887f512bc8793c608586a73d9e0108ca258220ac714280",
+            "tokenizer.json":
+                "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+            "tokenizer_config.json":
+                "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"},
+        # the pictures: the vision tower and its tokenizer are the same in every GLM-5.3-Flash quant
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "vision",
+            "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf", "download_gb": 1.14,
             "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
                            "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
                        "GLM-5.3-Flash-vocab.gguf":
@@ -757,7 +910,14 @@ def choose_context(a, prev_ctx) -> int:
 
 
 def shard_names(m: dict, pattern: str | None = None) -> list:
+    """A download's files under their names on Hugging Face: a GGUF's shards, or an EXL3 model's every file."""
+    if "files" in m and pattern is None:
+        return list(m["files"])
     return [(pattern or m["file"]).format(i=i, n=m["shards"]) for i in range(1, m["shards"] + 1)]
+
+
+def is_exl3(quant: str) -> bool:
+    return MODELS.get(quant, {}).get("format") == "exl3"
 
 
 def old_names(m: dict) -> list:
@@ -795,6 +955,37 @@ def download_dir(models: Path, quant: str) -> Path:
     return d
 
 
+def exl3_advice(cards: list, size_gb: float) -> tuple:
+    """(recommend, note) for an EXL3 quant of size_gb on this PC.  EXL3 (exllamav3's trellis) is better text prediction
+    than a GGUF of its size, but its decode costs more arithmetic: on the GPU's tensor cores (RTX 30 and newer) that is
+    cheap, on the RAM tier's lane it is not - an APU's iGPU or an AVX-512 CPU computes an expert in ~0.09-0.12 ms (GLM
+    sc_2.10bpw on an RTX 5090 + Radeon 8060S: 22.4 ms a token against Maya-S-v2's 14.8), a CPU with AVX2 only ~20x slower
+    than over PCIe.  So: recommended when the cards hold most of its experts, a quality option when the RAM tier has an
+    iGPU or AVX-512 to compute on, else not."""
+    vram = sum(g.get("vram_gb", 0.0) for g in cards)
+    tensor = bool(cards) and all(str(g.get("arch", "0")).isdigit() and int(g.get("arch", "0")) >= 80 for g in cards)
+    try:
+        avx512 = S.cpu_info()[2]
+    except Exception:  # noqa: BLE001
+        avx512 = False
+    try:
+        apu = any(g.get("arch") in ("gfx1150", "gfx1151") for g in S.amd_gpus())
+    except Exception:  # noqa: BLE001
+        apu = False
+    try:
+        ram = S.ram_gb()
+    except Exception:  # noqa: BLE001
+        ram = 0.0
+    if ram and vram + 0.75 * ram < size_gb + 8:   # (the RAM tier gets ~3/4 of the RAM; the page cache the rest)
+        return False, "experimental - does not fit the GPU and RAM: experts would come from the SSD"
+    if tensor and vram >= 0.8 * size_gb:
+        return True, "recommended for quality: the cards hold most of its experts"
+    if apu or avx512:
+        lane = "the iGPU" if apu else "the CPU's AVX-512"
+        return False, f"experimental, quality first: better text, slower decode (RAM-tier experts on {lane})"
+    return False, "experimental, not for this PC: no AVX-512 or APU iGPU for its RAM-tier experts (much slower)"
+
+
 def choose_model(a, models: Path, inst: dict) -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default."""
@@ -803,9 +994,13 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         if first is None:
             fail(why, "--gguf-dir takes the folder that holds the GLM-5.3-Flash .gguf files, or the (first) .gguf file")
         return "local", first
+    hip = getattr(a, "backend", None) == "hip"
     if a.model:
+        if hip and is_exl3(a.model):
+            fail(f"{a.model} runs on NVIDIA GPUs only (the HIP port has no EXL3 kernels)",
+                 f"pick another model: {ME} --setup")
         return "download", a.model
-    opts = list(MODELS)
+    opts = [q for q in MODELS if not (hip and is_exl3(q))]   # (EXL3: NVIDIA only)
     # cards of 24 GB or less: Maya-S24 (its 4-bit attention leaves ~1.5 GB more of the card for experts - decode about
     # 14% faster there), else Maya-S
     try:
@@ -813,6 +1008,11 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     except Exception:  # noqa: BLE001 - no NVIDIA tools (AMD): no card-based recommendation
         cards = []
     rec = "Maya-S24" if cards and all(g["vram_gb"] <= 24.5 for g in cards) and "Maya-S24" in MODELS else opts[0]
+    # an EXL3 quant: what this PC makes of it (exl3_advice); the largest one the cards hold is the recommendation then
+    advice = {q: exl3_advice(cards, MODELS[q]["download_gb"]) for q in opts if is_exl3(q)}
+    fits = [q for q, (r, _) in advice.items() if r]
+    if fits:
+        rec = max(fits, key=lambda q: MODELS[q]["download_gb"])
     default = inst["quant"] if inst.get("quant") in MODELS else rec
     rows = []
     for q in opts:
@@ -820,6 +1020,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         have = all(p.exists() for p in local_shards(m, d))
         rows.append((f"{q}: " + (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging "
                                                                      "Face"),
+                     advice[q][1] if q in advice else
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else None, m["about"]))
     pick = choose("Model?", ["The model to download (GLM-5.3-Flash GGUF files you already have: --gguf-dir <file or "
@@ -1231,8 +1432,21 @@ def incomplete(path: Path):
     return None if have >= need else f"short: {have:,} of {need:,} bytes"
 
 
+def file_incomplete(m: dict, path: Path):
+    """Why a download's file is not whole, or None when it is: a GGUF by its own tensor directory (incomplete), an
+    EXL3 model's file by its published size."""
+    if "files" not in m:
+        return incomplete(path)
+    if not path.exists():
+        return "missing"
+    have, want = path.stat().st_size, m["files"][hf_name(m, path)]
+    return None if have == want else f"{have:,} of {want:,} bytes"
+
+
 def quant_of(first: Path) -> str:
     for q, mm in MODELS.items():                       # a Maya download, under its name on Hugging Face or its old one
+        if "files" in mm:                              # (an EXL3 download is no .gguf file)
+            continue
         if first.name in [names[0] for names in [shard_names(mm)] + old_names(mm)]:
             return q
     m = re.match(r"GLM-5\.3-Flash-(.+?)(-\d{5}-of-\d{5})?\.gguf$", first.name, re.I)
@@ -1254,7 +1468,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
     """Shows what would be downloaded - the source, the size, the exact commands - and downloads only after a yes
     (or --download-model).  False: nothing was downloaded."""
     m = MODELS[quant]
-    missing = [s for s in shards if incomplete(s)]
+    missing = [s for s in shards if file_incomplete(m, s)]
     urls = {s: hf_url(m["repo"], m["revision"], m["folder"], hf_name(m, s)) for s in shards}
     on_disk = sum(s.stat().st_size for s in shards if s.exists()) / 1e9
     remaining = max(0.0, m["download_gb"] - on_disk)
@@ -1264,7 +1478,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
         [["curl", "-L", "--fail", "--retry", "5", "-C", "-", "-o", str(s), urls[s]] for s in missing]
     say(f"  {quant}: {m['about']}.")
     say(f"  Source: https://huggingface.co/{m['repo']}" + (f" (folder {m['folder']}/)" if m["folder"] else "") +
-        "; the files' own license applies.")
+        (f" (branch {m['branch']})" if m.get("branch") else "") + "; the files' own license applies.")
     say(f"  The model is {m['download_gb']:.1f} GB in {len(shards)} file{'s' if len(shards) != 1 else ''}; "
         f"{len(missing)} still to download, about "
         f"{remaining:.0f} GB, into")
@@ -1279,8 +1493,12 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
     say("  The exact commands (resumable: running them again continues an interrupted download):")
     for c in cmds:
         say("    " + shell_join(c))
-    say("  You can also run them yourself (or download the files any other way into that folder, or pass")
-    say(f"  --gguf-dir <folder with the files>), then run {ME} again.")
+    if "files" in m:                                   # (--gguf-dir takes GGUF files only)
+        say(f"  You can also run them yourself (or download the files any other way into that folder), then run {ME}")
+        say("  again.")
+    else:
+        say("  You can also run them yourself (or download the files any other way into that folder, or pass")
+        say(f"  --gguf-dir <folder with the files>), then run {ME} again.")
     if not curl:
         warn("curl is not installed" + ("" if WIN else " (sudo apt-get install -y curl)") + ": if you say yes, the "
              "same URLs are downloaded with Python instead (also resumable)")
@@ -1299,7 +1517,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
                      f"run {ME} --download-model again: it continues where it stopped")
         else:
             S.download(urls[s], s)
-        why = incomplete(s)
+        why = file_incomplete(m, s)
         if why:
             fail(f"{s.name} after the download: {why}", f"delete it and run {ME} --download-model again")
         want = m["sha256"].get(hf_name(m, s))
@@ -1313,7 +1531,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
 
 def model_step(a, models: Path, choice: tuple):
     """(model folder, shards, quant name), or None when the files are not there and were not downloaded."""
-    step(5, "the model (GLM-5.3-Flash, GGUF)")
+    step(5, "the model (GLM-5.3-Flash)")
     kind, what = choice
     if kind == "local":
         shards, quant, d = shard_set(what), quant_of(what), what.parent
@@ -1328,12 +1546,19 @@ def model_step(a, models: Path, choice: tuple):
         m = MODELS[quant]
         d = download_dir(models, quant)
         shards = local_shards(m, d)
-        if any(incomplete(s) for s in shards) and not offer_download(a, quant, d, shards):
+        if any(file_incomplete(m, s) for s in shards) and not offer_download(a, quant, d, shards):
             return None
-    from gguf_reader import GGUFFile
-    arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
-    if arch not in GLM_ARCHS:
-        fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
+    if is_exl3(quant) and kind != "local":
+        conf = read_json(d / "config.json")
+        method = (conf.get("quantization_config") or {}).get("quant_method")
+        if conf.get("model_type") != "glm5_next" or method != "exl3":
+            fail(f"{d / 'config.json'}: a {conf.get('model_type')!r} model quantized as {method!r}, not GLM-5.3-Flash "
+                 "in EXL3 (glm5_next, exl3)")
+    else:
+        from gguf_reader import GGUFFile
+        arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
+        if arch not in GLM_ARCHS:
+            fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
     gb = sum(s.stat().st_size for s in shards) / 1e9
     ok(f"{quant}: {len(shards)} file(s), {gb:.1f} GB in {d}")
     if rotational(d):
@@ -1353,8 +1578,10 @@ def pack_source(pack: Path):
     return m.group(1) if m else None
 
 
-def pack_step(a, d: Path, shards: list, llama: Path) -> Path:
+def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -> Path:
     step(6, "the pack (the engine's index of the model files)")
+    if quant is not None and is_exl3(quant):
+        return exl3_pack_step(a, d)
     # the engine finds the GGUF files at <pack>/.. (src/core/glm_model.cu, load_pack): the pack lives in their folder,
     # in pack/ - or pack-<model>/ when pack/ indexes another model of the same folder
     pack = d / "pack"
@@ -1377,6 +1604,31 @@ def pack_step(a, d: Path, shards: list, llama: Path) -> Path:
     run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
          "--compat-bf16"], env=env)
     missing = [f for f in PACK_FILES if not (pack / f).exists()]
+    if missing:
+        fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
+    ok(f"pack: {pack}")
+    return pack
+
+
+EXL3_GGUF = "maya-exl3.gguf"                       # what tools/exl3_pack.py writes beside an EXL3 model's files
+
+
+def exl3_pack_step(a, d: Path) -> Path:
+    """An EXL3 model's pack (tools/exl3_pack.py): the engine reads the EXL3 weights in place from the safetensors; the
+    pack names them, and a small GGUF beside them holds the unquantized tensors and the tokenizer."""
+    pack = d / "pack"
+    if not a.repack and pack_source(pack) == EXL3_GGUF and (d / EXL3_GGUF).exists() and \
+            all((pack / f).exists() for f in PACK_FILES + ("exl3.txt",)):
+        ok(f"pack already built: {pack}")
+        return pack
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the pack and {EXL3_GGUF} are written next to the model's files")
+    say(f"  Writing {EXL3_GGUF} (the unquantized tensors and the tokenizer, about 2 GB), the index of every tensor,")
+    say("  the small float weights (about 1 GB) and the tokenizer; the EXL3 weights stay in the safetensors (a few")
+    say("  minutes) ...")
+    run([sys.executable, str(ROOT / "tools" / "exl3_pack.py"), "--model", str(d), "--out", str(pack)])
+    missing = [f for f in PACK_FILES + ("exl3.txt",) if not (pack / f).exists()] + \
+        ([] if (d / EXL3_GGUF).exists() else [f"../{EXL3_GGUF}"])
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
     ok(f"pack: {pack}")
@@ -2188,7 +2440,7 @@ def set_up(a, prev: dict) -> Path | None:
     if got is None:
         return None
     d, shards, quant = got
-    pack = pack_step(a, d, shards, llama)              # 6
+    pack = pack_step(a, d, shards, llama, quant)       # 6
     vision = vision_step(a, pc, meta, llama, d, quant)  # 7
     cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice)   # 8
     # the tuning: asked for (--calibrate), or offered when nothing was tuned for this PC and model yet and someone

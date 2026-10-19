@@ -1,5 +1,6 @@
 """tools/test_maya_models.py - the setup's model downloads: what a setup is offered (Project Maya's four quants, the
-24 GB recommendation) and that every download names a hash per file.  No GPU, no network."""
+24 GB recommendation, the EXL3 model on NVIDIA only) and that every download names a hash per file.  No GPU, no
+network."""
 from pathlib import Path
 import shlex
 import sys
@@ -42,8 +43,7 @@ class ModelChoice(unittest.TestCase):
 
     def test_every_download_names_a_hash_per_shard(self):
         for q, m in maya.MODELS.items():
-            names = {m["file"].format(i=i, n=m["shards"]) for i in range(1, m["shards"] + 1)}
-            self.assertEqual(set(m["sha256"]), names, q)
+            self.assertEqual(set(m["sha256"]), set(maya.shard_names(m)), q)
             for h in m["sha256"].values():                   # a hash, or several (a header republished: v1.0.28)
                 self.assertTrue(all(len(x) == 64 for x in ([h] if isinstance(h, str) else h)), q)
 
@@ -169,9 +169,12 @@ class LabelledNames(unittest.TestCase):
         self.assertEqual(maya.shard_names(maya.MODELS["Maya-M"])[2], "GLM-5.3-Flash-Maya-M-IQ2_S-00003-of-00003.gguf")
         self.assertEqual(maya.shard_names(maya.MODELS["Maya-S24"])[1],
                          "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00002-of-00003.gguf")
-        # one label per model: Hugging Face adds up the files that share one (Maya-S is IQ2_XXS)
-        labels = [maya.shard_names(m)[0].split("-")[-4] for m in maya.MODELS.values()]
-        self.assertEqual(len(labels), len(set(labels)), labels)
+        # one label per model in a repo: Hugging Face adds up the files that share one (Maya-S is IQ2_XXS); a model in
+        # a repo of its own may share a label (Maya-M-Derisked's IQ2_S)
+        for repo in {m["repo"] for m in maya.MODELS.values()}:
+            labels = [maya.shard_names(m)[0].split("-")[-4] for m in maya.MODELS.values()
+                      if m["repo"] == repo and "files" not in m]   # (an EXL3 model has no shards)
+            self.assertEqual(len(labels), len(set(labels)), (repo, labels))
 
     def test_a_fresh_folder_downloads_the_new_names(self):
         m = maya.MODELS["Maya-L"]
@@ -215,6 +218,132 @@ class LabelledNames(unittest.TestCase):
                 self.assertEqual(maya.quant_of(Path(names[0])), q)
         self.assertEqual(maya.quant_of(Path("GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf")),
                          "Maya-S-v2-IQ2_XXS")
+
+
+class Exl3Download(unittest.TestCase):
+    """turboderp's EXL3 quant: offered with NVIDIA GPUs only, every file of its branch downloaded and checked by size
+    and hash, its config checked instead of a GGUF header, and its pack built by tools/exl3_pack.py."""
+    Q = "EXL3-3.05bpw"
+
+    def offered(self, backend, cards=None, ram=256.0, avx512=False, apu=False):
+        args = SimpleNamespace(gguf_dir=None, model=None, yes=True, backend=backend)
+        lines = []
+        amd = [{"arch": "gfx1151"}] if apu else []
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(maya.S, "gpus", return_value=cards or [{"vram_gb": 16.0, "arch": "86"}]), \
+                patch.object(maya.S, "ram_gb", return_value=ram), \
+                patch.object(maya.S, "cpu_info", return_value=("cpu", True, avx512)), \
+                patch.object(maya.S, "amd_gpus", return_value=amd), \
+                patch.object(maya, "say", side_effect=lambda *a: lines.append(" ".join(map(str, a)))):
+            quant = maya.choose_model(args, Path(d), {})[1]
+        return quant, "\n".join(lines)
+
+    def test_offered_on_nvidia_as_experimental_never_the_default(self):
+        quant, text = self.offered("cuda")
+        self.assertIn(f"{self.Q}: download 125.3 GB from Hugging Face   (experimental", text)
+        self.assertNotEqual(quant, self.Q)
+
+    def test_the_advice_follows_the_pc(self):
+        # no AVX-512 and no APU: not for this PC; an APU's iGPU or AVX-512: a quality option; never the default there
+        self.assertIn("(experimental, not for this PC", self.offered("cuda")[1])
+        for kw in ({"apu": True}, {"avx512": True}):
+            quant, text = self.offered("cuda", **kw)
+            self.assertIn("EXL3-sc_2.10bpw: download 88.3 GB from Hugging Face   (experimental, quality first", text)
+            self.assertFalse(maya.is_exl3(quant))
+        # too big for the GPU and 3/4 of the RAM: the SSD would serve experts
+        self.assertIn("(experimental - does not fit", self.offered("cuda", ram=64.0, apu=True)[1])
+        # cards that hold most of a quant's experts (RTX 30 or newer): the largest such quant is the recommendation
+        quant, text = self.offered("cuda", cards=[{"vram_gb": 96.0, "arch": "120"}])
+        self.assertEqual(quant, "EXL3-sc_2.10bpw")
+        self.assertIn("recommended for quality", text)
+        quant, _ = self.offered("cuda", cards=[{"vram_gb": 96.0, "arch": "120"}, {"vram_gb": 96.0, "arch": "120"}])
+        self.assertEqual(quant, self.Q)
+        # before RTX 30 (no tensor-core EXL3 decode): not recommended however much VRAM
+        self.assertFalse(maya.is_exl3(self.offered("cuda", cards=[{"vram_gb": 192.0, "arch": "70"}])[0]))
+
+    def test_not_offered_with_amd(self):
+        self.assertNotIn(self.Q, self.offered("hip")[1])
+        args = SimpleNamespace(gguf_dir=None, model=self.Q, yes=True, backend="hip")
+        with patch.object(maya.S, "say"), self.assertRaises(SystemExit):
+            maya.choose_model(args, Path("."), {})
+
+    def test_every_file_of_the_branch_with_size_and_hash(self):
+        m = maya.MODELS[self.Q]
+        self.assertEqual(maya.shard_names(m), list(m["files"]))
+        self.assertEqual(set(m["files"]), set(m["sha256"]))
+        self.assertIn("mtp.safetensors", m["files"])                       # the MTP draft block
+        self.assertEqual(len([n for n in m["files"] if n.startswith("model-")]), 15)
+        self.assertAlmostEqual(sum(m["files"].values()) / 1e9, m["download_gb"], delta=0.05)
+        self.assertEqual(len(m["revision"]), 40)                            # the branch's commit, pinned
+        self.assertEqual(maya.hf_url(m["repo"], m["revision"], m["folder"], "config.json"),
+                         "https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/resolve/"
+                         "332ab457b709b7ba30dd9a448be5de03b80a7ac9/config.json")
+        self.assertEqual(m["vision"]["repo"], "peasantsmith/GLM-5.3-Flash-Maya-GGUF")   # the same pictures files
+
+    def test_a_file_is_whole_at_its_published_size(self):
+        m = {"files": {"a.safetensors": 4}, "sha256": {}}
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "a.safetensors"
+            self.assertEqual(maya.file_incomplete(m, p), "missing")
+            p.write_bytes(b"ab")
+            self.assertEqual(maya.file_incomplete(m, p), "2 of 4 bytes")
+            p.write_bytes(b"abcd")
+            self.assertIsNone(maya.file_incomplete(m, p))
+
+    def test_the_download_names_the_branch_and_asks(self):
+        lines = []
+        args = SimpleNamespace(download_model=False)
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(maya, "say", side_effect=lambda *a: lines.append(" ".join(map(str, a)))), \
+                patch.object(maya, "rotational", return_value=False), \
+                patch.object(maya.shutil, "disk_usage", return_value=SimpleNamespace(free=500e9)), \
+                patch.object(maya, "ask", return_value="n") as ask:
+            m = maya.MODELS[self.Q]
+            shards = maya.local_shards(m, Path(d) / self.Q)
+            self.assertFalse(maya.offer_download(args, self.Q, Path(d) / self.Q, shards))
+        text = "\n".join(lines)
+        ask.assert_called_once()
+        self.assertIn("https://huggingface.co/turboderp/GLM-5.3-Flash-exl3 (branch 3.05bpw)", text)
+        self.assertIn("27 still to download", text)
+        self.assertIn("/resolve/332ab457b709b7ba30dd9a448be5de03b80a7ac9/mtp.safetensors", text)
+
+    def test_model_step_checks_the_config_not_a_gguf_header(self):
+        with tempfile.TemporaryDirectory() as d:
+            models = Path(d)
+            (models / self.Q).mkdir()
+            conf = models / self.Q / "config.json"
+            args = SimpleNamespace()
+            with patch.object(maya, "file_incomplete", return_value=None), patch.object(maya, "say"), \
+                    patch.object(maya.S, "say"), patch.object(maya, "rotational", return_value=False):
+                for n in maya.shard_names(maya.MODELS[self.Q]):
+                    (models / self.Q / n).write_bytes(b"")
+                conf.write_text('{"model_type": "glm5_next", "quantization_config": {"quant_method": "exl3"}}')
+                d_, shards, quant = maya.model_step(args, models, ("download", self.Q))
+                self.assertEqual((d_, quant, len(shards)), (models / self.Q, self.Q, 27))
+                conf.write_text('{"model_type": "llama", "quantization_config": {"quant_method": "exl3"}}')
+                with self.assertRaises(SystemExit):
+                    maya.model_step(args, models, ("download", self.Q))
+
+    def test_the_pack_is_exl3_packs_and_kept_once_built(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+
+            def pack(cmd, **kw):
+                self.assertEqual([Path(cmd[1]).name] + cmd[2:], ["exl3_pack.py", "--model", str(d), "--out",
+                                                                 str(d / "pack")])
+                for f in maya.PACK_FILES + ("exl3.txt",):
+                    (d / "pack" / f).parent.mkdir(parents=True, exist_ok=True)
+                    (d / "pack" / f).write_text("x")
+                (d / "pack" / "native_experts.txt").write_text("# header (absolute offsets in maya-exl3.gguf, or in "
+                                                               "the named shard(s) beside it)\n")
+                (d / maya.EXL3_GGUF).write_bytes(b"GGUF")
+
+            args = SimpleNamespace(repack=False)
+            with patch.object(maya, "run", side_effect=pack) as run, patch.object(maya, "say"), \
+                    patch.object(maya.S, "say"):
+                self.assertEqual(maya.pack_step(args, d, [], Path("llama"), self.Q), d / "pack")
+                self.assertEqual(maya.pack_step(args, d, [], Path("llama"), self.Q), d / "pack")
+            run.assert_called_once()                                        # the second time: already built
 
 
 if __name__ == "__main__":
