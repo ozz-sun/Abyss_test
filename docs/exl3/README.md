@@ -19,10 +19,11 @@ On this machine (RTX 5090 32 GB + Radeon 8060S iGPU lane + 94 GB RAM), `glm_ids4
 
 | | size | nll (lower is better) | top-1 | ms a token | a RAM-tier expert on the iGPU |
 | --- | --- | --- | --- | --- | --- |
-| Maya-S-v2-IQ2_XXS (GGUF) | 96.5 GB | 1.634 | 62.3% | 14.8 | 0.041 ms |
-| **EXL3 sc_2.10bpw** (turboderp) | 88.3 GB | **1.591-1.598** | **63.3-63.7%** | 22.4-22.7 | 0.088 ms |
+| Maya-S-v2-IQ2_XXS (GGUF) | 96.5 GB | 1.634 | 62.3% | 14.8-15.4 | 0.041 ms |
+| **EXL3 sc_2.10bpw** (turboderp), v1.3.36 | 88.3 GB | **1.591-1.598** | **63.3-63.7%** | 18.8 | 0.06-0.08 ms |
+| EXL3 sc_2.10bpw, v1.3.35 | | | | 22.4-22.7 | 0.088-0.10 ms |
 
-Better text at 8 GB less, at about two thirds of the decode speed: here ~140-190 experts a token are computed on the
+Better text at 8 GB less, at about 80% of the decode speed (two thirds in v1.3.35): here ~140-190 experts a token are computed on the
 RAM tier's lane, and an EXL3 expert costs the iGPU about twice a GGUF one (its trellis decode is compute-bound there;
 the GPU's own experts decode on its tensor cores and are cheap). With a card that holds most of the experts the
 difference mostly goes away.
@@ -70,7 +71,9 @@ compares the decoded weights with that GGUF's (cosine ~0.95+ between two quants;
 - **VRAM experts and the dense weights**: Maya's EXL3 kernels (`src/kernels/cuda/exl3.cu`): on RTX 30 and newer a
   tile decodes straight into an `mma.m16n8k16`, before that on the CUDA cores (`exl3_legacy.cu`).
 - **The RAM tier's lane**: the iGPU (`abyss_igpu_experts_x3` in `libabyss_igpu.so`, the same kernels built by hipcc
-  for gfx1151) when it is faster than the CPU at start, else the CPU threads (Maya's split-K AVX-512 / AVX2 kernels,
+  for gfx1151; from v1.3.36 the codebook's byte sum is one `v_sad_u8` instead of ~5 instructions, bit-identical,
+  and on RDNA 3 / 4 the dot products go two halves at a time through `v_dot2_f32_f16`) when it is faster than the CPU
+  at start, else the CPU threads (Maya's split-K AVX-512 / AVX2 kernels,
   `src/kernels/cpu/exl3_cpu.cpp`: 0.118 ms an expert on 16 Zen 5 threads).
 - **Prompts**: a lightly routed expert through the tensor-core kernels, the rest decoded to FP16 and multiplied by
   cuBLAS with its rows rotated instead of its weights. The RAM-tier experts are staged to the GPU (no CPU share yet).
@@ -84,10 +87,13 @@ compares the decoded weights with that GGUF's (cosine ~0.95+ between two quants;
 | `STRATA_GLM_X3_SPLIT` | off | the CPU threads compute this fraction of each route's RAM-tier experts while the iGPU computes the rest (`auto`: by their start-up timings). Slower on a Ryzen AI Max+ 395, whose CPU and iGPU share power and heat: 22.7 ms a token on the iGPU alone vs 23.5 (CPU 46% on 8 threads), 25.1 (25% on 4), 31.6 (16 threads) |
 | `STRATA_GLM_EXL3_DECODE` | by GPU | `new` (tensor-core tiles) or `legacy` (the CUDA-core kernels) on any GPU (A/B) |
 | `STRATA_GLM_EXL3_ROT` | on | prompts: an expert's rows rotated, its weight only decoded; `0`: the weight rotated |
+| `STRATA_EXL3_NO_FDOT2` | (build) | define it when building `libabyss_igpu.so` to keep the plain FP16 multiply-adds instead of `v_dot2_f32_f16` (the sum order differs: not bit-identical, nll 1.5913 -> 1.5959, within the run-to-run range) |
 | `STRATA_GLM_EXL3_MMA_ROWS` | 64 | prompts: the most rows an expert may have to go through the tensor-core kernels instead of cuBLAS (`0`: none) |
 
 ## Not yet
 
 DeepSeek V4 / V4.1 EXL3 quants (turboderp's V4 0731 2.52 bpw would be KL 0.143 against the Q2_K_XL's 0.203 at about
 the same size), EXL3's half-integer bitrates (exllamav3 1.6's K 1.5 / 2.5 / 3.5), a CPU share of a prompt's
-RAM-tier experts, and an iGPU trellis kernel tuned for RDNA.
+RAM-tier experts, and an iGPU trellis kernel built for RDNA from the start (v1.3.36 only swapped the hot
+instructions). On a PC without an iGPU, `STRATA_GLM_CPU_PIN=0-15` (one thread a core) makes the CPU lane's EXL3
+experts ~4% faster at K2.

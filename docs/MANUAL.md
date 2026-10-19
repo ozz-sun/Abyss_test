@@ -338,6 +338,9 @@ measurements, and [docs/deepseek41/SPEC.md](deepseek41/SPEC.md) what the model c
   are only on disk; KL 0.229 -> 0.240 against the unquantized model) decode is ~28 tok/s, 17.7 without; swe-bench
   coding tasks ran at 51.6 tok/s end to end. Prompts are slow (the attention runs a token at a time and the prompt's
   experts come from the SSD).
+- **A lighter dense pack** (v1.3.36, optional): `attn_q_b` / `attn_output_a` / `attn_output_b` at Q5_K instead of
+  Q8_0 (dense 8.14 -> 6.50 GB, 177 more VRAM expert slots) decodes 10-15% faster for KL 0.242 -> 0.251; see
+  [docs/deepseek41/README.md](deepseek41/README.md#a-lighter-dense-pack-q5_k).
 - **Start it in a memory-capped scope** (`systemd-run --user --scope -p MemoryMax=88G ...`): the page cache and the
   pinned tier together can push systemd-oomd into killing the desktop session.
 - **Not yet:** speculative decoding, a layer split, conversation slots on disk, images.
@@ -357,8 +360,8 @@ GLM-5.3-Flash, in place from their safetensors; [docs/exl3/README.md](exl3/READM
 - **By hand.** `.venv/bin/python tools/exl3_pack.py --model <dir>` (~5 s) writes `<dir>/maya-exl3.gguf` and
   `<dir>/pack/`; start with `--glm-pack <dir>/pack`.
 - **What to expect** (RTX 5090 + Radeon 8060S lane + 94 GB RAM, 1,000 scored tokens): sc_2.10bpw nll 1.591-1.598 and
-  top-1 63.3-63.7% against Maya-S-v2-IQ2_XXS's 1.634 / 62.3%, at 22.4-22.7 ms a token against 14.8 - an EXL3 expert
-  costs the iGPU lane 0.088 ms against 0.041.
+  top-1 63.3-63.7% against Maya-S-v2-IQ2_XXS's 1.634 / 62.3%, at 18.8 ms a token against 15.4 (v1.3.36: the iGPU's
+  trellis decode by `v_sad_u8` and `v_dot2_f32_f16`; 22.4 in v1.3.35).
 
 ## Memory and speed
 
@@ -431,6 +434,8 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_THINK_RESERVE` | 1024 | (server) tokens a thinking block always leaves for the answer |
 | `STRATA_GLM_IGPU` | auto | the iGPU lane: on when `libabyss_igpu.so` and a HIP device are there and it is faster than the CPU; `0` off, `1` on even when slower. `STRATA_GLM_IGPU_LIB=<path>`: another library |
 | `STRATA_GLM_IGPU_TIMEOUT_MS` | 20 | a lane call later than this goes to the CPU threads (0: wait) |
+| `STRATA_GLM_IGPU_EARLY` | on | a route that reads experts from the SSD starts its iGPU lane before the reads instead of after them (v1.3.36; DeepSeek V4.1 -2%, same logits); `0`: after |
+| `STRATA_GLM_IGPU_XQ` | on | the lane takes the token's input already quantized (q8_1) by the GPU from the request instead of quantizing it again (v1.3.36, bit-identical); `0`: quantized on the iGPU |
 | `STRATA_GLM_PREFILL_IGPU` | on | the prompt's RAM-tier experts on the iGPU; `0`: the CPU threads |
 | `STRATA_GLM_IGPU_FUSED` | on | the prompt's iGPU experts through the fused int8 tensor-core pass (gfx1151, IQ2_XS / IQ3_XXS experts at 4096 / 2048; v1.3.18); `0`: the one-row kernels. `ABYSS_IGPU_FUSED_CHECK=<n>` compares the first n calls against them (stderr) |
 | `STRATA_GLM_MV_SPLIT` | auto | dense GEMVs with a row over 4 warps: unset = under 256 blocks, and Q6_K up to 4,096 blocks (v1.3.18); `0` one warp a row always, `2` / `4` that split always. Not bit-identical to one warp a row |
@@ -439,6 +444,8 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_ZERO_COPY` | on | the token boundary without the copy engines (v1.3.21): the table edits, the embedding row (a pinned copy of `token_embd`, Q8_0 / Q5_K) and the token are read and written host-mapped by the kernels. `0`: the copies, as before |
 | `STRATA_GLM_GAP_PROF` | off | `1`: a `glm gap prof` line after each answer - where the time between two tokens goes (host laps, the GPU's idle gap by timing events) |
 | `STRATA_GLM_TAIL_SKIP` / `_W` | off | a route's experts past rank r (or below a probability share) that are not in VRAM are left out - faster on a slow CPU lane, changes the answers (KL ~0.01-0.02) |
+| `STRATA_GLM_ROUTE_AFFINITY` | off | `<a>`: a VRAM-resident expert's routing score gets +a (its weight stays the router's), so a near-tie goes to the expert already on the GPU (after Maya #252; v1.3.36). Changes the answers. GLM-5.3-Flash Maya-S-v2 on an RTX 5090: `0.04` -> 14.1 ms a token against 15.4 (-9%), VRAM hits 56 -> 69%, nll 1.631 against 1.635 (KL 0.043 to the default's logits); `0.08` -13% but nll starts to rise (1.641-1.651). Not on hash-routed layers |
+| `STRATA_GLM_ROUTE_AFFINITY_RAM` | off | `<a>`: the same for experts in the RAM tier (with an SSD tier: avoids experts that only the SSD has); not measured yet |
 | `STRATA_GLM_TAIL_SKIP_DISK` | off | `1`: the tail skip leaves out only experts that are on the SSD alone (v1.3.29). With `STRATA_GLM_TAIL_SKIP=3` the DeepSeek V4.1 speed setting: 56.6 -> 34.2 ms a token, KL 0.229 -> 0.240; changes nothing when every expert is in VRAM + RAM |
 | `STRATA_GLM_DEFER` | off | expert deferral: the CPU lane's part of a layer's MoE is not waited for at the layer's end but written into the residual after the next layer's attention (with its own layer's weights) - the GPU never idles for the lane: single tokens 10.9 -> 9.5 ms, the 2-token verify window 14.4 -> 13.1, +12-15% tok/s on an RTX 5090 + Radeon 8060S; changes the answers more than the tail skip (KL 0.08 against the Q8_0 reference, 0.012 without; swe-bench L7 16 tasks x 3: 107.2 tok/s and resolved 13 of 16 against 100.9 and 14 with it off). With a layer split each part defers within its own layers (its last layer waits for its own part) |
 | `STRATA_DS4_IDX`, `STRATA_DS4_ATTN` | 0 | `1`: the older FP32 kernels for the lightning indexer / the prompt attention instead of the tensor-core ones (A/B checks) |
@@ -449,6 +456,8 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_DISK_READERS` | off | prompts read SSD-held experts with this many threads (try it on a DRAM-less NVMe; DeepSeek V4.1: `8`, a 1K-token prompt 33 -> 27 s) |
 | `STRATA_GLM_DISK_LANE` | off | `1`: an expert read from the SSD into RAM is computed there by the CPU / iGPU lane instead of being copied to VRAM (v1.3.29; -5% on V4.1 with Q2_K/Q3_K experts, nothing with the smaller Q2 ones) |
 | `STRATA_DS41_ENGRAM_CACHE_MB` / `_THREADS` | 256 / 15 | DeepSeek V4.1: the Engram raw-row cache and the row readers (v1.3.29) |
+| `STRATA_DS41_ENGRAM_ASYNC` | on | DeepSeek V4.1: a token's 48 Engram rows are read by a background thread while layer 0 runs, layers 1 / 14 wait for them on the GPU (v1.3.36; -0.5 ms a token, same logits); `0`: read before the token |
+| `STRATA_DS41_ENGRAM_PREFETCH` | 8 | DeepSeek V4.1: threads reading a prompt chunk's Engram rows into the row cache right after its hash (v1.3.36; a 1K-token prompt's Engram 1.7-1.9 -> 0.6 s, the prompt -6-7%); `0` off |
 | `STRATA_DS4_SPEC` | 1 (on) | speculative decoding from the prompt and the answer: draft tokens a step (1-3; 1 is the fastest measured); `0` off |
 | `STRATA_DS4_SPEC_GATE` | on | drop a draft while the request's acceptance does not pay for the verify window; `0`: always draft |
 | `STRATA_DS4_SPEC_MIN` | 3 | the tokens a draft's lookup matches (2-4) |

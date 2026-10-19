@@ -91,6 +91,30 @@ systemd-run --user --scope -p MemoryMax=88G .venv/bin/python serve/server.py --e
 Drop the two `TAIL_SKIP` entries for the exact routing (17.7 tok/s instead of ~28, below). Do not add
 `ManagedOOMPreference=omit` to the scope: oomd then kills other programs instead.
 
+### A lighter dense pack (Q5_K)
+
+Every token reads all 8.14 GB of the dense weights, and 4.65 GiB of that is three Q8_0 tensors a layer: `attn_q_b`,
+`attn_output_a` and `attn_output_b`. As for DeepSeek V4 ([the manual](../MANUAL.md#a-lighter-dense-pack-the-attention-projections-at-q6_k-or-q5_k)),
+`tools/requant_dense.py` re-quantizes just those to Q5_K (3.01 GiB) and copies every other byte; from v1.3.36 it keeps
+the GGUF's 16 KB alignment (before, the V4.1 output came out shifted and `iq_pack.py` refused it). The new GGUF is
+another 366 GB (~25 minutes); the pack takes its expert statistics and tokenizer from the original one:
+
+```sh
+M=<models dir>
+GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
+  .venv/bin/python -I tools/requant_dense.py $M/nazeshinjite/DeepSeek-V4.1-Flash-1017-Q2.gguf \
+  $M/nazeshinjite-attn-q5k q5_k 'blk\.\d+\.attn_q_b\.weight' 'blk\.\d+\.attn_output_[ab]\.weight'
+.venv/bin/python tools/iq_pack.py --gguf $M/nazeshinjite-attn-q5k/DeepSeek-V4.1-Flash-1017-Q2.gguf \
+  --out $M/nazeshinjite-attn-q5k/pack --compat-bf16
+cp -r $M/nazeshinjite/pack/{expert_prior.txt,expert_counts.txt,tokenizer} $M/nazeshinjite-attn-q5k/pack/
+```
+
+Then point the config's `--glm-pack` and `tokenizer` at `nazeshinjite-attn-q5k/pack`. On the 8 held-out sequences
+(the speed config above, v1.3.36): KL 0.2416 -> 0.2508, top-1 78.96 -> 78.48%, ppl 9.78 -> 9.88, and 10-15% faster
+a sequence where the SSD had no slow spell (seq 0 / 1 / 2 / 4 / 5: 36.6 / 36.7 / 29.3 / 29.5 / 29.0 ->
+31.4 / 31.2 / 26.6 / 26.2 / 26.1 ms a token); the dense weights drop to 6.50 GB and the VRAM tier gains 177 expert
+slots (2,321 -> 2,498). It stays optional until a swe-bench run shows the answers hold up.
+
 ## Quality and speed (RTX 5090 + Radeon 8060S lane + 94 GB RAM + NVMe at 3.4 GB/s)
 
 Quality is measured against the unquantized 1017's top-256 log-probs on Lucebox's 8 held-out sequences
@@ -133,8 +157,13 @@ The hybrid shard set is shard 1 = the dense and Engram tensors fetched from Luce
 | `STRATA_GLM_STREAM_FETCH` | on (v1.3.31): a disk-landed expert goes to VRAM chunk by chunk while the SSD still reads it (seq 0: 43.6 -> 39.5 ms/token, same logits) |
 | `STRATA_DS41_ENGRAM_CACHE_MB` / `_THREADS` | the Engram raw-row cache (default 256 MB) and read threads (default 15 + caller) |
 | `STRATA_GLM_DISK_LANE=1` | a disk read is computed by the CPU / iGPU lane from its RAM landing instead of being pulled into VRAM (-5% on the Q2_K/Q3_K experts; none on the Q2) |
+| `STRATA_DS41_ENGRAM_ASYNC` | on (v1.3.36): a token's 48 Engram rows are read by a background thread while layer 0 runs; layers 1 and 14 wait for them on the GPU and copy them host-mapped (-0.5 ms a token, same logits) |
+| `STRATA_DS41_ENGRAM_PREFETCH` | 8 (v1.3.36): threads reading a prompt chunk's table 0 then table 1 rows into the row cache right after its hash (1K-token prompt: Engram 1.7-1.9 -> 0.6 s, row-cache hits 8 -> 79%, the prompt -6-7%); `0` off |
+| `STRATA_GLM_IGPU_EARLY` | on (v1.3.36): the iGPU lane starts before a route's SSD reads instead of after them (-2%, same logits) |
 
-Measured and left off: `STRATA_GLM_AHEAD` (the predicted reads were 22% useful and crowded the SSD),
+Measured and left off: `STRATA_GLM_AHEAD` (the predicted reads were 22% useful and crowded the SSD; v1.3.36 lets a
+demand read wait on an in-flight lookahead read inside the streamed fetch, `STRATA_GLM_AHEAD_MERGE`, which saves 2%,
+but with a 3.4 GB/s SSD 37.4 ms a token still loses to 34.9 without lookahead - to be re-measured on a faster NVMe),
 `STRATA_GLM_SEED_PRIOR=1` and `STRATA_GLM_DEMOTE_TIES=1` (46.8 -> 48.5 / 46.1 ms with more RAM re-reads),
 `STRATA_GLM_DISK_ADAPT=1`, `STRATA_GLM_DEFER=1` (-4% at KL 0.15 -> 0.28 on one sequence).
 

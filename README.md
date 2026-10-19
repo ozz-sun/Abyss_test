@@ -57,7 +57,7 @@ experts stay on the SSD. What changed from V4: [the V4.1 spec](docs/deepseek41/S
   build with CUDA 12.
 - **One-command setup** — engine, model, pack, config and the `Abyss-tools` helper scripts.
 - **EXL3 quants (GLM-5.3-Flash, experimental)** — exllamav3's trellis quants read in place: turboderp's sc_2.10bpw
-  predicts text better than Maya-S-v2 at 8 GB less (nll 1.59 vs 1.63), decoding at ~2/3 its speed on an APU lane; the
+  predicts text better than Maya-S-v2 at 8 GB less (nll 1.59 vs 1.63), decoding at ~80% of its speed on an APU lane (v1.3.36); the
   installer says which suits your PC ([EXL3](docs/exl3/README.md)).
 
 ## 📊 Performance
@@ -248,7 +248,7 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 - [x] AMD (HIP, experimental): runs on the Radeon 8060S with WMMA kernels
 - [x] V100 (sm_70) builds with CUDA 12
 - [x] EXL3 quants of GLM-5.3-Flash (exllamav3), on the GPU, the iGPU lane and the CPU lane; a per-PC recommendation in the installer
-- [ ] EXL3 quants of DeepSeek V4 / V4.1; an RDNA-tuned iGPU trellis kernel
+- [ ] EXL3 quants of DeepSeek V4 / V4.1; an iGPU trellis kernel built for RDNA
 - [ ] A DSpark drafter (this GGUF has no MTP block)
 - [ ] Conversation slots on disk
 - [ ] Windows for DeepSeek V4 (Linux tested; community builds on an RX 7900 XT, see [AMD HIP](docs/maya/AMD_HIP.md))

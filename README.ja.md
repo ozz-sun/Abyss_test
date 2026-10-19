@@ -50,7 +50,7 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 - **複数 GPU、AMD、V100** — NVIDIA の複数カードに層を分けて載せる。Radeon 向けの HIP ビルド（試験的）、CUDA 12 での sm_70 ビルド
 - **コマンド 1 つでセットアップ** — エンジン、モデル、pack、設定、運用スクリプトの `Abyss-tools` まで
 - **EXL3 量子化（GLM-5.3-Flash、試験的）** — exllamav3 のトレリス量子化をそのまま読む。turboderp の sc_2.10bpw は
-  Maya-S-v2 より 8 GB 小さく、文章の予測が良い（nll 1.59 対 1.63）。APU の lane では生成が約 2/3 の速さになる。
+  Maya-S-v2 より 8 GB 小さく、文章の予測が良い（nll 1.59 対 1.63）。APU の lane では生成が約 8 割の速さ（v1.3.36）。
   どちらが合うかはインストーラが PC を見て示す（[EXL3](docs/exl3/README.md)）
 
 ## 📊 性能

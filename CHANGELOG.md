@@ -7,6 +7,36 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.36 - 2026-10-19
+
+**EXL3 on the iGPU lane 16% faster; DeepSeek V4.1's Engram reads off the token's path; opt-in route affinity and a
+V4.1 Q5_K dense pack.**
+- **EXL3 (GLM-5.3-Flash sc_2.10bpw): 22.4 -> 18.8 ms a token** on an RTX 5090 + Radeon 8060S lane. The trellis
+  codebook's byte sum is one `v_sad_u8` on HIP (it compiled to ~5 instructions; bit-identical, 19.6 ms), and the decode
+  GEMV's dot goes two halves at a time through `v_dot2_f32_f16` on RDNA 3 / 4 (another sum order: nll 1.5913 ->
+  1.5959, inside the run-to-run range; `STRATA_EXL3_NO_FDOT2` at build time keeps the old form). The gap to the GGUF
+  Maya-S-v2 (15.4 ms) is 1.2x, was 1.5x.
+- **DeepSeek V4.1 Engram**: a token's 48 rows are read by a background thread while layer 0 runs and layers 1 / 14
+  wait for them on the GPU (`STRATA_DS41_ENGRAM_ASYNC`, on; -0.5 ms a token, same logits); a prompt chunk's rows are
+  read into the row cache right after its hash (`STRATA_DS41_ENGRAM_PREFETCH`, 8 threads; a 1K-token prompt's Engram
+  1.7-1.9 -> 0.6 s, the prompt -6-7%).
+- **The iGPU lane**: a route with SSD reads starts its lane before the reads (`STRATA_GLM_IGPU_EARLY`, on; V4.1 -2%,
+  same logits); the lane takes the GPU's q8_1 input from the request (`STRATA_GLM_IGPU_XQ`, on; bit-identical: DeepSeek
+  V4 KL 0.005939 as before); the RDNA IQ2_XXS gate/up kernel also runs V4.1's 5120 / 2304 shape (lane -3.5-7%,
+  bit-identical; `ABYSS_IGPU_GU16_4096=1` for the old rule).
+- **`STRATA_GLM_ROUTE_AFFINITY=<a>`** (opt-in, after Maya #252): a VRAM-resident expert's routing score gets +a, its
+  weight stays the router's. GLM-5.3-Flash Maya-S-v2 at `0.04`: 15.4 -> 14.1 ms a token, VRAM hits 56 -> 69%, nll
+  1.635 -> 1.631 (KL 0.043 to the default's logits). `_RAM` does the same for the RAM tier (not measured yet).
+- **DeepSeek V4.1 Q5_K dense pack** (optional): `attn_q_b` / `attn_output_a` / `attn_output_b` at Q5_K, dense 8.14 ->
+  6.50 GB, +177 VRAM slots, 10-15% faster a sequence, KL 0.2416 -> 0.2508 on the 8 held-out sequences
+  ([how](docs/deepseek41/README.md#a-lighter-dense-pack-q5_k)). `tools/requant_dense.py` now keeps a GGUF's custom
+  alignment (V4.1's 16 KB); before, its output was shifted and `iq_pack.py` refused it.
+- V4.1 lookahead: a demand read waits on an in-flight lookahead read inside the streamed fetch
+  (`STRATA_GLM_AHEAD_MERGE`, on; only with `STRATA_GLM_AHEAD`, which stays off: 37.4 against 34.9 ms without it on a
+  3.4 GB/s SSD).
+- Measured and dropped: unrolling the lane's K loop and a multi-expert down kernel (slower), GLM-5.3-Flash
+  `STRATA_GLM_DEFER=1` on Maya-S-v2 (-19% but nll +0.063).
+
 ## v1.3.35 - 2026-10-19
 
 **EXL3 quants of GLM-5.3-Flash (exllamav3), experimental; the installer says which quant suits the PC.**

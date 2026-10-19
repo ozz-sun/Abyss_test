@@ -333,6 +333,9 @@ v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。準�
   `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1`（ルートの 4〜6 位が SSD にしかないときは計算しない。量子化前の
   モデルに対する KL は 0.229 → 0.240）で生成は約 28 tok/s、なしで 17.7 tok/s。swe-bench のコーディング問題は通しで
   51.6 tok/s。prompt は遅い（アテンションを 1 トークンずつ計算し、prompt のエキスパートも SSD から読む）。
+- **軽い dense pack**（v1.3.36、任意）: `attn_q_b` / `attn_output_a` / `attn_output_b` を Q8_0 から Q5_K にすると、
+  dense が 8.14 → 6.50 GB、VRAM のエキスパート枠が 177 増え、生成が 10〜15% 速くなる。KL は 0.242 → 0.251。作り方は
+  [docs/deepseek41/README.md](deepseek41/README.md#a-lighter-dense-pack-q5_k)。
 - **メモリ上限つきのスコープで起動する**（`systemd-run --user --scope -p MemoryMax=88G ...`）。ページキャッシュと pinned の
   層が重なると、systemd-oomd がデスクトップのセッションを止めることがある。
 - **まだできないこと:** 投機デコード、層の分割、会話のディスク保存、画像。
@@ -352,8 +355,8 @@ safetensors からそのまま読む。詳しくは [docs/exl3/README.md](exl3/R
 - **手作業で。** `.venv/bin/python tools/exl3_pack.py --model <dir>`（約 5 秒）で `<dir>/maya-exl3.gguf` と `<dir>/pack/`
   ができる。起動は `--glm-pack <dir>/pack`。
 - **目安**（RTX 5090 + Radeon 8060S の lane + RAM 94 GB、採点 1,000 トークン）: sc_2.10bpw は nll 1.591〜1.598、1 位一致
-  63.3〜63.7%（Maya-S-v2-IQ2_XXS は 1.634 / 62.3%）。1 トークン 22.4〜22.7 ms（同 14.8 ms）。iGPU lane でのエキスパート
-  1 個は 0.088 ms（GGUF は 0.041 ms）。
+  63.3〜63.7%（Maya-S-v2-IQ2_XXS は 1.634 / 62.3%）。1 トークン 18.8 ms（同 15.4 ms）。v1.3.36 で iGPU のトレリス
+  復号を `v_sad_u8` と `v_dot2_f32_f16` にした（v1.3.35 は 22.4 ms）。
 
 ## メモリと速度
 
@@ -423,6 +426,8 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 | `STRATA_GLM_THINK_RESERVE` | 1024 | （サーバー）思考が回答のために必ず残すトークン数 |
 | `STRATA_GLM_IGPU` | 自動 | iGPU レーン。`libabyss_igpu.so` と HIP のデバイスがあり、CPU より速ければ使う。`0` で使わない、`1` で遅くても使う。`STRATA_GLM_IGPU_LIB=<パス>` で別のライブラリ |
 | `STRATA_GLM_IGPU_TIMEOUT_MS` | 20 | これより遅れたレーンの呼び出しは CPU のスレッドが引き継ぐ（0: 待つ） |
+| `STRATA_GLM_IGPU_EARLY` | オン | SSD からエキスパートを読むルートで、iGPU レーンを読みの後ではなく前に起動する（v1.3.36。DeepSeek V4.1 で −2%、出力は同じ）。`0`: 読みの後 |
+| `STRATA_GLM_IGPU_XQ` | オン | トークンの入力を、GPU が量子化した q8_1 のまま request で受け取り、iGPU で量子化し直さない（v1.3.36、ビット同一）。`0`: iGPU で量子化 |
 | `STRATA_GLM_PREFILL_IGPU` | オン | prompt の RAM 層エキスパートを iGPU で計算する。`0`: CPU のスレッド |
 | `STRATA_GLM_IGPU_FUSED` | オン | prompt の iGPU エキスパートを fused な int8 tensor core カーネルで計算する（gfx1151、IQ2_XS / IQ3_XXS の 4096 / 2048 エキスパート。v1.3.18）。`0`: 1 行ずつのカーネル。`ABYSS_IGPU_FUSED_CHECK=<n>` で最初の n 回を 1 行カーネルと比べる（stderr） |
 | `STRATA_GLM_MV_SPLIT` | auto | dense GEMV の 1 行を 4 warp で分担する: 未設定 = 256 block 未満と、Q6_K は 4,096 block まで（v1.3.18）。`0` 常に 1 warp、`2` / `4` 常にその分担。1 warp のときとビットは一致しない |
@@ -431,6 +436,8 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 | `STRATA_GLM_ZERO_COPY` | オン | copy engine を使わない token の境目（v1.3.21）: 表の更新・埋め込み行（`token_embd` の pinned コピー、Q8_0 / Q5_K）・トークンを、カーネルが host-mapped で直接読み書きする。`0`: 従来どおり memcpy |
 | `STRATA_GLM_GAP_PROF` | オフ | `1`: 答えごとに `glm gap prof` の行を出す。トークンとトークンの間の時間の内訳（host 側のラップと、timing event で測った GPU の空き） |
 | `STRATA_GLM_TAIL_SKIP` / `_W` | オフ | ルートの r 位より下（または確率の割合が閾値より下）で VRAM にないエキスパートを計算しない。CPU レーンが遅い環境で速くなるが、答えが変わる（KL 0.01〜0.02 程度） |
+| `STRATA_GLM_ROUTE_AFFINITY` | オフ | `<a>`: VRAM にあるエキスパートの選択スコアに +a する（重みはルーターの値のまま）。僅差なら GPU にあるエキスパートが選ばれる（Maya #252 から。v1.3.36）。答えが変わる。GLM-5.3-Flash Maya-S-v2、RTX 5090 で `0.04` が 1 トークン 14.1 ms（既定 15.4、−9%）、VRAM のヒット 56 → 69%、nll 1.631（既定 1.635、既定のロジットに対する KL 0.043）。`0.08` は −13% だが nll が悪化し始める（1.641〜1.651）。hash ルーティングの層は対象外 |
+| `STRATA_GLM_ROUTE_AFFINITY_RAM` | オフ | `<a>`: RAM 層のエキスパートにも同じく +a（SSD の層がある構成で、SSD にしかないエキスパートを避ける）。未計測 |
 | `STRATA_GLM_TAIL_SKIP_DISK` | オフ | `1`: 上の省略を、SSD にしかないエキスパートだけに限る（v1.3.29）。`STRATA_GLM_TAIL_SKIP=3` と合わせて DeepSeek V4.1 の速度設定: 1 トークン 56.6 → 34.2 ms、KL 0.229 → 0.240。全エキスパートが VRAM + RAM に載るなら何も変わらない |
 | `STRATA_GLM_DEFER` | オフ | expert deferral: 層の MoE のうち CPU レーン側の分を層の終わりで待たず、次の層の attention の後に（元の層の重みで）residual に足す。GPU がレーンを待たなくなる: RTX 5090 + Radeon 8060S で単発 1 トークン 10.9 → 9.5 ms、2 トークンの検証窓 14.4 → 13.1、tok/s +12〜15%。答えの変化は tail skip より大きい（Q8_0 参照に対する KL 0.08、オフなら 0.012。swe-bench L7 16 問 × 3: 107.2 tok/s、resolved 16 問中 13。オフなら 100.9、14）。層分割でも各 part の中で遅らせる（part の最後の層は自分の分を待つ） |
 | `STRATA_DS4_IDX`, `STRATA_DS4_ATTN` | 0 | `1`: lightning indexer / prompt の attention を tensor core 版ではなく従来の FP32 カーネルで計算する（A/B 確認用） |
@@ -441,6 +448,8 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 | `STRATA_GLM_DISK_READERS` | オフ | prompt 処理で SSD 上の expert をこの数のスレッドで読む（DRAM なしの NVMe 向け。環境ごとに測ること。DeepSeek V4.1 は `8` で 1K トークンの prompt が 33 → 27 秒） |
 | `STRATA_GLM_DISK_LANE` | オフ | `1`: SSD から RAM に読んだエキスパートを、VRAM に送らずその場で CPU / iGPU レーンが計算する（v1.3.29。V4.1 の Q2_K/Q3_K エキスパートで −5%、小さい Q2 では効果なし） |
 | `STRATA_DS41_ENGRAM_CACHE_MB` / `_THREADS` | 256 / 15 | DeepSeek V4.1: Engram の行キャッシュと、行を読むスレッド数（v1.3.29） |
+| `STRATA_DS41_ENGRAM_ASYNC` | オン | DeepSeek V4.1: トークンの Engram 48 行を、層 0 の計算中に裏のスレッドが読み、層 1 / 14 が GPU 上で到着を待つ（v1.3.36。1 トークン −0.5 ms、出力は同じ）。`0`: トークンの前に読む |
+| `STRATA_DS41_ENGRAM_PREFETCH` | 8 | DeepSeek V4.1: prompt の chunk の hash の直後に、その Engram 行を行キャッシュへ読むスレッド数（v1.3.36。1K トークンの prompt で Engram 1.7〜1.9 → 0.6 秒、prompt 全体 −6〜7%）。`0`: オフ |
 | `STRATA_DS4_SPEC` | 1（オン） | prompt と応答から作る投機デコード。1 回に試す候補トークン数（1〜3。実測では 1 が最速）。`0` でオフ |
 | `STRATA_DS4_SPEC_GATE` | オン | リクエストの採用率が検証窓の分に見合わない間は候補を出さない。`0`: 常に出す |
 | `STRATA_DS4_SPEC_MIN` | 3 | 候補を探すときに一致させるトークン数（2〜4） |
