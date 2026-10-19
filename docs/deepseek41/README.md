@@ -160,6 +160,7 @@ The hybrid shard set is shard 1 = the dense and Engram tensors fetched from Luce
 | `STRATA_DS41_ENGRAM_ASYNC` | on (v1.3.36): a token's 48 Engram rows are read by a background thread while layer 0 runs; layers 1 and 14 wait for them on the GPU and copy them host-mapped (-0.5 ms a token, same logits) |
 | `STRATA_DS41_ENGRAM_PREFETCH` | 8 (v1.3.36): threads reading a prompt chunk's table 0 then table 1 rows into the row cache right after its hash (1K-token prompt: Engram 1.7-1.9 -> 0.6 s, row-cache hits 8 -> 79%, the prompt -6-7%); `0` off |
 | `STRATA_GLM_IGPU_EARLY` | on (v1.3.36): the iGPU lane starts before a route's SSD reads instead of after them (-2%, same logits) |
+| `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08` | (v1.3.37, lossy, off by default) a resident expert's routing score +0.08, so a near-tie avoids an SSD-only expert: with the tail skip, SSD reads -22% and -8-12% a token on the sequences without iGPU stalls, KL 0.2406 -> 0.2438, ppl 9.76 -> 9.81 (8 sequences); `0.16`: -12-20% at KL 0.2501, ppl 9.89 - about the Q5_K pack's trade |
 
 Measured and left off: `STRATA_GLM_AHEAD` (the predicted reads were 22% useful and crowded the SSD; v1.3.36 lets a
 demand read wait on an in-flight lookahead read inside the streamed fetch, `STRATA_GLM_AHEAD_MERGE`, which saves 2%,

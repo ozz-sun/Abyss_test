@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.37 - 2026-10-20
+
+**DeepSeek V4.1: the iGPU lane's Q2_K down 31% faster; `STRATA_GLM_ROUTE_AFFINITY_RAM` measured (0.08: -8-12% a token
+for KL +0.003).**
+- **The lane's Q2_K down** (nazeshinjite's V4.1 Q2 experts) runs 8 lanes a row on whole 256-value super-blocks, the
+  products and min terms in integers: on a Radeon 8060S the down kernel 53.9 -> 37.1 us for two experts (144 -> 209
+  GB/s, the gate/up's level), a lane call 170 -> 155 us, V4.1 decode -2% (33.5 -> 32.7 ms a token). Not
+  bit-identical to the old dot (another sum order): KL 0.2294 -> 0.2279 on the 8 held-out sequences (exact routing).
+  `ABYSS_IGPU_Q2K_NR=0` for the old kernel. DeepSeek V4 and GLM-5.3-Flash are unchanged (KL 0.005939 as before).
+- **`STRATA_GLM_ROUTE_AFFINITY_RAM`** (opt-in, from v1.3.36) measured on V4.1 with the tail skip: `0.08` reads 22%
+  fewer experts from the SSD, -8-12% a token, KL 0.2406 -> 0.2438, ppl 9.76 -> 9.81; `0.16` -12-20% at KL 0.2501
+  ([docs](docs/deepseek41/README.md#options-for-this-model)).
+- `STRATA_GLM_ROUTE_PROF=1` (diagnostics): the route kernel's SM cycles per phase. DeepSeek V4 on an RTX 5090, 15 us
+  a route: the request's system fence 6.3 us, the plan 3.4, the top-k 2.4 - too little to chase (~1% a token).
+
 ## v1.3.36 - 2026-10-19
 
 **EXL3 on the iGPU lane 16% faster; DeepSeek V4.1's Engram reads off the token's path; opt-in route affinity and a
