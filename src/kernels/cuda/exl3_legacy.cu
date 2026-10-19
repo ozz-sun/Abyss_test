@@ -54,7 +54,9 @@ void launch_check(const char* what) {
 // ---------------------------------------------------------------- the codebooks
 __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
 #if defined(STRATA_USE_HIP)
-    return acc + (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + (x >> 24);
+    // v_sad_u8: sum of |x's bytes - 0| + acc, one instruction on GCN / RDNA (the shift-mask-add form was 7+ and made
+    // the trellis decode ALU-bound on the iGPU lane); the same bits as the byte sum
+    return __builtin_amdgcn_sad_u8(x, 0u, acc);
 #else
     return __dp4a(x, 0x01010101u, acc);
 #endif
