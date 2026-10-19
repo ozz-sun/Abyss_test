@@ -1548,6 +1548,7 @@ void Glm5Model::fast_igpu_setup() {
     if (const char* pk = getenv("STRATA_GLM_IGPU_POKE"))
         if (std::atoi(pk) == 0) F->igpu_poke = nullptr;
     F->igpu_rows = (abyss_igpu_rows_fn) dlsym(lib, "abyss_igpu_rows");
+    F->igpu_x3 = (abyss_igpu_experts_x3_fn) dlsym(lib, "abyss_igpu_experts_x3");
     F->igpu_reg = rg;
     F->igpu_unreg = (abyss_igpu_unregister_fn) dlsym(lib, "abyss_igpu_unregister");
     if (F->igpu_unreg == nullptr) F->igpu_rows = nullptr;
@@ -1564,10 +1565,20 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     const auto& nf = F->cpu_fmt[(size_t) il];
     namespace kc = strata::kernels::cpu;
     const int n_ff = g.n_ff_exp, n_embd = g.n_embd;
-    if (F->igpu_experts != nullptr) {   // the iGPU lane: the same sum from the registered RAM tier
+    // the iGPU lane: the same sum from the registered RAM tier (an EXL3 layer through abyss_igpu_experts_x3, when the
+    // library has it - else the CPU threads below)
+    if (F->igpu_experts != nullptr && (!Ly.exl3 || F->igpu_x3 != nullptr)) {
         const auto ti = std::chrono::steady_clock::now();
-        const int rc = F->igpu_experts(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, ne,
-                                       (const void* const*) blob, w, x, out);
+        int rc;
+        if (Ly.exl3) {
+            const size_t off9[9] = {Ly.xl.suh[0], Ly.xl.suh[1], Ly.xl.suh[2], Ly.xl.svh[0], Ly.xl.svh[1],
+                                    Ly.xl.svh[2], Ly.xl.trellis[0], Ly.xl.trellis[1], Ly.xl.trellis[2]};
+            rc = F->igpu_x3(Ly.xl.K, Ly.xl.cb, off9, n_embd, n_ff, g.swiglu_exp, ne, (const void* const*) blob, w, x,
+                            out);
+        } else {
+            rc = F->igpu_experts(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, ne,
+                                 (const void* const*) blob, w, x, out);
+        }
         // a call is ~0.1-0.3 ms; one that waits for the kernel driver to fault a registered range in again (the stall
         // STRATA_GLM_IGPU_CHUNK_MB bounds) says so, at most once a second
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ti).count();

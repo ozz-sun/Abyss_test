@@ -25,6 +25,9 @@ typedef int (*abyss_igpu_experts_fn)(int gu_type, int d_type, int n_embd, int n_
                                      const void* const* blobs, const float* w, const float* x, float* out);
 /// Forget a range registered by abyss_igpu_register (before the host frees it).
 typedef void (*abyss_igpu_unregister_fn)(const void* host);
+// an EXL3 layer's experts (optional symbol abyss_igpu_experts_x3): off9 = suh[3], svh[3], trellis[3] byte offsets
+typedef int (*abyss_igpu_experts_x3_fn)(const int* K3, int cb, const size_t* off9, int n_embd, int n_ff, float limit,
+                                        int ne, const void* const* blobs, const float* w, const float* x, float* out);
 /// The prompt path's experts on the iGPU (glm_fast's light row kernels): expert i (blob blobs[i], registered) over the
 /// rows [r0[i], r0[i] + nr[i]) of [rlo, rhi); row r is token row_tok[r] of x (n_tok rows of n_embd floats).  Gate/up,
 /// the clamped swiglu, down: out row r (ld floats apart, ld >= max(n_embd, 2 n_ff)) = expert(x[row_tok[r]]), unweighted.

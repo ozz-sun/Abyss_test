@@ -5,6 +5,7 @@
 #include "strata/igpu/igpu_lane.h"
 #include "igpu_fused.h"
 #include "../kernels/cuda/glm_fast.cu"
+#include "strata/kernels/exl3.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -344,6 +345,77 @@ __attribute__((visibility("default"))) int abyss_igpu_experts(int gu_type, int d
         return -1;
     }
     if (dout == 0ull) std::memcpy(out, L.out_h, (size_t) n_embd * sizeof(float));
+    return 0;
+}
+
+// the same for an EXL3 layer (exllamav3's trellis experts, src/kernels/cuda/exl3.cu): the blob layout in off9 (suh,
+// svh, trellis byte offsets of gate, up, down) and K3 / cb; F32 input, no q8_1.  The same queue, deadline and late-call
+// rule as abyss_igpu_experts
+__attribute__((visibility("default"))) int abyss_igpu_experts_x3(const int* K3, int cb, const size_t* off9, int n_embd,
+                                                                 int n_ff, float limit, int ne, const void* const* blobs,
+                                                                 const float* w, const float* x, float* out) {
+    namespace x3 = strata::kernels::exl3;
+    if (!L.open || ne < 1 || ne > 8 || n_embd > L.n_embd || n_ff > L.n_ff) return 1;
+    std::unique_lock<std::mutex> lk(L.mu, std::try_to_lock);
+    if (!lk.owns_lock()) return 1;
+    if (L.pending) {
+        if (hipStreamQuery(L.s) != hipSuccess) {
+            ++L.on_cpu;
+            L.t_busy = std::chrono::steady_clock::now();
+            return 1;
+        }
+        L.pending = false;
+        L.on_cpu = 0;
+    }
+    static const bool ready = x3::prepare(L.s);
+    if (!ready) return -1;
+    for (int i = 0; i < ne; ++i) {
+        const unsigned long long d = dev_of(blobs[i]);
+        if (d == 0ull) return 1;
+        L.plan_h->ptr[i] = d;
+        L.plan_h->w[i] = w[i];
+    }
+    for (int i = ne; i < 8; ++i) { L.plan_h->ptr[i] = 0ull; L.plan_h->w[i] = 0.0f; }
+    std::memcpy(L.x_h, x, (size_t) n_embd * sizeof(float));
+    x3::MoeArgs xa;
+    xa.plan_ptr = L.plan_d->ptr;
+    xa.plan_w = L.plan_d->w;
+    for (int r = 0; r < 3; ++r) {
+        xa.lay.suh[r] = off9[r];
+        xa.lay.svh[r] = off9[3 + r];
+        xa.lay.trellis[r] = off9[6 + r];
+        xa.lay.K[r] = K3[r];
+    }
+    xa.lay.cb = cb;
+    xa.k = ne;
+    xa.n_embd = n_embd;
+    xa.n_ff = n_ff;
+    xa.limit = limit;
+    x3::moe_gate_up(xa, L.x_d, nullptr, L.s);
+    x3::moe_down(xa, nullptr, nullptr, L.out_d, L.s);
+    static const double timeout_ms = [] {
+        const char* v = getenv("STRATA_GLM_IGPU_TIMEOUT_MS");
+        return v != nullptr ? std::max(0.0, std::atof(v)) : 20.0;
+    }();
+    const auto t0 = std::chrono::steady_clock::now();
+    hipError_t e;
+    while ((e = hipStreamQuery(L.s)) == hipErrorNotReady) {
+        if (timeout_ms > 0.0 &&
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > timeout_ms) {
+            L.pending = true;
+            L.t_pend = t0;
+            L.t_busy = std::chrono::steady_clock::now();
+            L.on_cpu = 0;
+            std::fprintf(stderr, "iGPU lane: an EXL3 call is still running after %.0f ms - the CPU lane takes the calls "
+                                 "until it finishes\n", timeout_ms);
+            return 1;
+        }
+    }
+    if (e != hipSuccess || x3::launch_errors() > 0) {
+        std::fprintf(stderr, "iGPU lane: EXL3 %s\n", hipGetErrorString(e));
+        return -1;
+    }
+    std::memcpy(out, L.out_h, (size_t) n_embd * sizeof(float));
     return 0;
 }
 

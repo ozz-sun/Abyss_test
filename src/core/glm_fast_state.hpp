@@ -544,6 +544,7 @@ struct Glm5Model::FastState {
     //      GPU from the registered RAM tier instead of the pool's threads; a call it cannot take stays on the CPU
     void* igpu_lib = nullptr;
     abyss_igpu_experts_fn igpu_experts = nullptr;
+    abyss_igpu_experts_x3_fn igpu_x3 = nullptr;   // an EXL3 layer's (abyss_igpu_experts_x3; absent: the CPU takes them)
     abyss_igpu_poke_fn igpu_poke = nullptr;   // the service thread's keep-alive while a decode runs
     // the prompt path's host experts on the iGPU (abyss_igpu_rows; STRATA_GLM_PREFILL_IGPU=0: the CPU threads)
     abyss_igpu_rows_fn igpu_rows = nullptr;
