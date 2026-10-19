@@ -7,6 +7,22 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.38 - 2026-10-20
+
+**DeepSeek V4.1: unsloth's GGUFs load (llama.cpp PR 30817's layout); UD-IQ1_S (233 GB) runs 32% faster than the
+nazeshinjite Q2 for lower quality; a supported-models table in the README.**
+- **unsloth/DeepSeek-V4.1-Flash-1017-GGUF** (and other GGUFs from llama.cpp PR 30817, likely Maya-S V4.1): one
+  `per_layer_token_embd.weight` Engram table (`deepseek41.ple.*` keys, global head offsets), `engram_gate` with the
+  q / k norms folded in, `attention.kv_source_layers` / `attention.indexer.*` keys. `tools/iq_pack.py` writes the pack
+  (BF16 `indexer.proj` is widened to F32 like F16); the engine reads the folded gate with a ones vector for the key norm.
+  The nazeshinjite and mrfakename GGUFs pack as before (same engram.txt).
+- **UD-IQ1_S** on an RTX 5090 + Radeon 8060S lane, tail skip: **21.9 / 22.0 ms a token** (was 32.3 / 32.4 with the
+  nazeshinjite Q2; disk waits ~3,750 -> ~2,300); the 8 held-out sequences (exact routing) KL 0.228 -> 0.355, same
+  top-1 79.2% -> 75.0%, ppl 9.68 -> 10.80. A server chat answered correctly at 38.5 tok/s. Pack recipe and table in
+  [docs](docs/deepseek41/README.md#ggufs-that-load). Only UD-IQ1_S was measured; other unsloth quants share the layout.
+- **README / README.ja**: a "Supported models" table (DeepSeek V4, V4.1, GLM-5.3-Flash GGUF / EXL3, with what was
+  measured and what is untested).
+
 ## v1.3.37 - 2026-10-20
 
 **DeepSeek V4.1: the iGPU lane's Q2_K down 31% faster; `STRATA_GLM_ROUTE_AFFINITY_RAM` measured (0.08: -8-12% a token

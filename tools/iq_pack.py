@@ -278,7 +278,8 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
             convert = compat_bf16 and needs_bf16(t.name, t.type_name, arch) and t.type_name != "BF16"
             widen = (compat_bf16 and arch in ("deepseek4", "deepseek41") and t.type_name == "F16" and name.startswith("blk.")
                      and name.endswith(DEEPSEEK4_F16_TO_F32))
-            widen_q = (compat_bf16 and arch == "deepseek41" and t.type_name not in FLOAT and name.startswith("blk.")
+            # (BF16 too: unsloth's 1017 GGUFs keep indexer.proj in BF16, exact in F32)
+            widen_q = (compat_bf16 and arch == "deepseek41" and t.type_name not in ("F32", "F16") and name.startswith("blk.")
                        and name.endswith(DEEPSEEK41_ANY_TO_F32))
             if t.type_name in FLOAT or convert or widen_q:
                 raw = tensor_bytes(mm, g, t).tobytes()
@@ -402,43 +403,65 @@ def write_engram(out, g, model: Model) -> int:
     """deepseek41: what the engine needs to read the Engram rows from the GGUF (worklog 2026-10-18_deepseek41-spec.md
     section 3): engram.txt (the row format, each table's absolute offset and row count, the primes and multipliers)
     and the token map as raw uint32 (engram_token_map.u32; the engine's GGUF reader keeps only an array's first
-    items).  Two layouts: ds4's (e4m3 + e8m0 rows of 264 bytes) and llama.cpp's converter (Q8_0 rows of 256)."""
+    items).  Layouts: ds4's (e4m3 + e8m0 rows of 264 bytes), llama.cpp's converter (Q8_0 rows of 256, a table a layer)
+    and llama.cpp PR 30817's (unsloth: deepseek41.ple.* keys, one per_layer_token_embd table)."""
     m = g.metadata
     p = "deepseek41.engram."
     llama = "deepseek41.block_count" in m
     if not llama and m.get(p + "encoding") != "e4m3_e8m0_32_row264":
         print("deepseek41: engram.encoding %r (only e4m3_e8m0_32_row264 is implemented)" % m.get(p + "encoding"))
         return 1
-    layers = list(m[p + "layer_ids"])
-    primes, mult, tmap = list(m[p + "primes"]), list(m[p + "multipliers"]), m[p + "token_map"]
+    # llama.cpp PR 30817 (unsloth's 1017 GGUFs): the hash keys under deepseek41.ple.*, both tables in one
+    # per_layer_token_embd.weight (the second table's rows after the first's: offsets run on across both)
+    ple = "deepseek41.ple.layers" in m
+    if ple:
+        q = "deepseek41.ple."
+        layers = list(m[q + "layers"])
+        primes, mult = list(m[q + "head_vocab_sizes"]), list(m[q + "layer_multipliers"])
+        tmap = m[p + "token_map"]
+        if int(m.get(q + "heads_per_ngram", 0)) != 8 or int(m.get(q + "ngram_size", 0)) != 4 or \
+                int(m.get("deepseek41.embedding_length_per_layer_input", 0)) != 256:
+            print("deepseek41: ple heads_per_ngram / ngram_size / embedding_length_per_layer_input are not 8 / 4 / 256")
+            return 1
+    else:
+        layers = list(m[p + "layer_ids"])
+        primes, mult, tmap = list(m[p + "primes"]), list(m[p + "multipliers"]), m[p + "token_map"]
     if len(layers) != 2 or len(primes) != 48 or len(mult) != 8:
         print("deepseek41: unexpected engram metadata (layers %d, primes %d, multipliers %d)"
               % (len(layers), len(primes), len(mult)))
         return 1
-    if llama and (int(m.get(p + "head_count", 0)) != 8 or int(m.get(p + "key_length", 0)) != 256 or
-                  int(m.get(p + "max_ngram_size", 0)) != 4):
+    if llama and not ple and (int(m.get(p + "head_count", 0)) != 8 or int(m.get(p + "key_length", 0)) != 256 or
+                              int(m.get(p + "max_ngram_size", 0)) != 4):
         print("deepseek41: engram head_count / key_length / max_ngram_size are not 8 / 256 / 4")
         return 1
+    base = [0, 0]   # (ple: each table's first row in the one tensor)
     if llama:
-        offs = list(m[p + "offsets"])
+        offs = list(m["deepseek41.ple.head_offsets" if ple else p + "offsets"])
+        if len(offs) != 48:
+            print("deepseek41: %d Engram head offsets, not 48" % len(offs))
+            return 1
+        run = 0
         for k in range(2):
-            run = 0
+            if not ple:
+                run = 0
+            base[k] = run
             for c in range(24):
                 if int(offs[24 * k + c]) != run:
-                    print("deepseek41: engram.offsets are not the running sum of the primes")
+                    print("deepseek41: the Engram head offsets are not the running sum of the primes")
                     return 1
                 run += int(primes[24 * k + c])
     fmt, lines = "row264 264", []
     for k, il in enumerate(layers):
-        name = "blk.%d.engram_embd.weight" % il
+        name = "per_layer_token_embd.weight" if ple else "blk.%d.engram_embd.weight" % il
         if name not in model.where:
             print("deepseek41: %s is missing" % name)
             return 1
         gg, t, _, path = model.where[name]
         need = sum(int(x) for x in primes[24 * k:24 * k + 24])
-        rows = int(t.shape[1])
-        if llama or t.type_name != "I8":   # any ggml row type (Q8_0 in the PR's converter, Q2_K in mrfakename's Q2_K); the engine decodes
-            rb = t.expected_bytes() // max(rows, 1) if t.expected_bytes() else 0   # with ggml's to_float
+        rows = int(t.shape[1]) - base[k]
+        if llama or t.type_name != "I8":   # any ggml row type (Q8_0 in the PR's converter, Q2_K in mrfakename's Q2_K,
+            # IQ4_NL in unsloth's); the engine decodes with ggml's to_float
+            rb = t.expected_bytes() // max(int(t.shape[1]), 1) if t.expected_bytes() else 0
             ok = int(t.shape[0]) == 256 and rows >= need and rb > 0 and rb <= 272
             fmt = "ggml %d %d" % (t.type_id, rb)
             ok = ok and (llama or rows == int(m[p + "rows"][k]))
@@ -447,11 +470,14 @@ def write_engram(out, g, model: Model) -> int:
         if not ok:
             print("deepseek41: %s is %s %s for %d rows of buckets" % (name, t.type_name, list(t.shape), need))
             return 1
-        lines.append("table %d %d %d %d %s" % (k, il, gg.data_start + t.offset, rows, pathlib.Path(path).resolve()))
+        if ple:
+            rows = need   # (the first table's rows end where the second's begin)
+        lines.append("table %d %d %d %d %s" % (k, il, gg.data_start + t.offset + base[k] * (rb if ple else 0), rows,
+                                               pathlib.Path(path).resolve()))
     lines.insert(0, "format " + fmt)
     lines.append("primes " + " ".join(str(int(x)) for x in primes))
     lines.append("multipliers " + " ".join(str(int(x)) for x in mult))
-    lines.append("pad %d" % int(m[p + "pad_id"]))
+    lines.append("pad %d" % int(m[p + ("pad_token_id" if ple else "pad_id")]))
     lines.append("vocab %d" % len(tmap))
     (out / "engram.txt").write_text("# deepseek41 Engram: format <name> <row bytes>; table <k> <layer> <abs offset> "
                                     "<rows> <file>\n" + "\n".join(lines) + "\n", encoding="utf-8")

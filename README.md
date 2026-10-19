@@ -60,6 +60,22 @@ experts stay on the SSD. What changed from V4: [the V4.1 spec](docs/deepseek41/S
   predicts text better than Maya-S-v2 at 8 GB less (nll 1.59 vs 1.63), decoding at ~80% of its speed on an APU lane (v1.3.36); the
   installer says which suits your PC ([EXL3](docs/exl3/README.md)).
 
+## 📦 Supported models
+
+| Model | GGUF / quant | Size | Status |
+| --- | --- | ---: | --- |
+| DeepSeek V4 Flash 0731 | unsloth [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) (the setup's default) | 96.8 GB | measured, swe-bench 59 of 60 resolved |
+| | huihui-ai's abliterated Q2, antirez's deepseek-v4-gguf (`--compat-bf16`) | ~83 GB | runs (KL 0.0075 against llama.cpp) |
+| | unsloth's other quants with these expert types: IQ1_S-IQ4_XS, Q2_K-Q6_K, MXFP4 | | should run, untested |
+| DeepSeek V4.1 Flash 1017 | nazeshinjite [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) (the default) | 366 GB | measured, swe-bench 34 of the first 35 |
+| | unsloth [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (v1.3.38) | 233 GB | measured: 32% faster, lower quality |
+| | mrfakename Q2_K; Lucebox dense + Engram with mrfakename's experts (a hybrid) | 247 / 201 GB | runs: low quality alone / the most accurate, slow |
+| | unsloth's other quants, Project Maya's Maya-S | 178-508 GB | same layout as UD-IQ1_S, untested |
+| GLM-5.3-Flash (Maya's) | Maya-S-v2 IQ2_XXS, Maya-S24 | 96.5 / 94.7 GB | measured |
+| | turboderp's EXL3 sc_2.10bpw ([EXL3](docs/exl3/README.md)) | | measured, experimental |
+
+Which V4.1 file to pick and how each was measured: [docs/deepseek41/README.md](docs/deepseek41/README.md#ggufs-that-load).
+
 ## 📊 Performance
 
 unsloth's [DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) `UD-Q2_K_XL`

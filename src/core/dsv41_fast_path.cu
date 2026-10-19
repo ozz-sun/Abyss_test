@@ -313,8 +313,15 @@ bool Glm5Model::dsv41_bind(std::string& err) {
         if (Ly.eng >= 0) {   // (ds4's names, then llama.cpp's)
             const bool l = !has("engram_kv.weight");
             Ly.eng_kv = q(l ? "engram_wkv.weight" : "engram_kv.weight", kEngCols * kEngDim, 5 * (int64_t) g.n_embd);
-            Ly.eng_qn = f32(l ? "engram_q.weight" : "engram_q_norm.weight");
-            Ly.eng_kn = f32(l ? "engram_k.weight" : "engram_k_norm.weight");
+            if (!l && has("engram_gate.weight")) {
+                // llama.cpp PR 30817 (unsloth): the q and k norm weights folded into one gate (q * k); the key's
+                // weight is then ones (dsv41_alloc)
+                Ly.eng_qn = f32("engram_gate.weight");
+                Ly.eng_kn = nullptr;
+            } else {
+                Ly.eng_qn = f32(l ? "engram_q.weight" : "engram_q_norm.weight");
+                Ly.eng_kn = f32(l ? "engram_k.weight" : "engram_k_norm.weight");
+            }
         }
     }
     if (!missing.empty()) {
@@ -386,7 +393,7 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
     bytes += 2 * al(D * 4) + al(HD * 4) + al(HD / 32 * 36) + al(OL * 4) + al(OL / 32 * 36) + al((size_t) g.idx_top_k * 4);
     bytes += 2 * al(4 * 4) + al((ctx + 1) * 4) + al(B * 4) + al((size_t) g.cand_blocks * 4) + al(B);
     bytes += al((size_t) 2 * kEngCols * kEngDim * 4) + al((size_t) 5 * g.n_embd * 4) + al((size_t) 2 * kEngCols * kEngDim / 32 * 36) +
-             al((size_t) kV41Blk * kEngCols * kEngDim * 4);
+             al((size_t) kV41Blk * kEngCols * kEngDim * 4) + al((size_t) g.hc * g.n_embd * 4);
     if (cudaMalloc(&dsv41_state_, bytes) != cudaSuccess) {
         cudaGetLastError();
         err = "deepseek41: the caches (" + std::to_string(bytes >> 20) + " MB for " + std::to_string(ctx) +
@@ -431,6 +438,13 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
     F->v41_eng_kv = (float*) take((size_t) 5 * g.n_embd * 4);
     F->v41_eng_q = take((size_t) 2 * kEngCols * kEngDim / 32 * 36);
     F->v41_pblk = (float*) take((size_t) kV41Blk * kEngCols * kEngDim * 4);
+    {   // a folded Engram gate's key weight (dsv41_bind): ones
+        float* ones = (float*) take((size_t) g.hc * g.n_embd * 4);
+        const std::vector<float> h((size_t) g.hc * g.n_embd, 1.0f);
+        cudaMemcpy(ones, h.data(), h.size() * 4, cudaMemcpyHostToDevice);
+        for (int il = l0_; il < l1_; ++il)
+            if (F->L[(size_t) il].eng >= 0 && F->L[(size_t) il].eng_kn == nullptr) F->L[(size_t) il].eng_kn = ones;
+    }
     if (cudaMallocHost(&F->v41_pblk_h, (size_t) kV41Blk * kEngCols * kEngDim * 4) != cudaSuccess) {
         cudaGetLastError();
         err = "deepseek41: the prompt path's Engram staging buffer did not allocate";

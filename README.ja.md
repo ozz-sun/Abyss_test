@@ -53,6 +53,22 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
   Maya-S-v2 より 8 GB 小さく、文章の予測が良い（nll 1.59 対 1.63）。APU の lane では生成が約 8 割の速さ（v1.3.36）。
   どちらが合うかはインストーラが PC を見て示す（[EXL3](docs/exl3/README.md)）
 
+## 📦 対応モデル
+
+| モデル | GGUF / 量子化 | サイズ | 状態 |
+| --- | --- | ---: | --- |
+| DeepSeek V4 Flash 0731 | unsloth [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)（セットアップの既定） | 96.8 GB | 計測済み、swe-bench 60問中59問解決 |
+| | huihui-ai の abliterated Q2、antirez の deepseek-v4-gguf（`--compat-bf16`） | 約 83 GB | 動作確認済み（llama.cpp との KL 0.0075） |
+| | unsloth のほかの量子化で、expert の型が IQ1_S〜IQ4_XS、Q2_K〜Q6_K、MXFP4 のもの | | 動くはず、未確認 |
+| DeepSeek V4.1 Flash 1017 | nazeshinjite の [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)（既定） | 366 GB | 計測済み、swe-bench 最初の35問中34 |
+| | unsloth の [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（v1.3.38） | 233 GB | 計測済み: 32% 速い、品質は下がる |
+| | mrfakename の Q2_K、Lucebox の dense + Engram と mrfakename の expert の組み合わせ（ハイブリッド） | 247 / 201 GB | 動作確認済み: 単体では低品質 / 最も正確だが遅い |
+| | unsloth のほかの量子化、Project Maya の Maya-S | 178〜508 GB | UD-IQ1_S と同じ形式、未確認 |
+| GLM-5.3-Flash（Maya のもの） | Maya-S-v2 IQ2_XXS、Maya-S24 | 96.5 / 94.7 GB | 計測済み |
+| | turboderp の EXL3 sc_2.10bpw（[EXL3](docs/exl3/README.md)） | | 計測済み、試験的 |
+
+V4.1 でどのファイルを選ぶかと、それぞれの測り方: [docs/deepseek41/README.md](docs/deepseek41/README.md#ggufs-that-load)。
+
 ## 📊 性能
 
 unsloth の [DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) `UD-Q2_K_XL`

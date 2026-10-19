@@ -38,12 +38,32 @@ flowchart LR
 
 ## GGUFs that load
 
-The packer (`tools/iq_pack.py`) reads both V4.1 layouts:
+The packer (`tools/iq_pack.py`) reads the three V4.1 layouts:
 
 | GGUF | layout | experts | notes |
 | --- | --- | --- | --- |
-| [nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) `Q2` | ds4 (antirez) | IQ2_XXS gate/up, Q2_K down, 1017 imatrix (9.95 MB an expert) | Q8_0 dense, FP8 Engram. **The fast one.** 366 GB |
-| [mrfakename/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) `Q2_K` | llama.cpp PR | Q2_K gate/up, Q3_K down (12.8 MB) | dense and Engram tables are Q2_K too - low quality alone (teacher KL 0.64) |
+| [nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) `Q2` | ds4 (antirez) | IQ2_XXS gate/up, Q2_K down, 1017 imatrix (9.95 MB an expert) | Q8_0 dense, FP8 Engram. **The default.** 366 GB |
+| [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) `UD-IQ1_S` | llama.cpp PR 30817 | IQ1_S, IQ2_XXS in some layers (~6.9 MB) | Q5_K-Q8_0 dense, IQ4_NL Engram. **The fastest** (v1.3.38): -32% a token, KL 0.355 against 0.228. 233 GB |
+| [mrfakename/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) `Q2_K` | llama.cpp PR (earlier) | Q2_K gate/up, Q3_K down (12.8 MB) | dense and Engram tables are Q2_K too - low quality alone (teacher KL 0.64) |
+
+unsloth's other quants (UD-IQ1_M 250 GB up to UD-Q8_K_XL 508 GB) and Project Maya's
+[Maya-S](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF) (178 GB, its Engram tables in a
+separate file) use the PR 30817 layout too; they should pack the same way but are untested. Their layout keeps both
+Engram tables in one `per_layer_token_embd.weight` and folds the Engram q / k norm weights into one `engram_gate`;
+unsloth's `engram/` folder offers the tables in MXFP8 / Q6_K / Q5_K / IQ4_NL (the pack points at whichever file it
+was made from).
+
+**unsloth UD-IQ1_S against nazeshinjite Q2** (2026-10-20, RTX 5090 + 60 GB RAM tier, model SSD 3.4 GB/s):
+
+| | nazeshinjite Q2 | unsloth UD-IQ1_S |
+| --- | :---: | :---: |
+| a token, disk tail skip (seq0 / seq1) | 32.3 / 32.4 ms | **21.9 / 22.0 ms** (45.6 tok/s) |
+| disk waits a 1,023-token sequence | 3,747 / 3,796 | 2,293 / 2,331 |
+| 8 held-out texts, exact routing: KL / top-1 agreement / ppl | 0.228 / 79.2% / 9.68 | 0.355 / 75.0% / 10.80 |
+| the chat (a 62-token prompt, 419 tokens out, first answer after start) | - | 38.5 tok/s |
+
+Its experts are 30% smaller, so fewer of them come from the SSD. The quality loss is clear (every one of the 8 texts,
+KL up to 0.51), so it is the pick when speed matters more than accuracy.
 
 The `deepseek41` GGUFs from kyuz0 / antirez named "v4.1" without `1017` are the September checkpoint
 (`general.source.revision` `df42c109`); check the revision before trusting a repo name. Lucebox's ROCMFP files use
@@ -52,6 +72,8 @@ below).
 
 ```sh
 .venv/bin/python tools/iq_pack.py --gguf <DeepSeek-V4.1-Flash-1017-Q2.gguf> --out <dir>/pack --compat-bf16
+# unsloth: shard 1, the pack in the shards' folder
+.venv/bin/python tools/iq_pack.py --gguf UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00001-of-00005.gguf --out UD-IQ1_S/pack --compat-bf16
 ```
 
 The pack keeps only an index, ~2.5 GB of converted small tensors and the Engram table offsets; the experts and the

@@ -734,9 +734,11 @@ bool Glm5Geometry::from_gguf_dsv41(const strata::GgufFile& g, Glm5Geometry& out,
     out.swiglu_shexp = (float) num2("swiglu_limit", "swiglu_clamp_shexp", 10.0);
     out.hash_layers = (int) num2("hash_layer_count", "hash_layer_count", 0);
     out.gating = 1;
-    out.cand_layer = (int) num2("candidate_source_layer_id", "candidate_source_layer_id", 20);
-    out.cand_blocks = (int) num2("candidate_topk_blocks", "candidate_topk_blocks", 2048);
-    out.cand_bs = (int) num2("candidate_block_size", "candidate_block_size", 8);
+    // (llama.cpp PR 30817 - unsloth's 1017 GGUFs - writes the candidate keys and the source lists under attention.*)
+    const bool pr = llama && g.get(p + "attention.kv_source_layers") != nullptr;
+    out.cand_layer = (int) num2("candidate_source_layer_id", pr ? "attention.indexer.candidate_source_layer" : "candidate_source_layer_id", 20);
+    out.cand_blocks = (int) num2("candidate_topk_blocks", pr ? "attention.indexer.candidate_top_k_blocks" : "candidate_topk_blocks", 2048);
+    out.cand_bs = (int) num2("candidate_block_size", pr ? "attention.indexer.candidate_block_size" : "candidate_block_size", 8);
     if (out.hash_layers != 0) { err = "deepseek41: hash-routed layers (V4.1 has none)"; return false; }
     if (llama) {
         if ((int) num2("", "expert_gating_func", 4) != 4) { err = "deepseek41: expert_gating_func is not 4"; return false; }
@@ -756,11 +758,16 @@ bool Glm5Geometry::from_gguf_dsv41(const strata::GgufFile& g, Glm5Geometry& out,
         out.n_vocab = 129280;
     std::vector<int> ratios, kv_ids, idx_ids, eng_ids;
     if (!ids(llama ? "attention.compress_ratios" : "compress_ratios", ratios) || ratios.size() < (size_t) out.n_layers ||
-        !ids("engram.layer_ids", eng_ids)) {
+        !(ids("engram.layer_ids", eng_ids) || ids("ple.layers", eng_ids))) {
         err = "deepseek41: compress_ratios / engram.layer_ids missing";
         return false;
     }
-    if (llama) {
+    if (pr) {
+        if (!ids("attention.kv_source_layers", kv_ids) || !ids("attention.indexer.source_layers", idx_ids)) {
+            err = "deepseek41: attention.kv_source_layers / attention.indexer.source_layers missing";
+            return false;
+        }
+    } else if (llama) {
         kv_ids = {2, 8, 14, 20};
         idx_ids = {2, 8, 14, 20, 24, 28, 32, 36};
     } else if (!ids("kv_source_layer_ids", kv_ids) || !ids("index_source_layer_ids", idx_ids)) {
