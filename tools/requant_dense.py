@@ -84,6 +84,9 @@ def main() -> int:
         for field in r.fields.values():
             if field.name == gguf.Keys.General.ARCHITECTURE or field.name.startswith("GGUF."):
                 continue
+            if field.name == gguf.Keys.General.ALIGNMENT:   # the writer's padding too, not just the key (nazeshinjite's
+                w.add_custom_alignment(int(field.contents()))   # V4.1 GGUF has 16384: copying only the key shifted the data)
+                continue
             val_type = field.types[0]
             sub_type = field.types[-1] if val_type == gguf.GGUFValueType.ARRAY else None
             w.add_key_value(field.name, field.contents(), val_type, sub_type=sub_type)
