@@ -2218,7 +2218,22 @@ struct RouteArgs {
     int early_x;                // 1: the request's x (16 KB, host-mapped) is written at the kernel's start, beside
                                 // the scores and the plan, instead of after them (STRATA_GLM_ROUTE_EARLY)
     int skip_disk;              // 1: the tail skip leaves out only the experts in no tier (disk-only), not RAM ones
+    const block_q8_1* xq;       // x's q8_1 (nullptr: none): copied into the request beside x, for the iGPU lane
+    float affinity;             // STRATA_GLM_ROUTE_AFFINITY (Project Maya #252): added to a VRAM-resident expert's
+                                // selection score - its weight stays its own probability.  LOSSY (0: off)
+    float affinity_ram;         // STRATA_GLM_ROUTE_AFFINITY_RAM: the same for an expert in the RAM tier (not on disk
+                                // only); a VRAM one gets the larger of the two.  LOSSY (0: off)
 };
+// the request's xq (x's q8_1 as the device computed it: 36-byte blocks, copied as words) and its flag; the system
+// fence before the request's seq covers it as it does x
+__device__ __forceinline__ void route_put_xq(const RouteArgs& a, MoeRequest* rq, int tid) {
+    if (tid == 0) rq->xq_ok = a.xq != nullptr && a.n_embd % 32 == 0 && a.n_embd <= kMaxEmbd ? 1 : 0;
+    if (a.xq == nullptr || a.n_embd % 32 != 0 || a.n_embd > kMaxEmbd) return;
+    const uint32_t* s = (const uint32_t*) a.xq;
+    uint32_t* d = (uint32_t*) rq->xq;
+    for (int e = tid; e < a.n_embd / 32 * 9; e += ROUTE_THREADS) d[e] = s[e];
+}
+
 // the router's per-expert probability
 __device__ __forceinline__ float route_score(float x, int gating) {
     if (gating == 1) return sqrtf(x > 20.0f ? x : logf(1.0f + expf(x)));   // ggml's softplus, then sqrt
@@ -2289,6 +2304,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         const float4* xs = (const float4*) a.x;
         float4* xd = (float4*) rqe->x;
         for (int e = tid; e < a.n_embd / 4; e += ROUTE_THREADS) xd[e] = xs[e];
+        route_put_xq(a, rqe, tid);
     }
     __syncthreads();
     // the CPU lane's frequency counts age: every 4096 routes all of them halve (the whole block, before any use)
@@ -2298,6 +2314,11 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         const float p = route_score(a.logits[e], a.gating);
         s_p[e] = p;
         s_sel[e] = a.bias ? p + a.bias[e] : p;
+        if ((a.affinity > 0.0f || a.affinity_ram > 0.0f) && a.hash_ids == nullptr) {
+            const size_t key = (size_t) a.layer * E + e;
+            if (a.d.tab[key] != 0ull) s_sel[e] += fmaxf(a.affinity, a.affinity_ram);
+            else if (a.affinity_ram > 0.0f && a.d.tab[a.d.n_keys + key] != 0ull) s_sel[e] += a.affinity_ram;
+        }
         if (!isfinite(a.logits[e]) || !isfinite(s_sel[e])) atomicMax(&bad, 1);
     }
     __shared__ float s_bv[32];
@@ -2583,8 +2604,10 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     }
     __syncthreads();
     MoeRequest* rq = (MoeRequest*) a.d.ring + (s_seq % kRingSize);
-    if ((s_cpu != 0u || (a.promote_min < 0 && s_mask != 0u)) && !a.early_x)   // (the disk lane reads x too)
+    if ((s_cpu != 0u || (a.promote_min < 0 && s_mask != 0u)) && !a.early_x) {   // (the disk lane reads x too)
         for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq->x[e] = a.x[e];
+        route_put_xq(a, rq, tid);
+    }
     if (tid == 0) {
         rq->layer = a.layer;
         rq->error = 0;
@@ -3808,11 +3831,21 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                int n_ff_sh, void* sh_hq, cudaStream_t s, const float* pred_logits, const float* pred_bias,
                int max_prefetch, const float* ahead_logits, const float* const* ahead_bias, int n_ahead,
                int skip_from, unsigned long long cpu_plan, int promote_min, int pf_rank, int gating,
-               const int* hash_ids, float skip_w, int skip_disk) {
+               const int* hash_ids, float skip_w, int skip_disk, const void* xq) {
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
-                pf_rank > 0 ? pf_rank : k, gating, hash_ids, skip_w, 0, skip_disk};
+                pf_rank > 0 ? pf_rank : k, gating, hash_ids, skip_w, 0, skip_disk, (const block_q8_1*) xq, 0.0f, 0.0f};
+    static const float affinity = [] {
+        const char* v = getenv("STRATA_GLM_ROUTE_AFFINITY");
+        return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
+    }();
+    static const float affinity_ram = [] {
+        const char* v = getenv("STRATA_GLM_ROUTE_AFFINITY_RAM");
+        return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
+    }();
+    a.affinity = affinity;
+    a.affinity_ram = affinity_ram;
     // STRATA_GLM_ROUTE_EARLY=1: x written at the route kernel's start (float4, beside the scores and the plan);
     // default 0: after the plan, as before - measured the same on an RTX 5090 + iGPU lane (the system fence, not the
     // store, is what the request waits for): 3 x 2 answers, 83.4 / 85.6 against 83.6 / 91.2 tok/s
@@ -3983,7 +4016,11 @@ void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, floa
         launch_check("moe_gate_up RDNA3.5");
         return;
     }
-    if (gu_type == 16 && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
+    // (any shape of whole super-blocks: DeepSeek V4.1's 5120 / 2304 too - the kernel takes the shape at run time;
+    // ABYSS_IGPU_GU16_4096=1: GLM-5.3-Flash's 4096 / 2048 only, as before)
+    static const bool gu16_any = std::getenv("ABYSS_IGPU_GU16_4096") == nullptr;
+    if (gu_type == 16 && ((n_embd == 4096 && n_ff == 2048) || (gu16_any && n_embd % 256 == 0 && n_ff % GU_ROWS == 0)) &&
+        rdna3_expert_device()) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
         launch_expert_gu<16, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
             xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);

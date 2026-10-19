@@ -23,6 +23,18 @@ typedef int (*abyss_igpu_register_fn)(const void* host, size_t bytes, char* err,
 /// < 0 an error (the lane should stop).
 typedef int (*abyss_igpu_experts_fn)(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit, int ne,
                                      const void* const* blobs, const float* w, const float* x, float* out);
+/// (optional symbol abyss_igpu_experts_q) the same with x given as its q8_1 blocks (n_embd / 32 x 36 bytes, the
+/// device's own quantization): no quantize on the lane.
+typedef int (*abyss_igpu_experts_q_fn)(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit,
+                                       int ne, const void* const* blobs, const float* w, const void* xq, float* out);
+/// (optional symbols) abyss_igpu_experts in two halves: _start queues the call (0) and keeps the lane - xq, when not
+/// null, is x's q8_1 as for abyss_igpu_experts_q - or returns 1 (nothing queued); _finish waits for it and writes out
+/// (0) or returns 1 (late: compute those experts elsewhere) / < 0 (an error).  Every _start that returned 0 needs its
+/// _finish.
+typedef int (*abyss_igpu_experts_start_fn)(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit,
+                                           int ne, const void* const* blobs, const float* w, const float* x,
+                                           const void* xq);
+typedef int (*abyss_igpu_experts_finish_fn)(float* out, int n_embd);
 /// Forget a range registered by abyss_igpu_register (before the host frees it).
 typedef void (*abyss_igpu_unregister_fn)(const void* host);
 // an EXL3 layer's experts (optional symbol abyss_igpu_experts_x3): off9 = suh[3], svh[3], trellis[3] byte offsets

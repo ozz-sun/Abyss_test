@@ -266,6 +266,14 @@ constexpr int kTok = 8;   // activations a block takes at once (the MMA's n)
 
 #if !defined(EXL3_TC)
 // a lane's 4 weights of one column times the activation's 4 inputs, added to a (the CUDA-core product)
+// EXL3_FDOT2: the HIP decode GEMV's dot on RDNA 3 / 4 by v_dot2_f32_f16 (STRATA_EXL3_NO_FDOT2 at build time: the
+// scalar dot4_acc everywhere)
+#if defined(STRATA_USE_HIP) && defined(__HIP_DEVICE_COMPILE__) && (defined(__GFX11__) || defined(__GFX12__)) && \
+    !defined(STRATA_EXL3_NO_FDOT2)
+#define EXL3_FDOT2 1
+typedef _Float16 h2v __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ h2v as_h2v(uint32_t u) { return __builtin_bit_cast(h2v, u); }
+#endif
 __device__ __forceinline__ float dot4_acc(float a, const float* v, float x0, float x1, float x2, float x3) {
     return __fadd_rn(a, __fmaf_rn(v[3], x3, __fmaf_rn(v[2], x2, __fmaf_rn(v[1], x1, __fmul_rn(v[0], x0)))));
 }
@@ -404,10 +412,20 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
             for (int cc = 0; cc < kTok; ++cc)
                 if (cc < nc) {
                     const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
+#if defined(EXL3_FDOT2)
+                    // RDNA 3+: v_dot2_f32_f16 - two FP16 products (exact in F32) and the sum in one instruction,
+                    // the x pairs straight from LDS (no conversions); the sum's order differs from dot4_acc's
+                    const h2v x01 = *reinterpret_cast<const h2v*>(xr), x89 = *reinterpret_cast<const h2v*>(xr + 8);
+                    acc[cc][0] = __builtin_amdgcn_fdot2(as_h2v(f[1]), x89,
+                                                        __builtin_amdgcn_fdot2(as_h2v(f[0]), x01, acc[cc][0], false), false);
+                    acc[cc][1] = __builtin_amdgcn_fdot2(as_h2v(f[3]), x89,
+                                                        __builtin_amdgcn_fdot2(as_h2v(f[2]), x01, acc[cc][1], false), false);
+#else
                     const float x0 = __half2float(xr[0]), x1 = __half2float(xr[1]);
                     const float x2 = __half2float(xr[8]), x3 = __half2float(xr[9]);
                     acc[cc][0] = dot4_acc(acc[cc][0], v, x0, x1, x2, x3);
                     acc[cc][1] = dot4_acc(acc[cc][1], v + 4, x0, x1, x2, x3);
+#endif
                 }
 #endif
         }

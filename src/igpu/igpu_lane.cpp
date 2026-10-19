@@ -143,6 +143,12 @@ struct Lane {
     float *x_h = nullptr, *out_h = nullptr, *x_d = nullptr, *out_d = nullptr;
     Plan *plan_h = nullptr, *plan_d = nullptr;
     void *xq = nullptr, *hq = nullptr;
+    void *xqh = nullptr, *xqh_d = nullptr;   // pinned, mapped: a caller's q8_1 x (abyss_igpu_experts_q)
+    // a call started by abyss_igpu_experts_start, for abyss_igpu_experts_finish
+    bool g_counted = false;
+    int g_want = 0;
+    unsigned long long g_dout = 0ull;
+    std::chrono::steady_clock::time_point g_t0;
     std::vector<Range> ranges;
     std::mutex mu;
     // abyss_igpu_rows: the experts' table (host-mapped) and the scratch, grown as needed
@@ -202,11 +208,13 @@ __attribute__((visibility("default"))) int abyss_igpu_open(int n_embd, int n_ff,
         (e = hm((void**) &L.out_h, (size_t) n_embd * sizeof(float))) != hipSuccess ||
         (e = hm((void**) &L.plan_h, sizeof(Plan))) != hipSuccess ||
         (e = hipMalloc(&L.xq, (size_t) n_embd / 32 * kQ8)) != hipSuccess ||
+        (e = hm(&L.xqh, (size_t) n_embd / 32 * kQ8)) != hipSuccess ||
         (e = hipMalloc(&L.hq, (size_t) 8 * n_ff / 32 * kQ8)) != hipSuccess) {
         say(err, err_n, "iGPU lane buffers", e);
         return -1;
     }
     hipHostGetDevicePointer((void**) &L.x_d, L.x_h, 0);
+    hipHostGetDevicePointer(&L.xqh_d, L.xqh, 0);
     hipHostGetDevicePointer((void**) &L.out_d, L.out_h, 0);
     hipHostGetDevicePointer((void**) &L.plan_d, L.plan_h, 0);
     std::memset(L.plan_h, 0, sizeof(Plan));
@@ -233,10 +241,45 @@ __attribute__((visibility("default"))) int abyss_igpu_register(const void* host,
     return 0;
 }
 
+static int igpu_experts(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit, int ne,
+                        const void* const* blobs, const float* w, const float* x, const void* xq_in, float* out,
+                        bool start_only = false);
+static int igpu_wait(bool counted, int want, unsigned long long dout, float* out, int n_embd,
+                     std::chrono::steady_clock::time_point t0);
+// in two halves (the engine's service thread starts a route's lane experts before that route's disk reads, and
+// collects the sum after them): _start queues the kernels and keeps the lane (0; 1: busy or not in registered memory -
+// nothing queued, compute it elsewhere), _finish waits up to the deadline and copies the sum out (0), or leaves the
+// call pending and returns 1 (compute those experts elsewhere); either way it releases the lane
+__attribute__((visibility("default"))) int abyss_igpu_experts_start(int gu_type, int d_type, int n_embd, int n_ff,
+                                                                    size_t down_off, float limit, int ne,
+                                                                    const void* const* blobs, const float* w,
+                                                                    const float* x, const void* xq) {
+    if (xq != nullptr && n_embd % 32 != 0) xq = nullptr;
+    return igpu_experts(gu_type, d_type, n_embd, n_ff, down_off, limit, ne, blobs, w, xq != nullptr ? nullptr : x, xq,
+                        nullptr, true);
+}
+__attribute__((visibility("default"))) int abyss_igpu_experts_finish(float* out, int n_embd) {
+    std::unique_lock<std::mutex> lk(L.mu, std::adopt_lock);
+    return igpu_wait(L.g_counted, L.g_want, L.g_dout, out, n_embd, L.g_t0);
+}
 __attribute__((visibility("default"))) int abyss_igpu_experts(int gu_type, int d_type, int n_embd, int n_ff,
                                                               size_t down_off, float limit, int ne,
                                                               const void* const* blobs, const float* w,
                                                               const float* x, float* out) {
+    return igpu_experts(gu_type, d_type, n_embd, n_ff, down_off, limit, ne, blobs, w, x, nullptr, out);
+}
+// x as the caller's q8_1 (the device's own quantization of it, from the engine's request): no quantize here - the
+// call's first kernel was a 5 us launch of its own - and a 4.6 KB copy instead of 16 KB
+__attribute__((visibility("default"))) int abyss_igpu_experts_q(int gu_type, int d_type, int n_embd, int n_ff,
+                                                                size_t down_off, float limit, int ne,
+                                                                const void* const* blobs, const float* w,
+                                                                const void* xq, float* out) {
+    if (xq == nullptr || n_embd % 32 != 0) return 1;
+    return igpu_experts(gu_type, d_type, n_embd, n_ff, down_off, limit, ne, blobs, w, nullptr, xq, out);
+}
+static int igpu_experts(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit, int ne,
+                        const void* const* blobs, const float* w, const float* x, const void* xq_in, float* out,
+                        bool start_only) {
     if (!L.open || ne < 1 || ne > 8 || n_embd > L.n_embd || n_ff > L.n_ff) return 1;
     // one caller at a time (a layer split's parts share the lane): busy -> the CPU takes this one, a decode does not wait
     std::unique_lock<std::mutex> lk(L.mu, std::try_to_lock);
@@ -280,8 +323,10 @@ __attribute__((visibility("default"))) int abyss_igpu_experts(int gu_type, int d
     // (measured the same as the copies on an RTX 5090 + Radeon 8060S: a call 109-117 us either way, 83.4 / 83.9 against
     // 84.6 / 84.5 tok/s - the call's time is the iGPU's, ~20 us fixed + 41 an expert)
     static const bool direct = [] { const char* v = getenv("ABYSS_IGPU_DIRECT"); return v != nullptr && std::atoi(v) != 0; }();
-    const unsigned long long dx = direct ? dev_of(x) : 0ull, dout = direct ? dev_of(out) : 0ull;
-    if (dx == 0ull) std::memcpy(L.x_h, x, (size_t) n_embd * sizeof(float));
+    const unsigned long long dx = direct && x != nullptr ? dev_of(x) : 0ull,
+                             dout = direct && out != nullptr ? dev_of(out) : 0ull;
+    if (xq_in != nullptr) std::memcpy(L.xqh, xq_in, (size_t) n_embd / 32 * kQ8);
+    else if (dx == 0ull) std::memcpy(L.x_h, x, (size_t) n_embd * sizeof(float));
     const float* xd = dx != 0ull ? (const float*) dx : L.x_d;
     float* od = dout != 0ull ? (float*) dout : L.out_d;
     gf::MoeDev md;
@@ -291,8 +336,9 @@ __attribute__((visibility("default"))) int abyss_igpu_experts(int gu_type, int d
     volatile unsigned int* done_h = &L.plan_h->done;
     *done_h = 0u;
     const int want = direct ? gf::lane_down_blocks(d_type, n_embd) : 0;
-    gf::quantize_q8_1(xd, L.xq, n_embd, L.s);
-    gf::moe_gate_up(gu_type, md, ne, n_embd, n_ff, limit, L.xq, L.hq, nullptr, 0, nullptr, 0, nullptr, L.s);
+    if (xq_in == nullptr) gf::quantize_q8_1(xd, L.xq, n_embd, L.s);
+    gf::moe_gate_up(gu_type, md, ne, n_embd, n_ff, limit, xq_in != nullptr ? L.xqh_d : L.xq, L.hq, nullptr, 0, nullptr,
+                    0, nullptr, L.s);
     bool counted = want > 0;
     if (!gf::lane_down(d_type, L.plan_d->ptr, L.plan_d->w, ne, n_embd, n_ff, down_off, L.hq, od,
                        counted ? &L.plan_d->done : nullptr, L.s)) {
@@ -313,12 +359,25 @@ __attribute__((visibility("default"))) int abyss_igpu_experts(int gu_type, int d
     static unsigned long long n_calls = 0;
     if (stall_ticks > 0 && stall_every > 0 && ++n_calls % stall_every == 0)
         gf::lane_stall_kernel<<<1, 32, 0, L.s>>>(stall_ticks);
+    if (start_only) {
+        L.g_counted = counted;
+        L.g_want = want;
+        L.g_dout = dout;
+        L.g_t0 = std::chrono::steady_clock::now();
+        lk.release();   // (the lane stays held until abyss_igpu_experts_finish)
+        return 0;
+    }
+    return igpu_wait(counted, want, dout, out, n_embd, std::chrono::steady_clock::now());
+}
+
+static int igpu_wait(bool counted, int want, unsigned long long dout, float* out, int n_embd,
+                     std::chrono::steady_clock::time_point t0) {
+    volatile unsigned int* done_h = &L.plan_h->done;
     // wait (spinning: a call is ~0.05-0.3 ms) up to the deadline, STRATA_GLM_IGPU_TIMEOUT_MS (20; 0: no deadline)
     static const double timeout_ms = [] {
         const char* v = getenv("STRATA_GLM_IGPU_TIMEOUT_MS");
         return v != nullptr ? std::max(0.0, std::atof(v)) : 20.0;
     }();
-    const auto t0 = std::chrono::steady_clock::now();
     hipError_t e = hipErrorNotReady;
     if (counted) {   // the blocks' count first (memory, no runtime call); the query below only confirms
         unsigned int polls = 0;

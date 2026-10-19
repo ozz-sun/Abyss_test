@@ -471,7 +471,8 @@ public:
     std::string pack_dir_;
     bool fast_warm(std::string& err);                      // load-time: stream every expert into the tiers
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
-    void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out);
+    void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
+                          const void* xq = nullptr);
     void fast_igpu_setup();   // the iGPU lane (STRATA_GLM_IGPU, src/igpu)
     // ---- the NextN (MTP) draft block (the last half carries it; layer index n_layers)
     int mtp_il_ = -1;                                      // its layer index here, -1: not on this half

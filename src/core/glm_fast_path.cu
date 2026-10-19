@@ -1509,6 +1509,13 @@ void Glm5Model::fast_igpu_setup() {
     auto op = (abyss_igpu_open_fn) dlsym(lib, "abyss_igpu_open");
     auto rg = (abyss_igpu_register_fn) dlsym(lib, "abyss_igpu_register");
     auto ex = (abyss_igpu_experts_fn) dlsym(lib, "abyss_igpu_experts");
+    // (optional) the same with x's q8_1 from the request: the lane skips its quantize; STRATA_GLM_IGPU_XQ=0: never
+    static const bool xq_on = [] { const char* v = getenv("STRATA_GLM_IGPU_XQ"); return v == nullptr || std::atoi(v) != 0; }();
+    auto exq = xq_on ? (abyss_igpu_experts_q_fn) dlsym(lib, "abyss_igpu_experts_q") : nullptr;
+    // (optional) the two halves: a route's lane experts start before its disk reads; STRATA_GLM_IGPU_EARLY=0: never
+    static const bool early_on = [] { const char* v = getenv("STRATA_GLM_IGPU_EARLY"); return v == nullptr || std::atoi(v) != 0; }();
+    auto exs = early_on ? (abyss_igpu_experts_start_fn) dlsym(lib, "abyss_igpu_experts_start") : nullptr;
+    auto exf = early_on ? (abyss_igpu_experts_finish_fn) dlsym(lib, "abyss_igpu_experts_finish") : nullptr;
     if (ver == nullptr || op == nullptr || rg == nullptr || ex == nullptr || ver() != ABYSS_IGPU_API)
         return fail("interface mismatch: rebuild libabyss_igpu.so");
     char e[256] = {0};
@@ -1543,6 +1550,9 @@ void Glm5Model::fast_igpu_setup() {
         std::fprintf(stderr, "glm fast: CUDA%d iGPU lane: the ring did not register (%s) - x copied instead\n", dev_, e);
     F->igpu_lib = lib;
     F->igpu_experts = ex;
+    F->igpu_experts_q = exq;
+    F->igpu_start = exs != nullptr && exf != nullptr ? exs : nullptr;
+    F->igpu_finish = exs != nullptr && exf != nullptr ? exf : nullptr;
     F->igpu_poke = (abyss_igpu_poke_fn) dlsym(lib, "abyss_igpu_poke");
     // STRATA_GLM_IGPU_POKE=0 (investigation): no keep-alive kernel between routes
     if (const char* pk = getenv("STRATA_GLM_IGPU_POKE"))
@@ -1745,7 +1755,8 @@ void x3_jobs(glmfast::Workers& pool, int n, int E, int FF, const GP& gu_prep, co
 }
 }  // namespace
 
-void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out) {
+void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
+                                 const void* xq) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
@@ -1821,8 +1832,11 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
             rc = F->igpu_x3(Ly.xl.K, Ly.xl.cb, off9, n_embd, n_ff, g.swiglu_exp, ne, (const void* const*) blob, w, x,
                             out);
         } else {
-            rc = F->igpu_experts(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, ne,
-                                 (const void* const*) blob, w, x, out);
+            rc = xq != nullptr && F->igpu_experts_q != nullptr
+                     ? F->igpu_experts_q(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, ne,
+                                         (const void* const*) blob, w, xq, out)
+                     : F->igpu_experts(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, ne,
+                                       (const void* const*) blob, w, x, out);
         }
         // a call is ~0.1-0.3 ms; one that waits for the kernel driver to fault a registered range in again (the stall
         // STRATA_GLM_IGPU_CHUNK_MB bounds) says so, at most once a second
@@ -2953,9 +2967,10 @@ void Glm5Model::fast_destroy() {
     F->kda_graphs.clear();   // before the graph's buffers and streams are freed
 #ifdef __linux__
     if (F->igpu_lib != nullptr) {   // (unregisters the RAM tier before it is freed)
-        if (F->igpu_falls.load() > 0)
-            std::fprintf(stderr, "glm fast: iGPU lane: %llu calls, %llu left to the CPU\n",
-                         (unsigned long long) F->igpu_calls.load(), (unsigned long long) F->igpu_falls.load());
+        if (F->igpu_falls.load() > 0 || F->igpu_early.load() > 0)
+            std::fprintf(stderr, "glm fast: iGPU lane: %llu calls (%llu started before their route's disk reads), %llu "
+                                 "left to the CPU\n", (unsigned long long) F->igpu_calls.load(),
+                         (unsigned long long) F->igpu_early.load(), (unsigned long long) F->igpu_falls.load());
         if (auto cl = (abyss_igpu_close_fn) dlsym(F->igpu_lib, "abyss_igpu_close")) cl();
         F->igpu_experts = nullptr;
         F->igpu_rows = nullptr;
@@ -3136,6 +3151,7 @@ void Glm5Model::fast_service() {
 #endif
     while (!F->quit.load(std::memory_order_relaxed)) {
         gf::MoeRequest* rq = F->ring_h + (next % gf::kRingSize);
+        bool lane_started = false;   // (EARLY LANE, below: this route's lane experts already on the iGPU)
         const unsigned int sq = rq->seq;
         if (sq != next) {
             // an entry AHEAD of us means the device lapped the ring (only non-waiting routes can be lapped: a
@@ -3321,6 +3337,25 @@ void Glm5Model::fast_service() {
             F->ram_hits.fetch_add((uint64_t) std::popcount((unsigned) (fetch)), std::memory_order_relaxed);
             F->misses.fetch_add((uint64_t) std::popcount((unsigned) (fetch | miss | cpu)), std::memory_order_relaxed);
             if (F->n_ahead > 0) fast_ahead_route(il, ids, miss, rq->ahead);
+            // EARLY LANE: a route with disk reads and lane experts starts the iGPU on those before its reads (they used
+            // to wait for the reads, ~3 ms, and the device then for the lane after the last chunk); collected below
+            const auto lane_start = [&] {
+                if (lane_started || rq->cpu_mask == 0u || F->cpu_ans_h == nullptr || F->igpu_start == nullptr ||
+                    F->igpu_experts == nullptr || F->L[(size_t) il].exl3)
+                    return;
+                const auto& Ly = F->L[(size_t) il];
+                const void* bl[8];
+                float wl[8];
+                int ne = 0;
+                for (int i = 0; i < g.n_exp_used; ++i)
+                    if ((rq->cpu_mask >> i) & 1u) {
+                        bl[ne] = (const void*) rq->cpu_src[i];
+                        wl[ne++] = rq->w[i];
+                    }
+                lane_started = F->igpu_start(Ly.gu_type, Ly.d_type, g.n_embd, g.n_ff_exp, Ly.down_off, g.swiglu_exp, ne,
+                                             bl, wl, rq->x,
+                                             rq->xq_ok && F->igpu_experts_q != nullptr ? (const void*) rq->xq : nullptr) == 0;
+            };
             if (miss != 0) {
                 // ---- disk only: read each into a free RAM slot (it stays there unless it was promoted) or staging;
                 //      one the LOOKAHEAD already read (or is reading) is answered from its RAM slot
@@ -3482,6 +3517,7 @@ void Glm5Model::fast_service() {
                     std::atomic_thread_fence(std::memory_order_release);
                     Rp->seq = next;
                 }
+                if (nr > 0 && !dlane_now) lane_start();
                 F->workers->run(nr * 3 * rch, [&](int job) {
                     const int m = rd[job / (3 * rch)], part = job % (3 * rch);
                     fast_read_part(il, ids[mi[m]], part / rch, dst[m], part % rch, rch);
@@ -3576,7 +3612,22 @@ void Glm5Model::fast_service() {
                     w[ne++] = rq->w[i];
                 }
             gf::CpuAnswer* ans = F->cpu_ans_h + (next % gf::kCpuAnswers);
-            fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part);
+            int rc = 1;
+            if (lane_started) {
+                rc = F->igpu_finish(ans->part, g.n_embd);
+                if (rc == 0) {
+                    F->igpu_calls.fetch_add(1, std::memory_order_relaxed);
+                    F->igpu_early.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    if (rc < 0) {
+                        std::fprintf(stderr, "glm fast: CUDA%d iGPU lane failed - the CPU lane takes over\n", dev_);
+                        F->igpu_experts = nullptr;
+                    }
+                    F->igpu_falls.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (rc != 0)
+                fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part, rq->xq_ok ? (const void*) rq->xq : nullptr);
             const auto t1 = std::chrono::steady_clock::now();
             std::atomic_thread_fence(std::memory_order_release);
             ans->seq = next;
@@ -4578,7 +4629,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah, fast_skip_from(il),
                   lane ? F->cpu_plan : 0ull, dlane ? -1 : promote_min, pf_rank, g.gating,
                   Ly.tid2eid != nullptr ? Ly.tid2eid + (size_t) F->cur_tok * g.n_exp_used : nullptr, fast_skip_w(il),
-                  F->tail_skip_disk ? 1 : 0);
+                  F->tail_skip_disk ? 1 : 0, lane && !Ly.exl3 && F->igpu_experts_q != nullptr ? F->xq : nullptr);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
     // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:

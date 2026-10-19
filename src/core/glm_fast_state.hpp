@@ -546,6 +546,9 @@ struct Glm5Model::FastState {
     //      GPU from the registered RAM tier instead of the pool's threads; a call it cannot take stays on the CPU
     void* igpu_lib = nullptr;
     abyss_igpu_experts_fn igpu_experts = nullptr;
+    abyss_igpu_experts_q_fn igpu_experts_q = nullptr;   // (optional) x's q8_1 from the request instead of x
+    abyss_igpu_experts_start_fn igpu_start = nullptr;   // (optional) the lane call in two halves: a route's lane
+    abyss_igpu_experts_finish_fn igpu_finish = nullptr; // experts started before its disk reads
     abyss_igpu_experts_x3_fn igpu_x3 = nullptr;   // an EXL3 layer's (abyss_igpu_experts_x3; absent: the CPU takes them)
     abyss_igpu_x3_start_fn igpu_x3s = nullptr;     // ... in two halves, the CPU threads computing a share between them
     abyss_igpu_x3_finish_fn igpu_x3f = nullptr;
@@ -556,7 +559,7 @@ struct Glm5Model::FastState {
     abyss_igpu_rows_fn igpu_rows = nullptr;
     abyss_igpu_register_fn igpu_reg = nullptr;
     abyss_igpu_unregister_fn igpu_unreg = nullptr;
-    std::atomic<uint64_t> igpu_calls{0}, igpu_falls{0};
+    std::atomic<uint64_t> igpu_calls{0}, igpu_falls{0}, igpu_early{0};   // (early: started before disk reads)
     std::thread svc;
     std::atomic<bool> quit{false};
     uint64_t clock = 0;
