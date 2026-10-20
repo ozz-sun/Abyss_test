@@ -172,7 +172,7 @@ Every step is skipped when done, so it is safe to run again. Options: `--quant`,
 | | |
 | --- | --- |
 | OS | Linux (tested on Ubuntu) |
-| GPU | NVIDIA: RTX 5090 32 GB and RTX 3090 measured; a V100 builds with CUDA 12 (not run yet). AMD Radeon through HIP, experimental: Radeon 8060S run, discrete cards untested |
+| GPU | NVIDIA: RTX 5090 32 GB and RTX 3090 measured; a V100 builds with CUDA 12 (not run yet). AMD Radeon through HIP, experimental: Radeon 8060S and AI PRO R9700 (with the 8060S as its lane) run; see [docs/amd](docs/amd/README.md) |
 | Memory | VRAM + RAM ≳ 100 GB to keep every expert in memory (less works, reading from the SSD) |
 | Disk | NVMe SSD with ~100 GB free (DeepSeek V4.1: ~370 GB, the faster the better) |
 | Toolchain | CUDA 13.x (`nvcc`; 12.9 for a V100), g++, Python 3.10+; ROCm 7 (`hipcc`) for the iGPU lane on an AMD APU or for an AMD build |
@@ -242,6 +242,7 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 | | |
 | --- | --- |
 | [Manual](docs/MANUAL.md) · [マニュアル](docs/MANUAL.ja.md) | setup, configuration, API, several GPUs, AMD, settings, troubleshooting |
+| [AMD Radeon](docs/amd/README.md) · [日本語](docs/amd/README.ja.md) | AMD: the driver, ROCm (per-architecture packages), a discrete Radeon + the APU's iGPU, troubleshooting |
 | [Changelog](CHANGELOG.md) | every release with its measurements |
 | [Port notes](docs/deepseek4/PORT.md) | what Abyss adds and how it was validated |
 | [Spec](docs/deepseek4/SPEC.md) | DeepSeek V4's forward pass as implemented |

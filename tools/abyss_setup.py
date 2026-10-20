@@ -192,6 +192,8 @@ def hip_engine(a):
         S.say("  in the config kept all experts resident on an RX 7900 XT + 128 GB (github.com/zephel01/Abyss/issues/4)")
     extra = {"exe": str(M.EXE), "backend": "hip", "gpu": [g["index"] for g in gpus],
              "lib_dirs": (meta or {}).get("lib_dirs") or [], "env": env}
+    if all(g.get("pci") for g in gpus):   # (Linux) the same cards when HIP numbers them otherwise after a reboot
+        extra["gpu_pci"] = [g["pci"] for g in gpus]
     return gpus, extra
 
 

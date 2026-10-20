@@ -164,7 +164,7 @@ curl http://127.0.0.1:8082/v1/chat/completions -H 'Content-Type: application/jso
 | | |
 | --- | --- |
 | OS | Linux（Ubuntu で確認） |
-| GPU | NVIDIA: RTX 5090 32 GB と RTX 3090 で測定。V100 は CUDA 12 でビルドできる（実機は未確認）。AMD Radeon は HIP で試験的に対応: Radeon 8060S で動作、単体カードは未確認 |
+| GPU | NVIDIA: RTX 5090 32 GB と RTX 3090 で測定。V100 は CUDA 12 でビルドできる（実機は未確認）。AMD Radeon は HIP で試験的に対応: Radeon 8060S と AI PRO R9700（8060S をレーンに）で動作。[docs/amd](docs/amd/README.ja.md) |
 | メモリ | 全エキスパートをメモリに置くには VRAM + RAM が約 100 GB 以上（少なくても SSD から読んで動く） |
 | ディスク | 空き約 100 GB の NVMe SSD（DeepSeek V4.1 は約 370 GB。速いほどよい） |
 | ツール | CUDA 13.x（`nvcc`。V100 は 12.9）、g++、Python 3.10 以上。AMD APU の iGPU レーンと AMD ビルドには ROCm 7（`hipcc`） |
@@ -234,6 +234,7 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 | | |
 | --- | --- |
 | [マニュアル](docs/MANUAL.ja.md) · [Manual](docs/MANUAL.md) | セットアップ、設定、API、複数 GPU、AMD、設定項目、トラブル対応 |
+| [AMD Radeon](docs/amd/README.ja.md) · [English](docs/amd/README.md) | AMD: ドライバ、ROCm（アーキテクチャ別のパッケージ）、単体の Radeon と APU の iGPU、トラブル対応 |
 | [更新履歴](CHANGELOG.md) | 各リリースの内容と測定結果 |
 | [移植の記録](docs/deepseek4/PORT.md) | Abyss が足したものと、その確認方法 |
 | [仕様](docs/deepseek4/SPEC.md) | 実装した DeepSeek V4 の計算 |

@@ -911,25 +911,54 @@ def engine_args(cfg: dict) -> list[str]:
 IGPU_ARCHS = ("gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153")
 
 
-def amd_igpu_index(base: str = "/sys/class/kfd/kfd/topology/nodes") -> int | None:
-    """The integrated Radeon's HIP number (the KFD topology's GPU nodes in order, the CPU nodes skipped), or None."""
+def amd_gpu_nodes(base: str = "/sys/class/kfd/kfd/topology/nodes") -> list[dict]:
+    """The AMD GPUs as HIP numbers them (the KFD topology's GPU nodes in order, the CPU nodes skipped): index, arch,
+    PCI address ("0000:c7:00.0", from the node's domain and location_id) and whether it is an integrated Radeon."""
     try:
         nodes = sorted((n for n in os.listdir(base) if n.isdigit()), key=int)
     except OSError:
-        return None
-    i = 0
+        return []
+    found = []
     for n in nodes:
         try:
             props = dict(l.split(" ", 1) for l in Path(base, n, "properties").read_text().splitlines() if " " in l)
             ver = int(props.get("gfx_target_version") or 0)
             if ver == 0 or int(props.get("simd_count") or 0) == 0:
                 continue
+            loc, dom = int(props.get("location_id") or 0), int(props.get("domain") or 0)
         except (OSError, ValueError):
             continue
-        if f"gfx{ver // 10000}{(ver // 100) % 100:x}{ver % 100:x}" in IGPU_ARCHS:
-            return i
-        i += 1
-    return None
+        arch = f"gfx{ver // 10000}{(ver // 100) % 100:x}{ver % 100:x}"
+        found.append({"index": len(found), "arch": arch, "igpu": arch in IGPU_ARCHS,
+                      "pci": f"{dom:04x}:{loc >> 8:02x}:{(loc >> 3) & 0x1f:02x}.{loc & 7}"})
+    return found
+
+
+def amd_igpu_index(base: str = "/sys/class/kfd/kfd/topology/nodes") -> int | None:
+    """The integrated Radeon's HIP number, or None."""
+    return next((g["index"] for g in amd_gpu_nodes(base) if g["igpu"]), None)
+
+
+def hip_gpu_list(cfg: dict) -> list[int]:
+    """The config's AMD GPUs as HIP numbers them now.  HIP's order is the order the driver found the GPUs at boot,
+    which can change (an OCuLink / USB4 card attached after boot comes after the iGPU, a BIOS update renumbers the
+    buses): setup also writes their PCI addresses ("gpu_pci"), which name the same cards whatever their numbers."""
+    gpus = gpu_list(cfg)
+    want = cfg.get("gpu_pci")
+    if not want:
+        return gpus
+    nodes = amd_gpu_nodes()
+    by_pci = {g["pci"]: g["index"] for g in nodes}
+    found = [by_pci.get(str(a).lower()) for a in want]
+    if nodes and all(i is not None for i in found):
+        if found != gpus:
+            print(f"[abyss] the AMD GPU(s) at {', '.join(want)} are HIP number {','.join(map(str, found))} now "
+                  f"(the config says {','.join(map(str, gpus))}): using {','.join(map(str, found))}", flush=True)
+        return found
+    if nodes:
+        print(f"[abyss] WARNING: no AMD GPU at {', '.join(str(a) for a in want if str(a).lower() not in by_pci)} "
+              f"(the config's gpu_pci): using the config's GPU numbers {','.join(map(str, gpus))}", flush=True)
+    return gpus
 
 
 def child_env(cfg: dict) -> dict:
@@ -937,7 +966,7 @@ def child_env(cfg: dict) -> dict:
     compiled it) first on the library search path."""
     env = dict(os.environ)
     if gpu_list(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (setup's KFD order)
-        gpus = gpu_list(cfg)
+        gpus = hip_gpu_list(cfg)
         # one discrete GPU on an APU: the iGPU listed after it, for the iGPU lane (the engine runs on the first)
         lane = str((cfg.get("env") or {}).get("STRATA_GLM_IGPU", env.get("STRATA_GLM_IGPU", ""))) != "0"
         igpu = amd_igpu_index() if lane and len(gpus) == 1 else None

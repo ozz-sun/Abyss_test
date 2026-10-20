@@ -312,9 +312,14 @@ AMD の Radeon でも動く。対象は RX 7900 XT / XTX（gfx1100）、RX 9070 
 Radeon 8060S（gfx1151）。
 
 - **セットアップ:** `./setup-deepseek.sh --backend hip`（NVIDIA の GPU がなければ自動で HIP を選ぶ）。Linux では
-  `/opt/rocm` の ROCm 7 を使う。エンジンは `build-hip/strata` にビルドされ、設定に `"backend": "hip"` が入る。
-- **確認済みの範囲:** Radeon 8060S（gfx1151）だけで動かし、CUDA 版との KL がぶれの範囲内（0.005）だった。
-  単体の GPU（RX 7900 など）ではまだ動かしていない。
+  `/opt/rocm` の ROCm 7 以降を使う（ROCm 10 は `/opt/rocm/core-10.0` も探す）。エンジンは `build-hip/strata` にビルドされ、設定に `"backend": "hip"` が入る。
+- **ドライバと ROCm:** 入れ方は [docs/amd/README.ja.md](amd/README.ja.md) にまとめた（amdgpu、ROCm 10 の
+  アーキテクチャ別のパッケージ、`HSA_OVERRIDE_GFX_VERSION` を設定してはいけない理由）。動作確認とトラブル対応も
+  そこにある。R9700 では `amdrocm10.0-gfx1201` が要る。
+- **確認済みの範囲:** Radeon 8060S（gfx1151）単体と、AI PRO R9700（gfx1201）で 8060S を iGPU レーンにした構成。
+  R9700 では DeepSeek V4 が 36〜42 tok/s で、CUDA 版との KL はぶれの範囲内（0.005）だった。
+- **Ryzen AI Max に単体の Radeon をつないだ場合:** NVIDIA のカードのときと同じく、iGPU が RAM 層のエキスパートを
+  計算する（R9700 で生成 +12〜46%）。設定の `"gpu_pci"` があれば、HIP の番号が変わっても同じカードを使う。
 - **速くなる部分:** indexer のスコア計算と prompt の attention は RDNA の WMMA を使う（gfx11 / gfx12）。
   `STRATA_DS4_IDX=1` で indexer を、`STRATA_DS4_ATTN=1` で attention を従来のカーネルに戻せる。
 - **制限:** NVIDIA との組み合わせ（1 つのプロセスで CUDA と HIP の両方）には対応していない。

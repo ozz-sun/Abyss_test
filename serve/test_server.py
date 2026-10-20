@@ -408,6 +408,44 @@ class GpuChoice(unittest.TestCase):
             self.assertEqual(amd_igpu_index(d), 1)
             self.assertIsNone(amd_igpu_index(os.path.join(d, "missing")))
 
+    def fake_kfd(self, d, nodes):
+        for n, props in nodes.items():
+            os.makedirs(os.path.join(d, n))
+            with open(os.path.join(d, n, "properties"), "w") as f:
+                f.write(props + "\n")
+
+    def test_amd_gpu_nodes(self):
+        import tempfile
+        from serve.server import amd_gpu_nodes
+        with tempfile.TemporaryDirectory() as d:
+            self.fake_kfd(d, {"0": "simd_count 0\ngfx_target_version 0",
+                              "1": "simd_count 128\ngfx_target_version 120001\nlocation_id 50944\ndomain 0",
+                              "2": "simd_count 80\ngfx_target_version 110501\nlocation_id 51200\ndomain 0"})
+            self.assertEqual(amd_gpu_nodes(d), [
+                {"index": 0, "arch": "gfx1201", "igpu": False, "pci": "0000:c7:00.0"},
+                {"index": 1, "arch": "gfx1151", "igpu": True, "pci": "0000:c8:00.0"}])
+
+    def test_hip_gpu_pci(self):
+        """The config's PCI addresses name the cards when HIP numbers them otherwise (an eGPU found after the iGPU)."""
+        import contextlib
+        import io
+        from unittest import mock
+        from serve import server
+        swapped = [{"index": 0, "arch": "gfx1151", "igpu": True, "pci": "0000:c8:00.0"},
+                   {"index": 1, "arch": "gfx1201", "igpu": False, "pci": "0000:c7:00.0"}]
+        cfg = {"gpu": [0], "gpu_pci": ["0000:c7:00.0"], "backend": "hip"}
+        with mock.patch.object(server, "amd_gpu_nodes", return_value=swapped), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(server.hip_gpu_list(cfg), [1])
+            self.assertEqual(server.child_env(cfg)["HIP_VISIBLE_DEVICES"], "1,0")   # the iGPU lane after it
+            self.assertIn("HIP number 1 now", out.getvalue())
+            gone = dict(cfg, gpu_pci=["0000:03:00.0"])                           # card not there: the numbers
+            self.assertEqual(server.hip_gpu_list(gone), [0])
+            self.assertIn("WARNING: no AMD GPU at 0000:03:00.0", out.getvalue())
+        with mock.patch.object(server, "amd_gpu_nodes", return_value=[]):        # no KFD (Windows): the numbers
+            self.assertEqual(server.hip_gpu_list(cfg), [0])
+        self.assertEqual(server.hip_gpu_list({"gpu": [0, 2]}), [0, 2])           # older configs: as before
+
 
 class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):

@@ -542,8 +542,10 @@ def amd_gpus(hipinfo=None):
             name = f"AMD Radeon ({arch})"
         if name == f"AMD Radeon ({arch})" and arch in AMD_NAMES:
             name = AMD_NAMES[arch]
+        # the PCI address names the card whatever HIP's number (the boot's order, which can change): "gpu_pci"
+        loc, dom = int(props.get("location_id") or 0), int(props.get("domain") or 0)
         found.append({"index": len(found), "name": name, "vram_gb": vram, "arch": arch, "driver": "amdgpu",
-                      "vendor": "amd"})
+                      "vendor": "amd", "pci": f"{dom:04x}:{loc >> 8:02x}:{(loc >> 3) & 0x1f:02x}.{loc & 7}"})
     return found
 
 

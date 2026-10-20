@@ -1769,6 +1769,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     env = parse_env(a.env)
     if pc.get("backend") == "hip":
         cfg["backend"] = "hip"
+        if all(g.get("pci") for g in pc["gpus"]):   # (Linux) the same cards when HIP numbers them otherwise
+            cfg["gpu_pci"] = [g["pci"] for g in pc["gpus"]]
         # Leave space for the Linux desktop. The engine sizes its prompt chunk from
         # the available prompt-memory budget; forcing 256 here severely slows HIP.
         hip_env = {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16"}

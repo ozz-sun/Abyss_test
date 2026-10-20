@@ -316,9 +316,14 @@ DeepSeek V4 also runs on AMD Radeon cards: the RX 7900 XT / XTX (gfx1100), the R
 the Ryzen AI Max's Radeon 8060S (gfx1151).
 
 - **Setup:** `./setup-deepseek.sh --backend hip` (chosen by itself when there is no NVIDIA GPU). On Linux it uses ROCm 7
-  in `/opt/rocm`. The engine is built in `build-hip/strata`, and the config gets `"backend": "hip"`.
-- **What has been checked:** it ran on the Radeon 8060S (gfx1151) alone, with KL against the CUDA build within the
-  run-to-run spread (0.005). It has not run on a discrete card such as an RX 7900 yet.
+  or newer in `/opt/rocm` (ROCm 10: `/opt/rocm/core-10.0` too). The engine is built in `build-hip/strata`, and the config gets `"backend": "hip"`.
+- **Driver and ROCm:** [docs/amd/README.md](amd/README.md) has the install steps (amdgpu, ROCm 10's per-architecture
+  packages - an R9700 needs `amdrocm10.0-gfx1201` - and why `HSA_OVERRIDE_GFX_VERSION` must not be set), a check
+  list, and troubleshooting.
+- **What has been checked:** the Radeon 8060S (gfx1151) alone, and an AI PRO R9700 (gfx1201) with the 8060S as its
+  iGPU lane: 36-42 tok/s on DeepSeek V4, KL against the CUDA build within the run-to-run spread (0.005).
+- **A discrete Radeon on a Ryzen AI Max:** the iGPU computes the RAM-tier experts as it does beside an NVIDIA card
+  (+12-46% decode on the R9700); the config's `"gpu_pci"` keeps the right card when HIP numbers the GPUs otherwise.
 - **What is faster:** the indexer's scores and the prompt attention use RDNA's WMMA (gfx11 / gfx12).
   `STRATA_DS4_IDX=1` keeps the older indexer kernels, and `STRATA_DS4_ATTN=1` the older attention.
 - **Limits:** mixing it with NVIDIA in one process (CUDA and HIP together) is not supported.
