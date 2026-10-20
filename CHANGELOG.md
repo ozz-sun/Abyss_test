@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.39 - 2026-10-21
+
+**AMD: a discrete Radeon (AI PRO R9700) with a Ryzen AI Max's iGPU as its lane, +12-46% decode; GPUs named by PCI
+address (`gpu_pci`); an AMD install guide (docs/amd).**
+- **The iGPU lane under the HIP engine.** On an R9700 + Radeon 8060S the iGPU computes the RAM-tier experts as it does
+  beside an RTX 5090 (an expert 0.040 ms against 0.10-0.13 on the CPU): swe 6 tasks, CPU lane -> iGPU lane, DeepSeek V4
+  UD-Q2_K_XL 36.4 -> 42.4 tok/s, huihui Q2 33.9 -> 38.1, GLM-5.3-Flash Maya-S-v2 25.8 -> 35.8, Maya-S24 28.2 -> 41.2;
+  prompts unchanged. KL against the CUDA build 0.0052 (0.0059 with the CPU lane).
+  - `libabyss_igpu.so` is built for HIP engines too, with the engine's architectures as well as the iGPU's: HIP
+    refuses a library's kernels on every GPU when any visible GPU has no code in it.
+  - The lane picks the integrated GPU itself and keeps the engine's device current outside its calls; memory the
+    engine pinned already is read in place.
+  - The server lists the iGPU after a single discrete HIP GPU (`HIP_VISIBLE_DEVICES=0,1`; `STRATA_GLM_IGPU=0` or a
+    layer split: as before). GLM-5.3-Flash's automatic layer split no longer picks the iGPU (it ran swe at 11.7 tok/s).
+- **`gpu_pci`.** HIP numbers the GPUs in the driver's boot order, which flips when an eGPU is attached after boot or
+  the buses are renumbered. Setup writes the cards' PCI addresses into the config, and the server maps them to the
+  current numbers at each start. Windows and older configs keep the numbers.
+- **docs/amd** (English and Japanese): the amdgpu driver, ROCm 10's per-architecture packages (an R9700 needs
+  `amdrocm10.0-gfx1201`, or its first prompt hangs in rocBLAS), why `HSA_OVERRIDE_GFX_VERSION` must not be set (ROCr
+  fails on gfx12), checks, a discrete Radeon + the iGPU, Windows, troubleshooting. MANUAL and README link it.
+- The CUDA build compiles with these changes; it has not been run on an NVIDIA card yet (the RTX 5090 was out).
+
 ## v1.3.38 - 2026-10-20
 
 **DeepSeek V4.1: unsloth's GGUFs load (llama.cpp PR 30817's layout); UD-IQ1_S (233 GB) runs 32% faster than the
