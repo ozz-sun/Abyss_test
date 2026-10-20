@@ -27,7 +27,9 @@ address (`gpu_pci`); an AMD install guide (docs/amd).**
 - **docs/amd** (English and Japanese): the amdgpu driver, ROCm 10's per-architecture packages (an R9700 needs
   `amdrocm10.0-gfx1201`, or its first prompt hangs in rocBLAS), why `HSA_OVERRIDE_GFX_VERSION` must not be set (ROCr
   fails on gfx12), checks, a discrete Radeon + the iGPU, Windows, troubleshooting. MANUAL and README link it.
-- The CUDA build compiles with these changes; it has not been run on an NVIDIA card yet (the RTX 5090 was out).
+- The CUDA build is unchanged in its answers and speed: on an RTX 5090 + Radeon 8060S lane, KL 0.005939 (identical to
+  v1.3.38), DeepSeek V4 UD-Q2_K_XL decode 94.7-98.0 tok/s, swe 6 tasks 103.4 (104.8 before), prompts 8K 1,646-1,989 /
+  16K 2,599-2,729 - all within the run-to-run spread.
 
 ## v1.3.38 - 2026-10-20
 
