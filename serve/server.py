@@ -907,12 +907,43 @@ def engine_args(cfg: dict) -> list[str]:
     return args
 
 
+# the integrated Radeons the iGPU lane (libabyss_igpu.so) runs on
+IGPU_ARCHS = ("gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153")
+
+
+def amd_igpu_index(base: str = "/sys/class/kfd/kfd/topology/nodes") -> int | None:
+    """The integrated Radeon's HIP number (the KFD topology's GPU nodes in order, the CPU nodes skipped), or None."""
+    try:
+        nodes = sorted((n for n in os.listdir(base) if n.isdigit()), key=int)
+    except OSError:
+        return None
+    i = 0
+    for n in nodes:
+        try:
+            props = dict(l.split(" ", 1) for l in Path(base, n, "properties").read_text().splitlines() if " " in l)
+            ver = int(props.get("gfx_target_version") or 0)
+            if ver == 0 or int(props.get("simd_count") or 0) == 0:
+                continue
+        except (OSError, ValueError):
+            continue
+        if f"gfx{ver // 10000}{(ver // 100) % 100:x}{ver % 100:x}" in IGPU_ARCHS:
+            return i
+        i += 1
+    return None
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
     env = dict(os.environ)
     if gpu_list(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (setup's KFD order)
-        env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
+        gpus = gpu_list(cfg)
+        # one discrete GPU on an APU: the iGPU listed after it, for the iGPU lane (the engine runs on the first)
+        lane = str((cfg.get("env") or {}).get("STRATA_GLM_IGPU", env.get("STRATA_GLM_IGPU", ""))) != "0"
+        igpu = amd_igpu_index() if lane and len(gpus) == 1 else None
+        if igpu is not None and igpu not in gpus:
+            gpus = gpus + [igpu]
+        env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpus)
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))

@@ -259,10 +259,18 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("GPUs: V100 16 GB", text)
 
     def test_bench_single_hip_gpu(self):
-        call, text = self.run_bench(self.installed_config(gpu=0))
+        with patch("serve.server.amd_igpu_index", return_value=None):   # (not this machine's KFD topology)
+            call, text = self.run_bench(self.installed_config(gpu=0))
         self.assertEqual(call.kwargs["env"]["HIP_VISIBLE_DEVICES"], "0")
         self.assertNotIn("--layer-split", call.args[0])
         self.assertIn("GPUs: RX 7900 XT 20 GB;", text)
+
+    def test_bench_single_hip_gpu_with_igpu(self):
+        # an APU's iGPU listed after the discrete GPU, for the iGPU lane
+        with patch("serve.server.amd_igpu_index", return_value=1):
+            call, _ = self.run_bench(self.installed_config(gpu=0))
+        self.assertEqual(call.kwargs["env"]["HIP_VISIBLE_DEVICES"], "0,1")
+        self.assertNotIn("--layer-split", call.args[0])
 
     def run_report(self, outputs=None, tools=(), backend=None, cfg_path=None):
         outputs = outputs or {}

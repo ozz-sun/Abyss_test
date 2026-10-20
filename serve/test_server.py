@@ -382,6 +382,32 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
 
+    def test_hip_igpu_lane(self):
+        """A HIP engine on one discrete Radeon of an APU: the iGPU is listed after it, for the iGPU lane."""
+        from unittest import mock
+        from serve import server
+        with mock.patch.object(server, "amd_igpu_index", return_value=1):
+            self.assertEqual(server.child_env({"gpu": [0], "backend": "hip"})["HIP_VISIBLE_DEVICES"], "0,1")
+            self.assertEqual(server.child_env({"gpu": [1], "backend": "hip"})["HIP_VISIBLE_DEVICES"], "1")
+            off = {"gpu": [0], "backend": "hip", "env": {"STRATA_GLM_IGPU": "0"}}
+            self.assertEqual(server.child_env(off)["HIP_VISIBLE_DEVICES"], "0")
+            split = {"gpu": [0, 2], "backend": "hip"}   # a layer split numbers its later GPUs itself
+            self.assertEqual(server.child_env(split)["HIP_VISIBLE_DEVICES"], "0,2")
+        with mock.patch.object(server, "amd_igpu_index", return_value=None):
+            self.assertEqual(server.child_env({"gpu": [0], "backend": "hip"})["HIP_VISIBLE_DEVICES"], "0")
+
+    def test_amd_igpu_index(self):
+        import tempfile
+        from serve.server import amd_igpu_index
+        with tempfile.TemporaryDirectory() as d:
+            for n, props in {"0": "simd_count 0\ngfx_target_version 0", "1": "simd_count 128\ngfx_target_version 120001",
+                             "2": "simd_count 80\ngfx_target_version 110501"}.items():
+                os.makedirs(os.path.join(d, n))
+                with open(os.path.join(d, n, "properties"), "w") as f:
+                    f.write(props + "\n")
+            self.assertEqual(amd_igpu_index(d), 1)
+            self.assertIsNone(amd_igpu_index(os.path.join(d, "missing")))
+
 
 class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):

@@ -232,6 +232,7 @@ struct Range {
     const uint8_t* host;
     size_t bytes;
     uint8_t* dev;
+    bool owned;   // registered here (not already pinned by the engine: a HIP engine's own RAM tier) - unregistered here
 };
 struct Plan {                         // host-mapped: the kernels read it in place
     unsigned long long ptr[8];
@@ -241,6 +242,7 @@ struct Plan {                         // host-mapped: the kernels read it in pla
 };
 struct Lane {
     bool open = false;
+    int dev = -1;   // the lane's HIP device: the first integrated GPU among the visible ones (a HIP engine sees its own too)
     int n_embd = 0, n_ff = 0;
     hipStream_t s = nullptr;
     float *x_h = nullptr, *out_h = nullptr, *x_d = nullptr, *out_d = nullptr;
@@ -283,6 +285,16 @@ unsigned long long dev_of(const void* p) {
     if (it != L.ranges.begin() && b < (--it)->host + it->bytes) return (unsigned long long) (it->dev + (b - it->host));
     return 0ull;
 }
+// The lane's device current on the calling thread for one entry point, the caller's put back after: a HIP engine
+// shares this HIP runtime, and its threads keep their own device current (a CUDA engine's HIP sees the iGPU alone)
+struct DevScope {
+    int prev = -1;
+    DevScope() {
+        if (L.dev < 0 || hipGetDevice(&prev) != hipSuccess || prev == L.dev) { prev = -1; return; }
+        hipSetDevice(L.dev);
+    }
+    ~DevScope() { if (prev >= 0) hipSetDevice(prev); }
+};
 void say(char* err, int n, const char* what, hipError_t e) {
     if (err != nullptr && n > 0) std::snprintf(err, (size_t) n, "%s: %s", what, hipGetErrorString(e));
 }
@@ -301,8 +313,19 @@ __attribute__((visibility("default"))) int abyss_igpu_open(int n_embd, int n_ff,
         say(err, err_n, "no HIP device", e == hipSuccess ? hipErrorNoDevice : e);
         return -1;
     }
+    // the first integrated GPU among the visible devices, else device 0 as before
+    int dev = -1;
+    for (int i = 0; i < n && dev < 0; ++i) {
+        hipDeviceProp_t p{};
+        if (hipGetDeviceProperties(&p, i) == hipSuccess && p.integrated) dev = i;
+    }
+    L.dev = dev < 0 ? 0 : dev;
+    int prev = -1;
+    hipGetDevice(&prev);
+    if ((e = hipSetDevice(L.dev)) != hipSuccess) { say(err, err_n, "hipSetDevice", e); return -1; }
+    DevScope ds;
+    ds.prev = prev != L.dev ? prev : -1;   // (the caller's device back on the way out)
     hipSetDeviceFlags(hipDeviceScheduleSpin);   // the service thread waits ~0.1 ms a call: spin, not sleep
-    if ((e = hipSetDevice(0)) != hipSuccess) { say(err, err_n, "hipSetDevice", e); return -1; }
     L.n_embd = n_embd;
     L.n_ff = n_ff;
     const auto hm = [&](void** p, size_t b) { return hipHostMalloc(p, b, hipHostMallocMapped); };
@@ -328,8 +351,12 @@ __attribute__((visibility("default"))) int abyss_igpu_open(int n_embd, int n_ff,
 __attribute__((visibility("default"))) int abyss_igpu_register(const void* host, size_t bytes, char* err, int err_n) {
     std::lock_guard<std::mutex> lk(L.mu);
     if (!L.open) { say(err, err_n, "iGPU lane not open", hipErrorNotInitialized); return -1; }
+    DevScope ds;
     hipError_t e = hipHostRegister(const_cast<void*>(host), bytes, hipHostRegisterMapped);
-    if (e != hipSuccess) { say(err, err_n, "hipHostRegister", e); return -1; }
+    // a HIP engine pinned it already (portable: every device maps it) - the lane reads it as it is
+    const bool owned = e == hipSuccess;
+    if (e == hipErrorHostMemoryAlreadyRegistered) (void) hipGetLastError();
+    else if (e != hipSuccess) { say(err, err_n, "hipHostRegister", e); return -1; }
     void* d = nullptr;
     if ((e = hipHostGetDevicePointer(&d, const_cast<void*>(host), 0)) != hipSuccess) {
         say(err, err_n, "hipHostGetDevicePointer", e);
@@ -337,7 +364,7 @@ __attribute__((visibility("default"))) int abyss_igpu_register(const void* host,
     }
     // kept sorted by host address: a call looks its experts up by binary search (the RAM tier is registered in a few
     // hundred pieces)
-    const Range nr{(const uint8_t*) host, bytes, (uint8_t*) d};
+    const Range nr{(const uint8_t*) host, bytes, (uint8_t*) d, owned};
     L.ranges.insert(std::upper_bound(L.ranges.begin(), L.ranges.end(), nr,
                                      [](const Range& a, const Range& b) { return a.host < b.host; }),
                     nr);
@@ -357,11 +384,13 @@ __attribute__((visibility("default"))) int abyss_igpu_experts_start(int gu_type,
                                                                     size_t down_off, float limit, int ne,
                                                                     const void* const* blobs, const float* w,
                                                                     const float* x, const void* xq) {
+    DevScope ds;
     if (xq != nullptr && n_embd % 32 != 0) xq = nullptr;
     return igpu_experts(gu_type, d_type, n_embd, n_ff, down_off, limit, ne, blobs, w, xq != nullptr ? nullptr : x, xq,
                         nullptr, true);
 }
 __attribute__((visibility("default"))) int abyss_igpu_experts_finish(float* out, int n_embd) {
+    DevScope ds;
     std::unique_lock<std::mutex> lk(L.mu, std::adopt_lock);
     return igpu_wait(L.g_counted, L.g_want, L.g_dout, out, n_embd, L.g_t0);
 }
@@ -369,6 +398,7 @@ __attribute__((visibility("default"))) int abyss_igpu_experts(int gu_type, int d
                                                               size_t down_off, float limit, int ne,
                                                               const void* const* blobs, const float* w,
                                                               const float* x, float* out) {
+    DevScope ds;
     return igpu_experts(gu_type, d_type, n_embd, n_ff, down_off, limit, ne, blobs, w, x, nullptr, out);
 }
 // x as the caller's q8_1 (the device's own quantization of it, from the engine's request): no quantize here - the
@@ -377,6 +407,7 @@ __attribute__((visibility("default"))) int abyss_igpu_experts_q(int gu_type, int
                                                                 size_t down_off, float limit, int ne,
                                                                 const void* const* blobs, const float* w,
                                                                 const void* xq, float* out) {
+    DevScope ds;
     if (xq == nullptr || n_embd % 32 != 0) return 1;
     return igpu_experts(gu_type, d_type, n_embd, n_ff, down_off, limit, ne, blobs, w, nullptr, xq, out);
 }
@@ -519,6 +550,7 @@ static int igpu_wait(bool counted, int want, unsigned long long dout, float* out
 __attribute__((visibility("default"))) int abyss_igpu_x3_start(const int* K3, int cb, const size_t* off9, int n_embd,
                                                                int n_ff, float limit, int ne, const void* const* blobs,
                                                                const float* w, const float* x) {
+    DevScope ds;
     namespace x3 = strata::kernels::exl3;
     if (!L.open || ne < 1 || ne > 8 || n_embd > L.n_embd || n_ff > L.n_ff) return 1;
     if (!L.mu.try_lock()) return 1;
@@ -564,6 +596,7 @@ __attribute__((visibility("default"))) int abyss_igpu_x3_start(const int* K3, in
 }
 
 __attribute__((visibility("default"))) int abyss_igpu_x3_finish(float* out, int n_embd) {
+    DevScope ds;
     namespace x3 = strata::kernels::exl3;
     std::unique_lock<std::mutex> lk(L.mu, std::adopt_lock);
     static const double timeout_ms = [] {
@@ -604,8 +637,9 @@ __attribute__((visibility("default"))) void abyss_igpu_unregister(const void* ho
     if (!L.open) return;
     for (size_t i = 0; i < L.ranges.size(); ++i)
         if (L.ranges[i].host == (const uint8_t*) host) {
+            DevScope ds;
             hipStreamSynchronize(L.s);
-            hipHostUnregister(const_cast<void*>(host));
+            if (L.ranges[i].owned) hipHostUnregister(const_cast<void*>(host));
             L.ranges.erase(L.ranges.begin() + (long) i);
             return;
         }
@@ -616,6 +650,7 @@ __attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_ty
                                                            const void* const* blobs, const int* r0, const int* nr,
                                                            const int* row_tok, const float* x, int n_tok, int rlo,
                                                            int rhi, float* out, int ld) {
+    DevScope ds;
     std::lock_guard<std::mutex> lk(L.mu);   // (a split's parts share the lane: a prompt's call waits its turn)
     if (!L.open || ne < 1 || rhi <= rlo || ld < n_embd || ld < 2 * n_ff) return 1;
     if (L.pending) {   // a late decode call still holds the queue (abyss_igpu_experts)
@@ -762,6 +797,7 @@ __attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_ty
 }
 
 __attribute__((visibility("default"))) void abyss_igpu_poke(void) {
+    DevScope ds;
     // ABYSS_IGPU_POKE_STAT=1 (investigation): how long the idle-stream query and the launch take, every 65,536 pokes
     static const bool stat = getenv("ABYSS_IGPU_POKE_STAT") != nullptr;
     if (!stat) {
@@ -787,8 +823,10 @@ __attribute__((visibility("default"))) void abyss_igpu_poke(void) {
 __attribute__((visibility("default"))) void abyss_igpu_close(void) {
     std::lock_guard<std::mutex> lk(L.mu);
     if (!L.open) return;
+    DevScope ds;
     hipStreamSynchronize(L.s);
-    for (const Range& r : L.ranges) hipHostUnregister(const_cast<uint8_t*>(r.host));
+    for (const Range& r : L.ranges)
+        if (r.owned) hipHostUnregister(const_cast<uint8_t*>(r.host));
     L.ranges.clear();
     hipFree(L.xq);
     hipFree(L.hq);

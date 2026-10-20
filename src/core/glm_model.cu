@@ -1721,8 +1721,14 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
         if (devs.empty())
             for (int i = 0; i <= (int) bounds.size(); ++i) devs.push_back(i);
     } else {
-        if (devs.empty())
-            for (int d = 0; d < std::min(n_dev, (int) kMaxParts); ++d) devs.push_back(d);
+        // (an integrated GPU after the first device is the iGPU lane's - a HIP engine on a discrete Radeon sees it
+        // too: GLM-5.3-Flash split onto the 8060S ran swe at 11.7 tok/s against 28.2 on the R9700 alone)
+        const bool fill = devs.empty();
+        for (int d = 0; fill && d < n_dev && (int) devs.size() < (int) kMaxParts; ++d) {
+            cudaDeviceProp p{};
+            if (d > 0 && cudaGetDeviceProperties(&p, d) == cudaSuccess && p.integrated) continue;
+            devs.push_back(d);
+        }
         if (devs.size() < 2) return load_pack(pack_dir, max_ctx, err, devs.empty() ? 0 : devs[0]);
         if (devs.size() == 2 && getenv("STRATA_GLM_DEVS") == nullptr)
             if (const char* d1 = getenv("STRATA_GLM_DEV1")) devs[1] = std::atoi(d1);

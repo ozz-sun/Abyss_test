@@ -1494,11 +1494,20 @@ void Glm5Model::fast_igpu_setup() {
     }
     if (!asked && access(path.c_str(), R_OK) != 0) return;   // not built here
     // HIP reads CUDA_VISIBLE_DEVICES too when HIP_VISIBLE_DEVICES is unset: the server's "1" (the second NVIDIA card)
-    // or "1,0" (a split) hid the iGPU, HIP's device 0.  STRATA_GLM_IGPU_DEVICE: another HIP device (default 0)
+    // or "1,0" (a split) hid the iGPU, HIP's device 0.  STRATA_GLM_IGPU_DEVICE: another HIP device (default 0).
+    // A HIP engine's runtime is the lane's, up already: the server lists the iGPU after the engine's GPU(s) and the
+    // lane takes the integrated one
+#if !defined(STRATA_USE_HIP)
     if (getenv("HIP_VISIBLE_DEVICES") == nullptr && getenv("ROCR_VISIBLE_DEVICES") == nullptr) {
         const char* d = getenv("STRATA_GLM_IGPU_DEVICE");
         setenv("HIP_VISIBLE_DEVICES", d != nullptr && d[0] ? d : "0", 0);
     }
+#else
+    {   // the engine on the integrated GPU itself (an APU alone): no second GPU for a lane
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, dev_) == cudaSuccess && p.integrated) return;
+    }
+#endif
     void* lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     const auto fail = [&](const std::string& why) {
         std::fprintf(stderr, "glm fast: CUDA%d iGPU lane off (%s) - the CPU lane computes\n", dev_, why.c_str());

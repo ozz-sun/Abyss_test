@@ -375,18 +375,27 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   # the iGPU lane (src/igpu/igpu_lane.cpp, STRATA_GLM_IGPU=1): glm_fast's expert kernels built by ROCm's hipcc into
-  # libabyss_igpu.so beside the CUDA engine, which loads it at run time - a separate compiler, so CUDA and HIP never
-  # meet in one translation unit.  Skipped (the CPU lane only) when hipcc is not found.
+  # libabyss_igpu.so beside the engine, which loads it at run time - a separate compiler, so CUDA and HIP never
+  # meet in one translation unit.  A HIP engine on a discrete Radeon loads it too: one HIP runtime, the lane on the
+  # integrated GPU.  Skipped (the CPU lane only) when hipcc is not found.
   option(STRATA_IGPU_LANE "Build libabyss_igpu.so for an AMD APU's integrated GPU (needs ROCm's hipcc)" ON)
   set(STRATA_IGPU_ARCH "gfx1151" CACHE STRING "The iGPU lane's HIP target (gfx1151: Ryzen AI Max / Radeon 8060S)")
-  if(STRATA_ENABLE_CUDA AND STRATA_IGPU_LANE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND STRATA_IGPU_LANE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_program(STRATA_HIPCC hipcc HINTS $ENV{ROCM_PATH}/bin /opt/rocm/bin)
     if(STRATA_HIPCC)
       get_filename_component(_strata_rocm_bin "${STRATA_HIPCC}" DIRECTORY)
       get_filename_component(_strata_rocm "${_strata_rocm_bin}" DIRECTORY)
       set(_strata_igpu_so "${CMAKE_CURRENT_BINARY_DIR}/libabyss_igpu.so")
+      # a HIP engine's GPU is visible to the lane's HIP too, and HIP refuses a library's kernels on every device
+      # when one visible device has no code object in it: the engine's targets as well (only the iGPU runs them)
+      set(_strata_igpu_archs ${STRATA_IGPU_ARCH})
+      if(STRATA_ENABLE_HIP)
+        list(APPEND _strata_igpu_archs ${CMAKE_HIP_ARCHITECTURES})
+        list(REMOVE_DUPLICATES _strata_igpu_archs)
+      endif()
+      list(TRANSFORM _strata_igpu_archs PREPEND "--offload-arch=" OUTPUT_VARIABLE _strata_igpu_offload)
       add_custom_command(OUTPUT "${_strata_igpu_so}"
-        COMMAND "${STRATA_HIPCC}" -O3 -std=c++20 --offload-arch=${STRATA_IGPU_ARCH} -fPIC -shared -fvisibility=hidden
+        COMMAND "${STRATA_HIPCC}" -O3 -std=c++20 ${_strata_igpu_offload} -fPIC -shared -fvisibility=hidden
                 -Wl,-Bsymbolic -Wl,--no-undefined "-Wl,-rpath,${_strata_rocm}/lib"
                 -DSTRATA_USE_HIP=1 -D__HIP_PLATFORM_AMD__=1
                 -I${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml -I${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -398,7 +407,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         DEPENDS src/igpu/igpu_lane.cpp src/igpu/igpu_fused.cu src/igpu/igpu_fused.h src/kernels/cuda/glm_fast.cu include/strata/kernels/glm_fast.hpp
                 src/kernels/cuda/exl3.cu src/kernels/cuda/exl3_legacy.cu include/strata/kernels/exl3.hpp
                 include/strata/igpu/igpu_lane.h
-        COMMENT "Building the iGPU lane (libabyss_igpu.so, ${STRATA_IGPU_ARCH})"
+        COMMENT "Building the iGPU lane (libabyss_igpu.so, ${_strata_igpu_archs})"
         VERBATIM)
       add_custom_target(abyss_igpu ALL DEPENDS "${_strata_igpu_so}")
       add_dependencies(strata abyss_igpu)   # (./abyss.sh builds the strata target)
