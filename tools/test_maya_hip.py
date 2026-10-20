@@ -92,6 +92,17 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(cfg["env"]["STRATA_GLM_RESERVE_MB"], "4096")
         self.assertEqual(cfg["exe"], str(self.root / "build-hip/strata"))
         self.assertNotIn("vision", cfg)
+        self.assertNotIn("gpu_pci", cfg)            # (GPUs listed without PCI addresses)
+
+    def test_config_names_linux_gpus_by_pci_address(self):
+        # KFD's PCI addresses: the server finds the same card when HIP numbers the GPUs otherwise after a reboot
+        for g, pci in zip(self.gpus, ("0000:03:00.0", "0000:c7:00.0", "0000:c8:00.0")):
+            g["pci"] = pci
+        pc = maya.check_pc(self.a)
+        p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                              self.root / "pack", "test", 8192, self.root / "data", None)
+        cfg = json.loads(p.read_text())
+        self.assertEqual(cfg["gpu_pci"], [self.gpus[i]["pci"] for i in cfg["gpu"]])
 
     def test_config_prompt_defaults_and_tuning_table(self):
         tables = self.root / "tools/hip"
@@ -725,6 +736,7 @@ class WindowsHipSetupTests(unittest.TestCase):
         self.assertEqual(p.name, "maya-maya-l-hip.json")
         self.assertEqual((cfg["backend"], cfg["gpu"], cfg["exe"]), ("hip", [0], str(self.root / "build-hip/strata.exe")))
         self.assertEqual(cfg["lib_dirs"], [str(self.rocm / "bin")])
+        self.assertNotIn("gpu_pci", cfg)            # Windows: hipInfo's numbers, as before
         env = cfg["env"]
         self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "3072")    # the desktop runs on the APU's GPU too
         self.assertEqual(env["STRATA_GLM_PREFILL_MB"], "6144")    # 32 GB Windows + 96 GB the GPU's

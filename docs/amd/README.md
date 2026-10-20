@@ -99,8 +99,44 @@ one `/opt/rocm` points to: remove the ones you do not use, or name one with `ROC
 
 ### Windows
 
-On Windows, setup installs AMD's ROCm SDK (TheRock's wheels) into Abyss's `.venv`; the driver is AMD Software:
-Adrenalin Edition. See [AMD HIP (Maya)](../maya/AMD_HIP.md).
+Windows has its own steps (experimental: reported on an RX 7900 XT, not yet run on an R9700).
+
+1. **Driver:** AMD Software: Adrenalin Edition (https://www.amd.com/en/support).
+2. **Visual Studio Build Tools** (2022 or 2026, "Desktop development with C++"). ROCm's compiler uses Visual
+   Studio's headers and libraries.
+
+   ```bat
+   winget install -e --id Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+   ```
+
+3. **64-bit Python 3.10 or newer** (`winget install -e --id Python.Python.3.12 --scope user`).
+4. **Run `setup-deepseek.bat --backend hip`,** or `START-ABYSS.bat` for GLM-5.3-Flash.
+   - Setup asks first, then installs AMD's ROCm SDK (TheRock's wheels, 7.14.1) into Abyss's `.venv`. Nothing is
+     installed system-wide.
+   - The kernels for the chosen GPUs' architectures (`rocm-sdk-device-<arch>`) come with it, and setup offers to add
+     any that are missing. The Linux problem of missing BLAS kernels therefore does not happen on Windows.
+   - The GPU numbers are those of ROCm's `hipInfo`. Without hipInfo they are Windows' own order, and setup warns that
+     HIP's numbers can differ.
+
+What is different on Windows:
+
+- **The iGPU lane is Linux only.** On Windows the CPU computes the RAM-tier experts, even with a discrete Radeon and
+  a Ryzen AI Max iGPU. The server passes only the config's GPUs in `HIP_VISIBLE_DEVICES`.
+- **`"gpu_pci"` is not used.** The numbers are hipInfo's. After adding or removing a GPU, run setup again to check
+  them.
+- **`HSA_OVERRIDE_GFX_VERSION` is a setting of Linux's ROCr.** It does not matter on Windows.
+- **RAM:** Windows counts the pinned RAM tier against the commit limit (RAM + pagefile). With a small pagefile,
+  experts go to the SSD while RAM is free. On an RX 7900 XT + 128 GB, these settings kept every expert in RAM
+  ([issue #4](https://github.com/zephel01/Abyss/issues/4)):
+  - a larger pagefile (for example 64 GB)
+  - `STRATA_GLM_RAM_HEADROOM_GB=4`
+  - `STRATA_GLM_RESERVE_MB=512` (when no display is attached to that card)
+  - `--prefill 8192`
+- **Hybrid Intel CPUs:** `STRATA_GLM_CPU_PIN=0-15` puts the CPU lane's workers on the P-core threads. Do not limit
+  the whole process to the P-cores, because that starves the HIP runtime's threads.
+
+Build problems seen so far, such as MSVC 14.51 colliding with TheRock 7.14.1 over `isgreater`, are in
+[AMD HIP (Maya)](../maya/AMD_HIP.md), section "Windows 11".
 
 ## 3. Environment variables
 
@@ -149,6 +185,7 @@ On a Ryzen AI Max with a discrete Radeon attached, the work is split as follows:
 - The engine (attention, the VRAM experts) runs on the discrete card.
 - The iGPU computes the RAM-tier experts. It reads RAM at ~240 GB/s, against ~75 GB/s for the CPU threads.
 
+This is Linux only (for Windows, see "Windows" above).
 Nothing needs to be configured. The server appends the iGPU to `HIP_VISIBLE_DEVICES` (for example `0,1`), the engine
 runs on the first GPU, and the lane finds the integrated GPU by itself.
 
@@ -221,4 +258,7 @@ R9700 + Radeon 8060S (the iGPU lane), 94 GB RAM, decode speed over 6 swe-bench t
 | The engine log shows `No compatible code objects found for: gfx1201`, or the iGPU lane fails with `invalid device function` | an older build's `libabyss_igpu.so` has no code for the engine's GPU. HIP refuses a library's kernels on every GPU when any visible GPU has no code in it | rebuild from the current source (`./setup-deepseek.sh --backend hip`) |
 | Slow with a discrete card attached, and the log's GPU is the iGPU (gfx1151) | the HIP numbers flipped and the config's `"gpu"` now names the iGPU | add `"gpu_pci"` to the config ("When the GPU numbers change"); check the order with `rocminfo` |
 | A discrete card and the iGPU are there, but the log never shows `-> the iGPU computes the lane` | the config's `env` narrows `HIP_VISIBLE_DEVICES` to the discrete card, or sets `STRATA_GLM_IGPU=0` | remove both |
+| (Windows) setup says `ROCm's hipInfo sees no AMD GPU` | the driver is old or missing | update Adrenalin, restart, and check with the hipInfo the warning names |
+| (Windows) the build stops at `__device__ function 'isgreater' cannot overload ...` | MSVC 14.51 against TheRock 7.14.1 | patch the headers as [AMD HIP (Maya)](../maya/AMD_HIP.md) "Windows 11" says ([issue #2](https://github.com/zephel01/Abyss/issues/2) has a script) |
+| (Windows) experts are read from the SSD while RAM is free | the pagefile is small and the commit limit is hit | the settings under "RAM" in "Windows" |
 | The build stops at `ROCm's HIP compiler ... and hipBLAS are required` | no development package, or `/opt/rocm` points at another version | install `amdrocm-core-dev10.0-<arch>`, or set `ROCM_PATH=/opt/rocm/core-10.0` |

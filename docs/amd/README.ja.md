@@ -100,8 +100,44 @@ ROCm 7（`amdgpu-install` の `rocm`、または amdrocm 7.x）でも動きま�
 
 ### Windows
 
-Windows では、セットアップが AMD の ROCm SDK（TheRock の wheel）を Abyss の `.venv` に入れます。ドライバは AMD
-Software: Adrenalin Edition です。詳しくは [AMD HIP（Maya）](../maya/AMD_HIP.md) を参照してください。
+Windows では手順が別になります（試験的。RX 7900 XT での報告があり、R9700 は未確認です）。
+
+1. **ドライバ:** AMD Software: Adrenalin Edition を入れます（https://www.amd.com/en/support）。
+2. **Visual Studio Build Tools**（2022 または 2026、「C++ によるデスクトップ開発」）を入れます。ROCm のコンパイラが、
+   Visual Studio のヘッダとライブラリを使います。
+
+   ```bat
+   winget install -e --id Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+   ```
+
+3. **64 ビットの Python 3.10 以降**を入れます（`winget install -e --id Python.Python.3.12 --scope user`）。
+4. **`setup-deepseek.bat --backend hip` を実行します。** GLM-5.3-Flash を使う場合は `START-ABYSS.bat` です。
+   - ROCm は、セットアップが聞いてから AMD の ROCm SDK（TheRock の wheel、7.14.1）を Abyss の `.venv` に入れます。
+     システムには何も入れません。
+   - 選んだ GPU のアーキテクチャのカーネル（`rocm-sdk-device-<arch>`）も一緒に入ります。足りなければ、セットアップが
+     入れ直しを勧めます。そのため、Linux の「BLAS のカーネルがない」問題は Windows では起きません。
+   - GPU の番号は ROCm の `hipInfo` の順です。hipInfo が見つからないときは Windows の一覧の順になり、HIP の番号と
+     違うことがあるという警告が出ます。
+
+Windows での違い:
+
+- **iGPU レーンは Linux だけです。** Windows では、単体の Radeon と Ryzen AI Max の iGPU があっても、RAM 層の
+  エキスパートは CPU が計算します。サーバーは `HIP_VISIBLE_DEVICES` に設定の GPU だけを渡します。
+- **`"gpu_pci"` は使いません。** 番号は hipInfo のものです。GPU を足したり外したりしたあとは、セットアップを
+  もう一度実行して番号を確かめてください。
+- **`HSA_OVERRIDE_GFX_VERSION` は Linux の ROCr の設定です。** Windows では関係ありません。
+- **RAM の扱い:** Windows は pinned の RAM 層をコミット上限（RAM + ページファイル）で数えます。ページファイルが
+  小さいと、RAM が空いていてもエキスパートが SSD に回ります。RX 7900 XT + 128 GB では、次の設定ですべての
+  エキスパートが RAM に載りました（[issue #4](https://github.com/zephel01/Abyss/issues/4)）。
+  - ページファイルを大きくする（例: 64 GB）
+  - `STRATA_GLM_RAM_HEADROOM_GB=4`
+  - `STRATA_GLM_RESERVE_MB=512`（そのカードに画面をつないでいない場合）
+  - `--prefill 8192`
+- **Intel のハイブリッド CPU:** `STRATA_GLM_CPU_PIN=0-15` で、CPU レーンを P コアのスレッドに載せられます。
+  プロセス全体を P コアに絞ると、HIP ランタイムのスレッドが足りなくなって遅くなります。
+
+ビルドで起きた問題（MSVC 14.51 と TheRock 7.14.1 の `isgreater` の衝突など）は
+[AMD HIP（Maya）](../maya/AMD_HIP.md) の「Windows 11」にあります。
 
 ## 3. 環境変数
 
@@ -150,6 +186,7 @@ ls /opt/rocm/lib/rocblas/library | grep -c gfx1201  # 0 なら amdrocm10.0-gfx12
 - エンジン（attention、VRAM のエキスパート）は単体カードで動きます。
 - RAM 層のエキスパートは iGPU が計算します。iGPU は RAM を約 240 GB/s で読めるのに対し、CPU のスレッドは約 75 GB/s です。
 
+Linux だけで動きます（Windows は上の「Windows」を参照）。
 設定は要りません。サーバーが iGPU を `HIP_VISIBLE_DEVICES` の後ろに足し（例: `0,1`）、エンジンは最初の GPU で
 動きます。レーンは integrated の GPU を自分で探して使います。
 
@@ -222,4 +259,7 @@ R9700 + Radeon 8060S（iGPU レーン）、RAM 94 GB、swe-bench の 6 問の生
 | エンジンのログに `No compatible code objects found for: gfx1201` が出る。iGPU レーンで `invalid device function` になる | 古いビルドの `libabyss_igpu.so` に、エンジンの GPU 用のコードが入っていない。HIP は、見えている GPU のどれか 1 つでもコードがないライブラリだと、そのカーネルを全部の GPU で使えなくする | 今のソースでビルドし直す（`./setup-deepseek.sh --backend hip`） |
 | 単体カードがあるのに遅く、ログの GPU が iGPU（gfx1151）になっている | HIP の番号が入れ替わり、設定の `"gpu"` が iGPU を指している | 設定に `"gpu_pci"` を書く（「GPU の番号が変わる場合」）。`rocminfo` で順番を確かめる |
 | 単体カードと iGPU があるのに、ログに `-> the iGPU computes the lane` が出ない | 設定の `env` で `HIP_VISIBLE_DEVICES` を単体カードだけにしている、または `STRATA_GLM_IGPU=0` | どちらも外す |
+| （Windows）`ROCm's hipInfo sees no AMD GPU` と出る | ドライバが古い、または入っていない | Adrenalin を更新して再起動し、警告に出る hipInfo で確かめる |
+| （Windows）ビルドが `__device__ function 'isgreater' cannot overload ...` で止まる | MSVC 14.51 と TheRock 7.14.1 の衝突 | [AMD HIP（Maya）](../maya/AMD_HIP.md) の「Windows 11」の手順でヘッダを直す（[issue #2](https://github.com/zephel01/Abyss/issues/2) にスクリプトがある） |
+| （Windows）RAM が空いているのに、エキスパートが SSD から読まれる | ページファイルが小さく、コミット上限に当たっている | 「Windows」の「RAM の扱い」の設定 |
 | ビルドが `ROCm's HIP compiler ... and hipBLAS are required` で止まる | 開発用パッケージがない、または `/opt/rocm` が別の版を指している | `amdrocm-core-dev10.0-<arch>` を入れる。または `ROCM_PATH=/opt/rocm/core-10.0` を設定する |
