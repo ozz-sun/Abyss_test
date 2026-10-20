@@ -104,6 +104,21 @@ class HipSetupTests(unittest.TestCase):
         cfg = json.loads(p.read_text())
         self.assertEqual(cfg["gpu_pci"], [self.gpus[i]["pci"] for i in cfg["gpu"]])
 
+    def test_config_keeps_no_desktop_room_on_a_card_without_a_screen(self):
+        # an eGPU beside an APU: the desktop is on the iGPU, the card keeps the engine's own reserve (no 3 GB less pool)
+        for g in self.gpus:
+            g["display"] = False
+        pc = maya.check_pc(self.a)
+        p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                              self.root / "pack", "test", 8192, self.root / "data", None)
+        env = json.loads(p.read_text())["env"]
+        self.assertNotIn("STRATA_GLM_RESERVE_MB", env)
+        self.assertEqual(env["STRATA_GLM_RAM_HEADROOM_GB"], "16")
+        self.gpus[0]["display"] = True          # a screen on the chosen card: its room as before
+        p = maya.write_config(self.a, maya.check_pc(self.a), {"lib_dirs": [str(self.rocm / "lib")]},
+                              self.root / "pack", "test", 8192, self.root / "data", None)
+        self.assertEqual(json.loads(p.read_text())["env"]["STRATA_GLM_RESERVE_MB"], "3072")
+
     def test_config_prompt_defaults_and_tuning_table(self):
         tables = self.root / "tools/hip"
         tables.mkdir(parents=True)
@@ -178,7 +193,7 @@ class HipSetupTests(unittest.TestCase):
                               self.root / "data", None)
         self.assertEqual(json.loads(p.read_text())["env"], {
             "STRATA_GLM_SPLIT": "0", "STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16",
-            "STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
+            "GPU_MAX_HW_QUEUES": "2", "STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
         self.assertFalse(maya.hip_unified_memory(self.gpus[1]))
 
     def test_hip_build_enables_mmq_and_never_cuda(self):

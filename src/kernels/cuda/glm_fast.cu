@@ -1021,6 +1021,82 @@ __device__ __forceinline__ float any_row_dot(int type, const void* w, int row, c
     }
 }
 
+#if defined(STRATA_USE_HIP)
+// ... over part p of split of a row's k-blocks (mv_kernel_gs: split warps a row): the warp's partial sum, unreduced
+template<int T>
+__device__ __forceinline__ float row_dot_part(const uint8_t* row, const block_q8_1* x, int n_in, int lane, int p,
+                                              int split) {
+    using Fm = F<T>;
+    const int nk = n_in / Fm::qk * Fm::ipb;
+    float s = 0.0f;
+    for (int k = nk * p / split + lane; k < nk * (p + 1) / split; k += 32) {
+        const int kbx = k / Fm::ipb, iqs = Fm::step * (k % Fm::ipb);
+        s += Fm::dot(row, x + kbx * (Fm::qk / 32), kbx, iqs);
+    }
+    return s;
+}
+__device__ __forceinline__ float any_row_dot_part(int type, const void* w, int row, const void* xq, const float* xf,
+                                                  int n_in, int lane, int p, int split) {
+    switch (type) {
+        case kTypeF32: {
+            const float4* r4 = (const float4*) ((const float*) w + (size_t) row * n_in);
+            const float4* x4 = (const float4*) xf;
+            const int n4 = n_in / 4;
+            float s = 0.0f;
+            for (int k = n4 * p / split + lane; k < n4 * (p + 1) / split; k += 32) {
+                const float4 a = r4[k], b = x4[k];
+                s += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+            return s;
+        }
+        case kTypeBF16: {
+            const uint4* r8 = (const uint4*) ((const uint16_t*) w + (size_t) row * n_in);
+            const float4* x4 = (const float4*) xf;
+            const int n8 = n_in / 8;
+            float s = 0.0f;
+            for (int k = n8 * p / split + lane; k < n8 * (p + 1) / split; k += 32) {
+                const uint4 v = r8[k];
+                const float4 a = x4[2 * k], b = x4[2 * k + 1];
+                s += __uint_as_float(v.x << 16) * a.x + __uint_as_float(v.x & 0xffff0000u) * a.y +
+                     __uint_as_float(v.y << 16) * a.z + __uint_as_float(v.y & 0xffff0000u) * a.w +
+                     __uint_as_float(v.z << 16) * b.x + __uint_as_float(v.z & 0xffff0000u) * b.y +
+                     __uint_as_float(v.w << 16) * b.z + __uint_as_float(v.w & 0xffff0000u) * b.w;
+            }
+            return s;
+        }
+#define GF_CASE(T) case T: return row_dot_part<T>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane, p, split);
+        GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
+        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29)
+#undef GF_CASE
+        default: return 0.0f;
+    }
+}
+
+// gfx1201, a full 64-CU die: a dispatch whose waves land at or near a multiple of the die's wave slots (CUs x 2 SIMDs
+// x 16 waves = 2048) delays the NEXT dispatch's start by 8-14 us (ROCm/TheRock#9300, ROCm 10.0 / HIP 7.15; only a
+// kernel that can fill every slot).  An AI PRO R9700 met it ~275 times a DeepSeek V4 token: the 4096-row GEMVs (a wave
+// a row) and the expert down (8192 waves).  Blocks that return at once move a launch out of the window (Strata PR
+// #2492: a 2560 -> 512 matvec 16.5 -> 5.0 us); every row and sum stays the same.  STRATA_GLM_GRID_PAD=0: none
+static int grid_pad(int blocks, int wpb) {
+    static const bool on = getenv("STRATA_GLM_GRID_PAD") == nullptr || std::atoi(getenv("STRATA_GLM_GRID_PAD")) != 0;
+    static thread_local int dev = -1, slots = 0;
+    int d = 0;
+    if (!on || wpb <= 0 || hipGetDevice(&d) != hipSuccess) return blocks;
+    if (d != dev) {
+        int cu = 0;
+        slots = hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, d) == hipSuccess ? cu * 32 : 0;
+        dev = d;
+    }
+    if (slots <= 0) return blocks;
+    const int win = std::max(16, 4 * wpb), r = (int) (((long long) blocks * wpb) % slots);
+    if (r < 16) return blocks + (16 - r + wpb - 1) / wpb;                     // at a multiple or just past it
+    if (r > slots - win) return blocks + (slots - r + 16 + wpb - 1) / wpb;    // just below one
+    return blocks;
+}
+#else
+static inline int grid_pad(int blocks, int) { return blocks; }
+#endif
+
 // ---------------------------------------------------------------- multi-job GEMV
 struct MvBatch {
     MvJob j[kMaxMvJobs];
@@ -1096,6 +1172,34 @@ __global__ void __launch_bounds__(256) mv_kernel_ts(const __grid_constant__ MvBa
         J.y[row] = J.alpha * t + (J.bias ? J.bias[row] : 0.0f);
     }
 }
+
+#if defined(STRATA_USE_HIP)
+// ... the same for jobs of ANY types in one launch (HIP, mv's small calls of several types): the type is switched per
+// block (one job a block), which RDNA's wave32 affords - 16 waves a SIMD up to 96 VGPRs
+template<int SPLIT>
+__global__ void __launch_bounds__(256) mv_kernel_gs(const __grid_constant__ MvBatch b) {
+    constexpr int RPB = MV_ROWS / SPLIT;
+    __shared__ float s_part[MV_ROWS];
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = (bid - blk0) * RPB + warp / SPLIT, part = warp % SPLIT;
+    float s = 0.0f;
+    if (row < J.n_out) s = any_row_dot_part(J.type, J.w, row, J.xq, J.xf, J.n_in, lane, part, SPLIT);
+    s = warp_sum(s);
+    if (lane == 0) s_part[warp] = s;
+    __syncthreads();
+    if (part == 0 && lane == 0 && row < J.n_out) {
+        float t = 0.0f;
+#pragma unroll
+        for (int p = 0; p < SPLIT; ++p) t += s_part[warp + p];
+        J.y[row] = J.alpha * t + (J.bias ? J.bias[row] : 0.0f);
+    }
+}
+#endif
 
 // ... and against NC activations at once (a verify window's tokens): the weight row is read once, every column's
 // q8_1 blocks at xq + c * n_in / 32, its outputs at y + c * n_out (columns contiguous, as native_mmvq's)
@@ -2956,6 +3060,8 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
                                                        const float* __restrict__ sh_out, float* __restrict__ out) {
 #if !defined(STRATA_USE_HIP)
     constexpr int NR = DOWN_ROWS;
+#else
+    if ((int) blockIdx.x * NR >= n_embd) return;   // (grid_pad's blocks)
 #endif
     // NR output rows per block; warp w computes those rows for expert w (one activation load per call
     // for all of them), the combine runs in plan order like the reference's axpy chain
@@ -3566,6 +3672,34 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             std::fprintf(stderr, "glm_fast mv: type %d unsupported\n", jobs[i].type);
             return false;
         }
+#if defined(STRATA_USE_HIP)
+    // HIP: a small call of several types in ONE launch, 4 warps a row (mv_kernel_gs) - an AI PRO R9700 spends 15-29 us
+    // on a small GEMV whatever its size (an RTX 5090 3-6), and DeepSeek V4's projections of x went out as two or three
+    // launches a layer (Q5_K q_a, the Q8_0 compressors, the F32 indexer weights).  STRATA_GLM_MV_FUSE=0: one per type
+    static const bool fuse = getenv("STRATA_GLM_MV_FUSE") == nullptr || std::atoi(getenv("STRATA_GLM_MV_FUSE")) != 0;
+    if (fuse && n > 1) {
+        int rows = 0;
+        bool mixed = false, exl = false;
+        for (int i = 0; i < n; ++i) {
+            rows += jobs[i].n_out;
+            mixed = mixed || jobs[i].type != jobs[0].type;
+            exl = exl || jobs[i].type == exl3::kTypeEXL3;
+        }
+        if (mixed && !exl && rows <= 8192) {
+            MvBatch b{};
+            int acc = 0;
+            for (int i = 0; i < n; ++i) {
+                b.j[i] = jobs[i];
+                acc += (jobs[i].n_out + MV_ROWS / 4 - 1) / (MV_ROWS / 4);
+                b.blk_end[i] = acc;
+            }
+            b.n = n;
+            mv_kernel_gs<4><<<grid_pad(acc, 8), 256, 0, s>>>(b);
+            launch_check("mv (one launch)");
+            return true;
+        }
+    }
+#endif
     // the jobs of the common dense types go to a kernel compiled for their type (one launch per type present), the
     // rest to the generic one; the jobs are independent, so their order does not matter
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
@@ -3622,9 +3756,9 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             }
 #define GF_MV_T(TT) \
             switch (split) { \
-                case 4: mv_kernel_ts<TT, 4><<<acc, 256, 0, s>>>(b); break; \
-                case 2: mv_kernel_ts<TT, 2><<<acc, 256, 0, s>>>(b); break; \
-                default: mv_kernel_t<TT><<<acc, 256, 0, s>>>(b); break; \
+                case 4: mv_kernel_ts<TT, 4><<<grid_pad(acc, 8), 256, 0, s>>>(b); break; \
+                case 2: mv_kernel_ts<TT, 2><<<grid_pad(acc, 8), 256, 0, s>>>(b); break; \
+                default: mv_kernel_t<TT><<<grid_pad(acc, 8), 256, 0, s>>>(b); break; \
             }
             switch (T) {
                 case 14: GF_MV_T(14) break;
@@ -3645,7 +3779,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     }
     if (m > 0) {
         b.n = m;
-        mv_kernel<<<acc, 256, 0, s>>>(b);
+        mv_kernel<<<grid_pad(acc, 8), 256, 0, s>>>(b);
     }
     launch_check("mv");
     return true;
@@ -3973,36 +4107,36 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, size_t
 
 #if defined(STRATA_USE_HIP)
 namespace {
-// Limit automatic dispatch to the measured decode geometry and RDNA3/3.5
-// targets. RDNA4 and all other shapes retain the original expert kernels.
-bool rdna3_expert_device(bool allow_gfx1151 = true) {
+// The RDNA expert kernels of the measured decode geometry, by the current device's architecture (hip_expert_kernel_bench
+// --sweep; every sum bit-identical to the original kernels'): gfx1100 and gfx1201 all of them (an AI PRO R9700, 8
+// experts: IQ2_XS / IQ2_XXS gate/up 90.6 / 85.3 -> 75.6 / 70.2 us, IQ3_XXS down 59.3 -> 48.8, IQ2_S down 56.7 ->
+// 45.4); gfx1151 all but the IQ3_XXS down, which regresses there.  Other architectures and shapes keep the original
+// kernels; STRATA_HIP_EXPERTS_LEGACY=1 the original ones everywhere.
+enum class RdnaArch { none, gfx1100, gfx1151, gfx1201 };
+RdnaArch rdna_expert_arch() {
     static const bool legacy = [] {
         const char* v = std::getenv("STRATA_HIP_EXPERTS_LEGACY");
         return v && v[0] == '1';
     }();
-    if (legacy) return false;
+    if (legacy) return RdnaArch::none;
     int device = 0;
-    if (hipGetDevice(&device) != hipSuccess) return false;
+    if (hipGetDevice(&device) != hipSuccess) return RdnaArch::none;
     static thread_local int cached_device = -1;
-    static thread_local bool gfx1100 = false;
-    static thread_local bool gfx1151 = false;
+    static thread_local RdnaArch arch = RdnaArch::none;
     if (cached_device != device) {
         hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
-        gfx1100 = std::strncmp(prop.gcnArchName, "gfx1100", 7) == 0;
-        gfx1151 = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        if (hipGetDeviceProperties(&prop, device) != hipSuccess) return RdnaArch::none;
+        const char* a = prop.gcnArchName;
+        arch = std::strncmp(a, "gfx1100", 7) == 0 ? RdnaArch::gfx1100
+             : std::strncmp(a, "gfx1151", 7) == 0 ? RdnaArch::gfx1151
+             : std::strncmp(a, "gfx1201", 7) == 0 ? RdnaArch::gfx1201 : RdnaArch::none;
         cached_device = device;
     }
-    return gfx1100 || (allow_gfx1151 && gfx1151);
+    return arch;
 }
-bool gfx1151_device() {
-    static const bool v = [] {
-        int device = 0;
-        hipDeviceProp_t prop{};
-        return hipGetDevice(&device) == hipSuccess && hipGetDeviceProperties(&prop, device) == hipSuccess &&
-               std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
-    }();
-    return v;
+bool rdna3_expert_device(bool allow_gfx1151 = true) {
+    const RdnaArch a = rdna_expert_arch();
+    return a == RdnaArch::gfx1100 || a == RdnaArch::gfx1201 || (allow_gfx1151 && a == RdnaArch::gfx1151);
 }
 // Splitting shared down removes its dynamic type switch from routed gate/up's
 // register budget. The routed grid keeps exactly the original dot/reduction order.
@@ -4033,7 +4167,7 @@ void launch_expert_gu(const MoeDev& d, int k, int n_embd, int n_ff, float limit,
 template<int T, int NR, bool GLOBAL = false, bool LUT = true, bool DIRECT = false, bool WIDE = false>
 void launch_expert_down(const MoeDev& d, int k, int n_embd, int n_ff, size_t off, const void* hq,
                const float* sh, float* out, cudaStream_t s) {
-    moe_down_kernel<T, NR, LUT, GLOBAL, DIRECT, WIDE><<<n_embd / NR, 256, 0, s>>>(d, k, n_embd, n_ff, off,
+    moe_down_kernel<T, NR, LUT, GLOBAL, DIRECT, WIDE><<<grid_pad(n_embd / NR, 8), 256, 0, s>>>(d, k, n_embd, n_ff, off,
         (const block_q8_1*) hq, sh, out);
 }
 } // namespace
@@ -4042,8 +4176,12 @@ void launch_expert_down(const MoeDev& d, int k, int n_embd, int n_ff, size_t off
 void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
                  const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
-    // IQ2_XS (DeepSeek V4's gate/up) the same way, measured on gfx1151 only (the Radeon 8060S lane: bit-identical sums)
-    if (gu_type == 17 && n_embd == 4096 && n_ff == 2048 && gfx1151_device() && !std::getenv("ABYSS_IGPU_GU17_LEGACY")) {
+    // IQ2_XS (DeepSeek V4's gate/up) the same way, measured on gfx1151 (the Radeon 8060S lane) and gfx1201 (an AI PRO
+    // R9700: 90.6 -> 75.6 us for 8 experts), bit-identical sums; gfx1100 not measured
+    static const bool gu17_legacy = std::getenv("ABYSS_IGPU_GU17_LEGACY") != nullptr;
+    const RdnaArch ra = rdna_expert_arch();
+    if (gu_type == 17 && n_embd == 4096 && n_ff == 2048 && (ra == RdnaArch::gfx1151 || ra == RdnaArch::gfx1201) &&
+        !gu17_legacy) {
         launch_expert_gu<17, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
             xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
         launch_check("moe_gate_up RDNA3.5");
@@ -4100,7 +4238,7 @@ void gate_up(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, 
     else if (v == Variant::waves8) launch_expert_gu<T, 8>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
     else if (v == Variant::global_grid) launch_expert_gu<T, 16, true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
     else launch_expert_gu<T, 16>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); break;
-    switch (type) { BENCH_GU(16) BENCH_GU(18) BENCH_GU(22)
+    switch (type) { BENCH_GU(16) BENCH_GU(17) BENCH_GU(18) BENCH_GU(22)
         default: std::fprintf(stderr, "expert bench: unsupported type %d\n", type); std::abort(); }
 #undef BENCH_GU
     launch_check("expert bench gate/up");
@@ -4178,7 +4316,7 @@ void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t d
     const auto* H = (const block_q8_1*) hq;
     switch (d_type) {
 #define GLMF_DN(T) \
-        case T: moe_down_kernel<T><<<blocks, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out); break;
+        case T: moe_down_kernel<T><<<grid_pad(blocks, 8), 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out); break;
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
         GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(39)
 #undef GLMF_DN

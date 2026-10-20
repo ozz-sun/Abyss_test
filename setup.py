@@ -124,6 +124,14 @@ def out(cmd):
         return ""
 
 
+def read_text(path: Path) -> str:
+    """A sysfs file's text, stripped ("" when it cannot be read)."""
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
 def done(path: Path) -> bool:
     """A step's finish mark: <path>.done exists (written only after the step completed)."""
     return path.with_name(path.name + ".done").exists()
@@ -544,8 +552,12 @@ def amd_gpus(hipinfo=None):
             name = AMD_NAMES[arch]
         # the PCI address names the card whatever HIP's number (the boot's order, which can change): "gpu_pci"
         loc, dom = int(props.get("location_id") or 0), int(props.get("domain") or 0)
+        # a screen on one of its connectors: the desktop's VRAM is kept free on it (an eGPU beside an APU often
+        # has none - the desktop is on the iGPU)
+        display = any(read_text(s) == "connected" for s in dev.glob("drm/card*/card*-*/status"))
         found.append({"index": len(found), "name": name, "vram_gb": vram, "arch": arch, "driver": "amdgpu",
-                      "vendor": "amd", "pci": f"{dom:04x}:{loc >> 8:02x}:{(loc >> 3) & 0x1f:02x}.{loc & 7}"})
+                      "vendor": "amd", "pci": f"{dom:04x}:{loc >> 8:02x}:{(loc >> 3) & 0x1f:02x}.{loc & 7}",
+                      "display": display})
     return found
 
 

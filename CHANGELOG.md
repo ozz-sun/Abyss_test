@@ -7,6 +7,50 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.40 - 2026-10-21
+
+**AMD AI PRO R9700: prompts ~2x (ROCm's single hardware queue handled), decode +17% (gfx1201 kernels), the verify
+window chosen by timing; the iGPU lane kept awake through DeepSeek V4.1's SSD waits.** Measured on an AI PRO R9700
+(OCuLink, PCIe Gen4 x4) + Radeon 8060S lane, DeepSeek V4 UD-Q2_K_XL unless named.
+- **Prompts: 8K / 16K 454 / 599 tok/s (v1.3.39, one hardware queue) -> 866-995 / 999-1,011.**
+  - The prompt's host lane waited for its expert inputs with a stream sync. With every stream in one hardware queue
+    (`GPU_MAX_HW_QUEUES=1`, which R9700 guides set against a MES firmware's idle power) that waited for all the other
+    streams' earlier work too, 120-150 ms a layer. It waits for an event after the copies now (the same on CUDA).
+  - **`GPU_MAX_HW_QUEUES=2`**: setup writes it into HIP configs, and the server passes it when neither the shell nor
+    the config sets it. 8K / 16K: one queue 586-650 / 676-684 tok/s, ROCm's 4 653-737 / 748-756, two 866-995 /
+    999-1,011; idle power 12 W on one and two alike. A config from an older setup: add it to `env`, or run setup again.
+  - HIP's prompt sub-batch is 1,024 (was 256): +8-10% (DeepSeek V4), +13-15% (GLM-5.3-Flash Maya-S-v2) on its own.
+  - The iGPU lane's fused int8 prompt kernel was looked up on HIP device 0 - beside a discrete Radeon, the card - so
+    the iGPU's prompt experts ran the one-row kernels. It is looked up on the iGPU now (as beside an RTX 5090).
+  - The fused kernel's barriers wait for LDS only on gfx11 / gfx12: no measured change, the same results.
+- **Decode** (one token at a time, no drafts): 22.0-22.4 ms a token (44.7-45.5 tok/s) -> 18.9-19.0 (52.2-52.9).
+  - **Grid padding** (`STRATA_GLM_GRID_PAD`, HIP): a gfx1201 dispatch whose waves end at, or just below, a multiple
+    of the GPU's wave slots holds up the next dispatch by 8-14 us (ROCm/TheRock#9300); DeepSeek V4's 4096-row GEMVs
+    and expert downs hit it ~275 times a token. A few blocks that return at once: 22.2 -> 20.2 ms, bit-identical.
+  - **A token's small GEMVs of several types in one launch** (`STRATA_GLM_MV_FUSE`, HIP; a small GEMV costs 15-29 us
+    on gfx1201 whatever its size): 20.2 -> 19.5-19.9 ms. Not bit-identical to the typed kernels.
+  - **The RDNA decode expert kernels on gfx1201** (gfx1100's gate/up and down): ~20% faster each, 19.4-19.5 ->
+    18.9-19.0 ms a token, bit-identical (`STRATA_HIP_EXPERTS_LEGACY=1`: the old ones).
+  - Without the iGPU lane (the CPU threads compute the RAM-tier experts): 23.4-23.9 ms (41.8-42.8 tok/s).
+- **The verify window** (`STRATA_DS4_SPEC_PIPE`): on HIP the first windows time the pipelined and the batched kind (3
+  each) and the faster stays. The R9700 keeps the batched one: 2-token windows 30.6 against 44.5 ms with one hardware
+  queue (swe-bench 6 tasks 42.3 / 41.9 -> 50.2 / 46.1 tok/s), 14.1 against 14.9 ms a token with two. NVIDIA keeps the
+  pipelined window (`auto` times it there too; not checked on an NVIDIA card yet).
+- **DeepSeek V4.1: the iGPU lane's keep-alive** runs 500 ms after a route (`STRATA_GLM_IGPU_POKE_MS`, was 20). The SSD
+  waits between routes let the iGPU sleep, and its next call took 21-27 ms (the CPU threads took it over):
+  nazeshinjite Q2, the slowest of the 8 held-out sequences, 80.4 -> 65.6 ms a token, 123 -> 3 late calls.
+- **Setup** keeps the 3 GB desktop reserve only on a GPU with a screen connected: an eGPU beside an APU's desktop has
+  none (~380 more DeepSeek V4 expert slots on an R9700).
+- **GLM-5.3-Flash Maya-S-v2**: prompts 8K / 16K 417-421 / 539-543 tok/s (one queue, 2026-10-20) -> 644-716 /
+  797-843; decode unchanged (34.3-38.3 tok/s).
+- KL against the reference, DeepSeek V4, 1,000 tokens: 0.005922 with the iGPU lane (v1.3.39: 0.005195; the one-launch
+  GEMVs' sum order - `STRATA_GLM_MV_FUSE=0` gives 0.005195 again; the CUDA build's own 0.005939), 0.005687 with the
+  CPU lane (0.0059). The CUDA build compiles; it was not run this time (no NVIDIA card attached) - its kernels are
+  unchanged, the prompt's event wait and the keep-alive window apply to it too.
+- `STRATA_GLM_SVC_STAT=1` also prints the CPU lane's calls by their expert count (an R9700 host: 147 us for one
+  expert, ~124 us for each more - the CPU's IQ2_XS / IQ3_XXS dots, not the call, take the time).
+- Docs: MANUAL (the new settings), docs/amd (`GPU_MAX_HW_QUEUES`, two troubleshooting rows).
+
 ## v1.3.39 - 2026-10-21
 
 **AMD: a discrete Radeon (AI PRO R9700) with a Ryzen AI Max's iGPU as its lane, +12-46% decode; GPUs named by PCI

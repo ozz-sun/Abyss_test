@@ -231,6 +231,21 @@ template <int T> __device__ __forceinline__ const void* grid_src() {
 #define ABYSS_NAT_W12 0
 #endif
 #define ABYSS_NAT_WMMA (ABYSS_NAT_W11 || ABYSS_NAT_W12)
+
+// a barrier over LDS only (Strata PR #3222): __syncthreads() is a fence over all memory, which on gfx11 / gfx12 also
+// waits for every global load in flight (gfx12 also drops the L0 cache) - the stage loop's prefetched weights and
+// activations would land before each barrier instead of under the stage's WMMAs.  The kernel's barriers order its LDS
+// (wt, ws, srow, hs) only
+__device__ __forceinline__ void nw_sync_lds() {
+#if ABYSS_NAT_W12
+    __asm__ volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+#elif ABYSS_NAT_W11
+    __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
+
 #if ABYSS_NAT_W12
 #define NW_DROW(i, hi) (8 * (hi) + (i))
 #else
@@ -325,7 +340,7 @@ native_kernel(const unsigned long long* __restrict__ blobs, int ntiles, const in
             d[1] = make_uint4(q[4], q[5], q[6], q[7]);
             *(float2*) &ws[buf][ur][2 * uj] = make_float2(s0, s1);
         };
-        __syncthreads();                                          // the previous item is done with the buffers
+        nw_sync_lds();                                            // the previous item is done with the buffers
         if (tid < kTileRows) {
             const int r = row0 + min(tid, nrows - 1);             // rows past the tile's end repeat its last one
             srow[tid] = GU ? src[r] : r;
@@ -334,7 +349,7 @@ native_kernel(const unsigned long long* __restrict__ blobs, int ntiles, const in
         load_unit<WT>(unit(0), sub(0), raw);
         put(raw, 0);
         if (NS > 1) load_unit<WT>(unit(1), sub(1), raw);
-        __syncthreads();                                          // srow
+        nw_sync_lds();                                            // srow, and stage 0's weights in buffer 0
         const bool on = 32 * wn < nrows;
         const uint8_t* brow[2];
 #pragma unroll
@@ -365,7 +380,8 @@ native_kernel(const unsigned long long* __restrict__ blobs, int ntiles, const in
         };
         if (on) fetch_b(0, bq, bx, bsum);
         for (int s = 0; s < NS; ++s) {
-            __syncthreads();                                      // stage s's weights are in buffer s & 1
+            // (stage s's weights are in buffer s & 1: stage 0's by the barrier above, the next ones' by the barrier at
+            // the end of the stage before - no barrier here, which only made the prefetch below wait (Strata #3222))
             nw_frag nbq[2][4];
             float2 nbx[2], nbsum[2];
             if (on && s + 1 < NS) fetch_b(s + 1, nbq, nbx, nbsum);
@@ -415,7 +431,7 @@ native_kernel(const unsigned long long* __restrict__ blobs, int ntiles, const in
             }
             if (s + 1 < NS) {
                 put(raw, (s + 1) & 1);                            // the other buffer: its readers passed this barrier
-                __syncthreads();                                  // every thread's writes are in LDS before the next stage reads them
+                nw_sync_lds();                                    // every thread's writes are in LDS before the next stage reads them
                 if (s + 2 < NS) load_unit<WT>(unit(s + 2), sub(s + 2), raw);
                 if (on) {
 #pragma unroll
@@ -429,7 +445,7 @@ native_kernel(const unsigned long long* __restrict__ blobs, int ntiles, const in
             }
         }
         if constexpr (GU) {
-            __syncthreads();                                      // every wave is done reading the weight buffers (hs aliases them)
+            nw_sync_lds();                                        // every wave is done reading the weight buffers (hs aliases them)
             if (on) {
 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt)
@@ -455,7 +471,7 @@ native_kernel(const unsigned long long* __restrict__ blobs, int ntiles, const in
 #endif
                     }
             }
-            __syncthreads();
+            nw_sync_lds();
             // H block fb (64 features) to int8 per 32: one thread per tile row and half
             if (tid < 2 * kTileRows) {
                 const int r = tid >> 1, hh = tid & 1;

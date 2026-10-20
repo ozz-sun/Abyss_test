@@ -227,7 +227,6 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
         x = activation(EMB, rng, c == 4); xq.put(x.data(), x.size());
         const float limit = c == 5 ? 1e9f : 10.f;
         auto gu = [&](V v, int pool, void* dst, float* sh_dst) {
-            if (v == V::baseline && gu_type == 17) v = V::production;   // IQ2_XS: no tuned variants
             bench::gate_up(v, gu_type, plans[pool], k, EMB, FF, limit, xq.p, dst,
                           use_shared ? sh_weights.p : nullptr, 14, sh_hq.p, FF, sh_dst, s);
         };

@@ -152,6 +152,18 @@ Build problems seen so far, such as MSVC 14.51 colliding with TheRock 7.14.1 ove
   Comment out any line this finds, then log in again.
 - Leave `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` unset as well. Abyss's server works out the engine's value
   from the GPUs in the config.
+- **`GPU_MAX_HW_QUEUES`: let Abyss use 2.** R9700 guides spread `export GPU_MAX_HW_QUEUES=1` against a MES firmware
+  bug that kept the card's idle power high. With 1, all of the engine's streams share one hardware queue, and a wait on
+  one stream waits for every other stream's work: on the machine above DeepSeek V4's 8K / 16K prompts ran 586-650 /
+  676-684 tok/s on 1, 653-737 / 748-756 on ROCm's default (4) and 866-995 / 999-1,011 on 2, decode the same. The
+  idle power with the engine loaded was 12 W on both 1 and 2. Setup writes `"GPU_MAX_HW_QUEUES": "2"` into the
+  config, and the server passes 2 when neither the shell nor the config sets it. If the card's idle power stays high
+  with 2 (older firmware), set `"GPU_MAX_HW_QUEUES": "1"` in the config's `env`.
+
+  ```sh
+  grep -rn GPU_MAX_HW_QUEUES ~/.bashrc ~/.profile /etc/profile.d/ /etc/environment 2>/dev/null
+  amd-smi metric -g 0 -p    # the card's power, idle with the engine loaded
+  ```
 
 ## 4. Check the install
 
@@ -234,7 +246,7 @@ Older configs without `"gpu_pci"` keep using the numbers. To add it by hand, tak
 ## 7. What to expect
 
 R9700 + Radeon 8060S (the iGPU lane), 94 GB RAM, decode speed over 6 swe-bench tasks (tok/s), measured with
-`bench/model_gpu_cmp.sh`:
+`bench/model_gpu_cmp.sh` on v1.3.39:
 
 | Model | CPU lane | iGPU lane | 8K / 16K prompt |
 |---|---|---|---|
@@ -243,10 +255,14 @@ R9700 + Radeon 8060S (the iGPU lane), 94 GB RAM, decode speed over 6 swe-bench t
 | GLM-5.3-Flash Maya-S-v2 | 25.8 | 35.8 | 418 / 541 |
 | GLM-5.3-Flash Maya-S24 | 28.2 | 41.2 | 433 / 562 |
 
-- **Accuracy:** KL against the CUDA build is 0.0052, the same level as the spread between two CUDA runs
-  (0.0057-0.0060).
-- **Decode:** 0.42-0.58x an RTX 5090 + iGPU, and 0.73-0.91x an RTX 3090 + iGPU.
-- **Prompts:** 0.2-0.4x a 5090. HIP's prompt path (MMQ, hipBLASLt) is still being improved.
+v1.3.40 (two hardware queues, the gfx1201 kernels): DeepSeek V4 UD-Q2_K_XL prompts 8K / 16K 866-995 / 999-1,011
+tok/s, decode one token at a time 52.2-52.9 tok/s with the iGPU lane and 41.8-42.8 without it (v1.3.39: 44.7-45.5
+with the lane); GLM-5.3-Flash Maya-S-v2 prompts 644-716 / 797-843, decode unchanged.
+
+- **Accuracy:** KL against the CUDA build's reference is 0.0059 (0.0052 in v1.3.39, before the one-launch GEMVs), the
+  same level as the spread between two CUDA runs (0.0057-0.0060).
+- **Decode:** 0.42-0.58x an RTX 5090 + iGPU, and 0.73-0.91x an RTX 3090 + iGPU (v1.3.39).
+- **Prompts:** 0.4-0.5x a 5090 (v1.3.40; 0.2-0.4x in v1.3.39).
 
 ## 8. Troubleshooting
 
@@ -262,3 +278,5 @@ R9700 + Radeon 8060S (the iGPU lane), 94 GB RAM, decode speed over 6 swe-bench t
 | (Windows) the build stops at `__device__ function 'isgreater' cannot overload ...` | MSVC 14.51 against TheRock 7.14.1 | patch the headers as [AMD HIP (Maya)](../maya/AMD_HIP.md) "Windows 11" says ([issue #2](https://github.com/zephel01/Abyss/issues/2) has a script) |
 | (Windows) experts are read from the SSD while RAM is free | the pagefile is small and the commit limit is hit | the settings under "RAM" in "Windows" |
 | The build stops at `ROCm's HIP compiler ... and hipBLAS are required` | no development package, or `/opt/rocm` points at another version | install `amdrocm-core-dev10.0-<arch>`, or set `ROCM_PATH=/opt/rocm/core-10.0` |
+| Prompts far below "What to expect" (an R9700's 16K DeepSeek V4 prompt ~680 tok/s instead of ~1,000) | `GPU_MAX_HW_QUEUES=1` from the shell reaches the engine (an R9700 guide's setting) and the config does not set it | `"GPU_MAX_HW_QUEUES": "2"` in the config's `env` (setup writes it); see "3. Environment variables" |
+| DeepSeek V4.1: the engine log shows many `iGPU lane: the late call ran 21-27 ms` | the iGPU slept while the engine waited on the SSD (before v1.3.40 the keep-alive stopped 20 ms after a route) | update, or set `STRATA_GLM_IGPU_POKE_MS=500` |

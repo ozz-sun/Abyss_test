@@ -174,8 +174,11 @@ def hip_engine(a):
     else:
         S.ok(f"HIP engine already compiled: {M.EXE}")
     gpus = pc["gpus"]
-    # (as abyss.py's HIP configs: room for the desktop, one card unless two are chosen, an APU's prompt budget)
-    env = {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16"}
+    # (as abyss.py's HIP configs: two hardware queues, room for the desktop, one card unless two are chosen, an APU's
+    # prompt budget)
+    env = {"STRATA_GLM_RAM_HEADROOM_GB": "16", "GPU_MAX_HW_QUEUES": "2"}
+    if any(g.get("display", True) for g in gpus):   # (no screen on it - an eGPU beside an APU's desktop: the default)
+        env["STRATA_GLM_RESERVE_MB"] = "3072"
     if len(gpus) == 1:
         env["STRATA_GLM_SPLIT"] = "0"
     if any(M.hip_unified_memory(g) for g in gpus):

@@ -1771,10 +1771,16 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["backend"] = "hip"
         if all(g.get("pci") for g in pc["gpus"]):   # (Linux) the same cards when HIP numbers them otherwise
             cfg["gpu_pci"] = [g["pci"] for g in pc["gpus"]]
-        # Leave space for the Linux desktop. The engine sizes its prompt chunk from
+        # Leave space for the Linux desktop (on a card with a screen on it: an eGPU beside an APU's desktop has none,
+        # and 3 GB are ~380 of DeepSeek V4's experts on an AI PRO R9700). The engine sizes its prompt chunk from
         # the available prompt-memory budget; forcing 256 here severely slows HIP.
-        hip_env = {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16"}
         gpus = pc["gpus"]
+        # two hardware queues a device, written so that a shell's GPU_MAX_HW_QUEUES=1 (an R9700 guides' idle-power
+        # setting) does not reach the engine: AI PRO R9700 DeepSeek V4 prompts 8K / 16K 586-650 / 676-684 tok/s on 1,
+        # 866-995 / 999-1,011 on 2, the same 12 W idle (serve/server.py sets 2 when nothing does)
+        hip_env = {"STRATA_GLM_RAM_HEADROOM_GB": "16", "GPU_MAX_HW_QUEUES": "2"}
+        if any(g.get("display", True) for g in gpus):
+            hip_env["STRATA_GLM_RESERVE_MB"] = "3072"
         if len(gpus) == 1:
             hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards: the engine picks the split (and drafts with MTP)
         # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need

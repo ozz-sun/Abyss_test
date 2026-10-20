@@ -321,7 +321,10 @@ the Ryzen AI Max's Radeon 8060S (gfx1151).
   packages - an R9700 needs `amdrocm10.0-gfx1201` - and why `HSA_OVERRIDE_GFX_VERSION` must not be set), a check
   list, and troubleshooting.
 - **What has been checked:** the Radeon 8060S (gfx1151) alone, and an AI PRO R9700 (gfx1201) with the 8060S as its
-  iGPU lane: 36-42 tok/s on DeepSeek V4, KL against the CUDA build within the run-to-run spread (0.005).
+  iGPU lane: 36-42 tok/s on DeepSeek V4 over swe-bench tasks in v1.3.39, 52 tok/s one token at a time in v1.3.40
+  (42 without the lane), KL against the CUDA build within the run-to-run spread (0.005-0.006).
+- **ROCm's hardware queues:** keep `GPU_MAX_HW_QUEUES` at 2 (setup writes it); 1, which R9700 guides suggest, cuts
+  the prompts by a third ([docs/amd](amd/README.md#3-environment-variables)).
 - **A discrete Radeon on a Ryzen AI Max:** the iGPU computes the RAM-tier experts as it does beside an NVIDIA card
   (+12-46% decode on the R9700); the config's `"gpu_pci"` keeps the right card when HIP numbers the GPUs otherwise.
 - **What is faster:** the indexer's scores and the prompt attention use RDNA's WMMA (gfx11 / gfx12).
@@ -434,16 +437,22 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_CPU_PIN` | off | `<CPU list>` (e.g. `0-15`, `0,2,4-7`): pin the CPU lane's workers to those CPUs and cap their count at the list's size, one GPU or a split, Linux and Windows (v1.3.29); `1` / `0`: a split's per-part pools pinned or not, as before |
 | `STRATA_GLM_PCIE_SHARE` | measured at start | the share of RAM-tier experts copied over PCIe instead of computed on the CPU (`0` = all on the CPU, `1` = none) |
 | `STRATA_GLM_PREFILL` / `--prefill` | `auto` | the prompt chunk: `auto`, a number of tokens, or `0` (token by token) |
+| `STRATA_GLM_PREFILL_SUB` | auto (NVIDIA), 1024 (HIP) | the prompt's mixer and dense-FFN sub-batch (16-8192). HIP's default 1024 since v1.3.40 (it was 256: AI PRO R9700 DeepSeek V4 8K / 16K prompts +8% / +10%, GLM-5.3-Flash +13% / +15%) |
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | your expert usage between starts; `0` = off |
 | `STRATA_GLM_NO_REUSE` | off | `1`: no conversation reuse |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | (server) tokens a thinking block always leaves for the answer |
+| `GPU_MAX_HW_QUEUES` | 2 (HIP) | ROCm's hardware queues a device: the server passes 2 when neither the shell nor the config sets it (v1.3.40). AI PRO R9700 DeepSeek V4 prompts 8K / 16K: 586-650 / 676-684 tok/s on 1 (a value R9700 guides spread against a MES firmware's idle power; 12 W idle here either way), 653-737 / 748-756 on ROCm's 4, 866-995 / 999-1,011 on 2 |
 | `STRATA_GLM_IGPU` | auto | the iGPU lane: on when `libabyss_igpu.so` and a HIP device are there and it is faster than the CPU; `0` off, `1` on even when slower. `STRATA_GLM_IGPU_LIB=<path>`: another library |
 | `STRATA_GLM_IGPU_TIMEOUT_MS` | 20 | a lane call later than this goes to the CPU threads (0: wait) |
+| `STRATA_GLM_IGPU_POKE_MS` | 500 | how long after a route the service thread keeps the iGPU busy with a no-op kernel every 50 us (v1.3.40; was 20). DeepSeek V4.1 waits on the SSD between routes for longer than 20 ms, and an idle iGPU then took 21-27 ms to answer (AI PRO R9700 + 8060S, the slowest held-out sequence: 123 late calls and 80.4 ms a token; 500: 3 calls, 65.6 ms) |
 | `STRATA_GLM_IGPU_EARLY` | on | a route that reads experts from the SSD starts its iGPU lane before the reads instead of after them (v1.3.36; DeepSeek V4.1 -2%, same logits); `0`: after |
 | `STRATA_GLM_IGPU_XQ` | on | the lane takes the token's input already quantized (q8_1) by the GPU from the request instead of quantizing it again (v1.3.36, bit-identical); `0`: quantized on the iGPU |
 | `STRATA_GLM_PREFILL_IGPU` | on | the prompt's RAM-tier experts on the iGPU; `0`: the CPU threads |
 | `STRATA_GLM_IGPU_FUSED` | on | the prompt's iGPU experts through the fused int8 tensor-core pass (gfx1151, IQ2_XS / IQ3_XXS experts at 4096 / 2048; v1.3.18); `0`: the one-row kernels. `ABYSS_IGPU_FUSED_CHECK=<n>` compares the first n calls against them (stderr) |
 | `STRATA_GLM_MV_SPLIT` | auto | dense GEMVs with a row over 4 warps: unset = under 256 blocks, and Q6_K up to 4,096 blocks (v1.3.18); `0` one warp a row always, `2` / `4` that split always. Not bit-identical to one warp a row |
+| `STRATA_GLM_MV_FUSE` | on (HIP) | a small GEMV call of several types (DeepSeek V4's projections of x) in one launch, 4 waves a row (v1.3.40; a small GEMV costs 15-29 us on an AI PRO R9700 whatever its size); `0`: a launch per type. Not bit-identical to the typed kernels |
+| `STRATA_GLM_GRID_PAD` | on (HIP) | launches whose waves land at or just below a multiple of the GPU's wave slots get a few empty blocks (v1.3.40): on gfx1201 such a dispatch delays the next one by 8-14 us (ROCm/TheRock#9300), and DeepSeek V4's 4096-row GEMVs and expert down hit it ~275 times a token (AI PRO R9700: 22.2 -> 20.2 ms a token). Bit-identical; `0` off |
+| `STRATA_HIP_EXPERTS_LEGACY` | off | `1`: the original decode expert kernels instead of the RDNA ones (gfx1100, gfx1201 since v1.3.40: gate/up and down ~20% faster on an AI PRO R9700; gfx1151 all but the IQ3_XXS down). Bit-identical either way |
 | `STRATA_GLM_PROMOTE_RATIO` / `_MARGIN` | 4 / 16 | a RAM-tier expert replaces a resident one when its use count passes ratio x the resident's + margin (2 / 4: the old, churnier rule) |
 | `STRATA_GLM_BG_PACE_KB` | 1024 | the tier moves' copies (the refill after a prompt, the swaps) go in pieces of up to this many KB a MoE layer, while the next layer's mixer runs, instead of all at the token boundary - there they held up the next token's host-mapped reads until they had landed (after an 8K prompt ~10 tokens at 35-39 ms). `0`: at the boundary, as before |
 | `STRATA_GLM_ZERO_COPY` | on | the token boundary without the copy engines (v1.3.21): the table edits, the embedding row (a pinned copy of `token_embd`, Q8_0 / Q5_K) and the token are read and written host-mapped by the kernels. `0`: the copies, as before |
@@ -467,6 +476,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_DS4_SPEC` | 1 (on) | speculative decoding from the prompt and the answer: draft tokens a step (1-3; 1 is the fastest measured); `0` off |
 | `STRATA_DS4_SPEC_GATE` | on | drop a draft while the request's acceptance does not pay for the verify window; `0`: always draft |
 | `STRATA_DS4_SPEC_MIN` | 3 | the tokens a draft's lookup matches (2-4) |
+| `STRATA_DS4_SPEC_PIPE` | auto (HIP), 1 (NVIDIA) | the verify window: `1` pipelined (a token a stream, the lane's wait overlapped), `0` batched (the dense weights read once for the window), `auto`: the first windows time both (3 each) and the faster stays (v1.3.40; the HIP default - not yet checked on an NVIDIA card). An RTX 5090 + iGPU: pipelined (swe-bench 90 against 73 tok/s); an AI PRO R9700 + iGPU: batched (2-token windows 30.6 against 44.5 ms with one hardware queue) |
 
 `--max-context` sets the context. DeepSeek V4 is trained for 1M tokens; 65536 is the default and 131072 (a 125K
 prompt) has been measured. The attention caches are small (0.44 GB at 65536), but the prompt path's buffers grow with

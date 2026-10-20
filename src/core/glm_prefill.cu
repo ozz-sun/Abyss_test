@@ -301,7 +301,7 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
 // the mixers' and the dense FFN's sub-batch for chunks of T tokens: kSub, doubled (up to 4096) while their buffers
 // stay within what the chunk's MoE buffers take of the union anyway - no extra memory, fewer and larger GEMMs, and
 // each projection dequantized to FP16 once a sub-batch instead of once every 256 tokens (a 14.8K chunk: 58 -> 4).
-// sub_env (STRATA_GLM_PREFILL_SUB, 16-8192) sets every sub-batch instead; HIP keeps kSub without it.
+// sub_env (STRATA_GLM_PREFILL_SUB, 16-8192) sets every sub-batch instead; HIP sets it by default (prefill_sub_env).
 int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, bool moe, int max_pools, int sub_env) {
     if (sub_env > 0) return sub_env;
 #if defined(STRATA_USE_HIP)
@@ -320,6 +320,19 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
         ts = t2;
     }
     return ts;
+#endif
+}
+
+// STRATA_GLM_PREFILL_SUB (16-8192): every sub-batch.  HIP without it: 1024 - mixer_sub keeps 256 there, which left an
+// AI PRO R9700's 64 CUs short on the dense prompt projections (DeepSeek V4 8K / 16K prompts 454 / 599 -> 491 / 659
+// tok/s, GLM-5.3-Flash Maya-S-v2 448 / 569 -> 505 / 655; 2048 and 4096 no faster); setup wrote 1024 into the configs of
+// 20 GB+ Radeons and APUs already
+int prefill_sub_env() {
+    if (const char* v = getenv("STRATA_GLM_PREFILL_SUB")) return std::clamp(std::atoi(v), 16, 8192);
+#if defined(STRATA_USE_HIP)
+    return 1024;
+#else
+    return 0;
 #endif
 }
 
@@ -423,9 +436,11 @@ struct Glm5Model::PrefillState {
         pn = 0;
     }
     uint64_t staged_ram = 0, staged_vram = 0, staged_disk = 0, rows_resident = 0, rows_staged = 0, disk_issued = 0;
-    // the prompt's CPU experts: x and the rows' tokens down, the outputs up, on their own stream
+    // the prompt's CPU experts: x and the rows' tokens down, the outputs up, on their own stream.  ev_xd: xs's copies
+    // done - the host waits for it, not for the stream (HIP on an AI PRO R9700 runs every stream in one hardware queue,
+    // and a stream's synchronize there waited out the layer's whole PCIe staging queued after: ~120-150 ms a layer)
     cudaStream_t xs = nullptr;
-    cudaEvent_t ev_x = nullptr, ev_out = nullptr;
+    cudaEvent_t ev_x = nullptr, ev_out = nullptr, ev_xd = nullptr;
     float* x_h = nullptr;
     size_t x_h_n = 0;
     int* rt_h = nullptr;
@@ -638,8 +653,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     S->has_dense = has_dense;
     S->has_moe = has_moe;
     S->max_pools = (int) std::max<int64_t>(1, max_ctx_ / g.idx_kpool);
-    if (const char* v = getenv("STRATA_GLM_PREFILL_SUB"))
-        S->sub_env = std::clamp(std::atoi(v), 16, 8192);
+    S->sub_env = prefill_sub_env();
     S->prof = getenv("STRATA_GLM_PREFILL_PROF") != nullptr;
     S->gstride = gstride;
 
@@ -962,8 +976,7 @@ std::pair<size_t, size_t> Glm5Model::prefill_bytes_for(size_t T) const {
 size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa, bool has_dense,
                               bool has_moe, bool mtp, int64_t max_ctx, size_t gstride) {
     const int max_pools = (int) std::max<int64_t>(1, max_ctx / g.idx_kpool);
-    int sub_env = 0;
-    if (const char* v = getenv("STRATA_GLM_PREFILL_SUB")) sub_env = std::clamp(std::atoi(v), 16, 8192);
+    const int sub_env = prefill_sub_env();
     const auto pu = chunk_bytes(g, T, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env, mtp);
     const auto ws = weight_scratch(g, has_dsa);
     Carve c;
@@ -1314,6 +1327,7 @@ void Glm5Model::prefill_destroy() {
     if (S->out_h) cudaFreeHost(S->out_h);
     if (S->ev_x) cudaEventDestroy(S->ev_x);
     if (S->ev_out) cudaEventDestroy(S->ev_out);
+    if (S->ev_xd) cudaEventDestroy(S->ev_xd);
     if (S->ev_c0) cudaEventDestroy(S->ev_c0);
     if (S->ev_c1) cudaEventDestroy(S->ev_c1);
     for (auto e : S->ev_pdone)
@@ -1853,7 +1867,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (S->xs == nullptr)
             ok = cudaStreamCreateWithFlags(&S->xs, cudaStreamNonBlocking) == cudaSuccess &&
                  cudaEventCreateWithFlags(&S->ev_x, cudaEventDisableTiming) == cudaSuccess &&
-                 cudaEventCreateWithFlags(&S->ev_out, cudaEventDisableTiming) == cudaSuccess;
+                 cudaEventCreateWithFlags(&S->ev_out, cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&S->ev_xd, cudaEventDisableTiming) == cudaSuccess;
         // (the iGPU reads x and the rows' tokens and writes the outputs in place: registered with it)
         const auto unreg = [&](const void* p) {
             if (p == nullptr) return;
@@ -2438,6 +2453,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 cudaMemcpyAsync(S->x_h, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
             }
             cudaMemcpyAsync(S->rt_h, M.row_tok + cpu_r0, (size_t) cpu_nrows * sizeof(int), cudaMemcpyDeviceToHost, S->xs);
+            cudaEventRecord(S->ev_xd, S->xs);   // (what the host lane waits for: xs's copies, ev_xd)
         }
         S->mark("plan", s);
         S->ms_plan += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
@@ -2845,7 +2861,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (S->c_act.size() < (size_t) cpu_nrows * kA) S->c_act.resize((size_t) cpu_nrows * kA);
             if (S->c_hq.size() < (size_t) cpu_nrows * kH) S->c_hq.resize((size_t) cpu_nrows * kH);
             if (S->c_ff.size() < (size_t) cpu_nrows * nff) S->c_ff.resize((size_t) cpu_nrows * nff);
-            if (!glmfast::cuda_ok(cudaStreamSynchronize(S->xs), "glm prompt CPU rows", err)) return false;
+            if (!glmfast::cuda_ok(cudaEventSynchronize(S->ev_xd), "glm prompt CPU rows", err)) return false;
             const int ncx = (int) cpu_set.size();
             std::vector<int> r_of((size_t) ncx);   // each expert's first row in the CPU segment
             for (int j = 0; j < ncx; ++j) r_of[(size_t) j] = S->h_base[cpu_set[(size_t) j].e] - cpu_r0;

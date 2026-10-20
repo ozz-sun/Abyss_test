@@ -701,7 +701,8 @@ __attribute__((visibility("default"))) int abyss_igpu_rows(int gu_type, int d_ty
     // ABYSS_IGPU_FUSED_CHECK=<n>: the first n fused calls are also computed by the row kernels and compared (stderr).
     namespace fz = abyss::igpu_fused;
     static const int chk = [] { const char* v = getenv("ABYSS_IGPU_FUSED_CHECK"); return v != nullptr ? std::atoi(v) : 0; }();
-    bool fused = fz::available(0) && fz::supported(gu_type, d_type, n_embd, n_ff) && ld == n_embd && n_tok > 0 &&
+    // (L.dev, not 0: beside a HIP engine on a discrete Radeon, HIP's device 0 is that card)
+    bool fused = fz::available(L.dev) && fz::supported(gu_type, d_type, n_embd, n_ff) && ld == n_embd && n_tok > 0 &&
                  r0[0] == rlo && (((uintptr_t) od & 15) == 0);
     const size_t gu_row = fz::row_bytes(gu_type, n_embd);
     if (fused && down_off != 2 * (size_t) n_ff * gu_row) fused = false;   // (gate rows, up rows, then down: the lane's layout)

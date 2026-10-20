@@ -88,6 +88,9 @@ struct VerifyBuf {
     void* scr = nullptr;
     size_t hpart_n = 0, hq_n = 0, score_n = 0;
     bool pipe = false;                        // the per-column scratch slots allocated: the pipelined window possible
+    bool pipe_now = true;                     // this window pipelined (verify's choice, STRATA_DS4_SPEC_PIPE)
+    int pipe_choice = -1;                     // (the first part's) the kind kept on this machine: -1 still timing both
+    std::vector<double> ms_pipe, ms_batch;    // ... the timed windows' ms a token of each kind
     cudaStream_t st[4] = {};                  // column t's stream (st[0]: the compute stream)
     cudaEvent_t ev_attn[4] = {}, ev_route[4] = {}, ev_fin[4] = {}, ev_start = nullptr;
     cudaEvent_t done = nullptr;
@@ -458,6 +461,30 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
     auto* V = (VerifyBuf*) vb_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
+    // the window's kind: STRATA_DS4_SPEC_PIPE=1 pipelined, 0 batched (2: pipelined on one stream, debug), auto: the
+    // faster on this machine - the first windows alternate, 3 of each, then the kind with the lower median time a token
+    // stays.  Unset: auto on HIP, pipelined on NVIDIA (the timing is not checked on an NVIDIA card yet).  An RTX 5090 +
+    // iGPU lane: pipelined (90 against 73 tok/s on swe-bench prompts).  An AI PRO R9700 + iGPU lane: batched (2-token
+    // windows 30.6 against 44.5 ms, swe-bench 6 tasks 42 -> 46-50 tok/s) - HIP put every stream in one hardware queue,
+    // so the pipelined window's tokens ran one after another, each reading the dense weights
+    static const int pipe_env = [] {
+        const char* v = getenv("STRATA_DS4_SPEC_PIPE");
+        if (v != nullptr) return std::strcmp(v, "auto") == 0 ? -1 : std::atoi(v);
+#if defined(STRATA_USE_HIP)
+        return -1;
+#else
+        return 1;
+#endif
+    }();
+    bool timed = pipe_env < 0 && V->pipe_choice < 0 && T > 1 && !F->prof_on;
+    const bool use_pipe = pipe_env >= 0 ? pipe_env != 0
+                        : V->pipe_choice >= 0 ? V->pipe_choice != 0
+                        : V->ms_pipe.size() <= V->ms_batch.size();   // (timing: alternate, pipelined first)
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        auto* VM = (VerifyBuf*) m->vb_;
+        VM->pipe_now = use_pipe;
+        timed = timed && VM->pipe;   // (no scratch slots: every window is batched)
+    }
     const int64_t p0 = pos_;
     pos_ += T;
     const bool gp = F->gap_on && split_next_ == nullptr;   // (as the token path: one device's events)
@@ -517,7 +544,23 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         err = "deepseek4 verify: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
         return false;
     }
-    F->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    F->ms += wms;
+    if (timed) {   // (the window kind still being timed: this one's ms a token; 3 of each decide)
+        (use_pipe ? V->ms_pipe : V->ms_batch).push_back(wms / T);
+        if (V->ms_pipe.size() >= 3 && V->ms_batch.size() >= 3) {
+            const auto median = [](std::vector<double> v) {
+                std::sort(v.begin(), v.end());
+                return v[v.size() / 2];
+            };
+            const double mp = median(V->ms_pipe), mb = median(V->ms_batch);
+            V->pipe_choice = mp <= mb ? 1 : 0;
+            std::fprintf(stderr, "deepseek4 verify: the %s window here (%.1f ms a token against %.1f %s) - kept "
+                                 "(STRATA_DS4_SPEC_PIPE=0 batched, 1 pipelined)\n",
+                         V->pipe_choice ? "pipelined" : "batched", std::min(mp, mb), std::max(mp, mb),
+                         V->pipe_choice ? "batched" : "pipelined");
+        }
+    }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_->prof_on) {
             cudaSetDevice(m->dev_);
@@ -575,13 +618,9 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
         gf::hc_defer_add(V->md[(size_t) t], V->post_defer + (size_t) t * 8, g.n_embd, Rc[(size_t) t], hs);
     };
     // STRATA_GLM_PROF (as the token path's): the window's phases, marked v<T>_* so the two kinds stay apart
-    // the pipelined window (STRATA_DS4_SPEC_PIPE, default on; not with PROF - its marks are one stream's)
-    static const bool pipe_env = [] {
-        const char* v = getenv("STRATA_DS4_SPEC_PIPE");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    // the pipelined window (verify's choice, V->pipe_now; not with PROF - its marks are one stream's)
     static const bool pipe_env1 = getenv("STRATA_DS4_SPEC_PIPE") != nullptr && std::atoi(getenv("STRATA_DS4_SPEC_PIPE")) == 2;
-    const bool pipe = pipe_env && V->pipe && T > 1 && !F->prof_on;
+    const bool pipe = V->pipe_now && V->pipe && T > 1 && !F->prof_on;
     const bool prof = F->prof_on;
     const std::string vt = "v" + std::to_string(T) + "_";
     static std::vector<std::string> names;   // (mark keeps the pointer)

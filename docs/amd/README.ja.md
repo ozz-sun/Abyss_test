@@ -153,6 +153,19 @@ Windows での違い:
   見つかった行はコメントアウトして、ログインし直してください。
 - `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` も、普段は設定しないでください。Abyss のサーバーが、設定ファイル
   の GPU からエンジンに渡す値を決めます。
+- **`GPU_MAX_HW_QUEUES` は Abyss に任せて 2 にしてください。** R9700 向けの手順には、MES ファームウェアの不具合で
+  アイドル時の電力が下がらない問題の回避策として `export GPU_MAX_HW_QUEUES=1` を勧めるものがあります。1 にすると、
+  エンジンのストリームがすべて 1 本の HW キューに載り、あるストリームを待つと他のストリームの仕事まで待つことに
+  なります。上の PC での DeepSeek V4 の 8K / 16K の prompt は、1 で 586〜650 / 676〜684 tok/s、ROCm の既定（4）で
+  653〜737 / 748〜756、2 で 866〜995 / 999〜1,011 tok/s でした。decode は同じです。エンジンを読み込んだ状態の
+  アイドル時の電力は、1 でも 2 でも 12 W でした。セットアップは設定ファイルに `"GPU_MAX_HW_QUEUES": "2"` を書き、
+  サーバーはシェルにも設定ファイルにも値がなければ 2 を渡します。2 でアイドル時の電力が下がらない場合（古い
+  ファームウェア）は、設定ファイルの `env` に `"GPU_MAX_HW_QUEUES": "1"` を書いてください。
+
+  ```sh
+  grep -rn GPU_MAX_HW_QUEUES ~/.bashrc ~/.profile /etc/profile.d/ /etc/environment 2>/dev/null
+  amd-smi metric -g 0 -p    # エンジンを読み込んだまま、アイドル時のカードの電力
+  ```
 
 ## 4. 動作確認
 
@@ -235,8 +248,8 @@ HIP の番号は、起動時にドライバが GPU を見つけた順（KFD の�
 
 ## 7. 速度の目安
 
-R9700 + Radeon 8060S（iGPU レーン）、RAM 94 GB、swe-bench の 6 問の生成速度（tok/s）です。測り方は
-`bench/model_gpu_cmp.sh` です。
+R9700 + Radeon 8060S（iGPU レーン）、RAM 94 GB、swe-bench の 6 問の生成速度（tok/s）です。v1.3.39 で
+`bench/model_gpu_cmp.sh` を使って測りました。
 
 | モデル | CPU レーン | iGPU レーン | 8K / 16K の prompt |
 |---|---|---|---|
@@ -245,9 +258,15 @@ R9700 + Radeon 8060S（iGPU レーン）、RAM 94 GB、swe-bench の 6 問の生
 | GLM-5.3-Flash Maya-S-v2 | 25.8 | 35.8 | 418 / 541 |
 | GLM-5.3-Flash Maya-S24 | 28.2 | 41.2 | 433 / 562 |
 
-- **精度:** CUDA 版を基準にした KL は 0.0052 で、CUDA 版どうしのぶれ（0.0057〜0.0060）と同じ水準です。
-- **生成速度:** RTX 5090 + iGPU の 0.42〜0.58 倍、RTX 3090 + iGPU の 0.73〜0.91 倍です。
-- **prompt:** 5090 の 0.2〜0.4 倍です。HIP の prompt 経路（MMQ / hipBLASLt）は改善の途中です。
+v1.3.40（HW キュー 2 本、gfx1201 向けのカーネル）では、DeepSeek V4 UD-Q2_K_XL の 8K / 16K の prompt が
+866〜995 / 999〜1,011 tok/s、1 token ずつの生成が iGPU レーンありで 52.2〜52.9 tok/s、なしで 41.8〜42.8 tok/s
+です（v1.3.39 はレーンありで 44.7〜45.5）。GLM-5.3-Flash Maya-S-v2 の prompt は 644〜716 / 797〜843 で、生成は
+変わりません。
+
+- **精度:** CUDA 版の基準に対する KL は 0.0059 です（v1.3.39 は 0.0052。小さい GEMV のまとめ起動で足し算の順番が
+  変わったため）。CUDA 版どうしのぶれ（0.0057〜0.0060）と同じ水準です。
+- **生成速度:** RTX 5090 + iGPU の 0.42〜0.58 倍、RTX 3090 + iGPU の 0.73〜0.91 倍です（v1.3.39）。
+- **prompt:** 5090 の 0.4〜0.5 倍です（v1.3.40。v1.3.39 は 0.2〜0.4 倍）。
 
 ## 8. うまくいかないとき
 
@@ -263,3 +282,5 @@ R9700 + Radeon 8060S（iGPU レーン）、RAM 94 GB、swe-bench の 6 問の生
 | （Windows）ビルドが `__device__ function 'isgreater' cannot overload ...` で止まる | MSVC 14.51 と TheRock 7.14.1 の衝突 | [AMD HIP（Maya）](../maya/AMD_HIP.md) の「Windows 11」の手順でヘッダを直す（[issue #2](https://github.com/zephel01/Abyss/issues/2) にスクリプトがある） |
 | （Windows）RAM が空いているのに、エキスパートが SSD から読まれる | ページファイルが小さく、コミット上限に当たっている | 「Windows」の「RAM の扱い」の設定 |
 | ビルドが `ROCm's HIP compiler ... and hipBLAS are required` で止まる | 開発用パッケージがない、または `/opt/rocm` が別の版を指している | `amdrocm-core-dev10.0-<arch>` を入れる。または `ROCM_PATH=/opt/rocm/core-10.0` を設定する |
+| prompt が「7. 速度の目安」よりかなり遅い（R9700 で DeepSeek V4 の 16K の prompt が約 1,000 ではなく約 680 tok/s） | シェルの `GPU_MAX_HW_QUEUES=1`（R9700 向けの手順の設定）がエンジンに渡っていて、設定ファイルで上書きしていない | 設定ファイルの `env` に `"GPU_MAX_HW_QUEUES": "2"`（セットアップは書く）。「3. 環境変数」を参照 |
+| DeepSeek V4.1 で、エンジンのログに `iGPU lane: the late call ran 21-27 ms` が多い | エンジンが SSD を待っている間に iGPU が寝ていた（v1.3.40 より前は、ルーティングから 20 ms で keep-alive が止まっていた） | 更新する。または `STRATA_GLM_IGPU_POKE_MS=500` |

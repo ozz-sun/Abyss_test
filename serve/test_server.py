@@ -396,6 +396,20 @@ class GpuChoice(unittest.TestCase):
         with mock.patch.object(server, "amd_igpu_index", return_value=None):
             self.assertEqual(server.child_env({"gpu": [0], "backend": "hip"})["HIP_VISIBLE_DEVICES"], "0")
 
+    def test_hip_hw_queues(self):
+        """HIP engines get two hardware queues unless the shell or the config sets them (R9700 prompts +33-48%)."""
+        from unittest import mock
+        from serve import server
+        with mock.patch.object(server, "amd_igpu_index", return_value=None):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("GPU_MAX_HW_QUEUES", None)
+                self.assertEqual(server.child_env({"gpu": [0], "backend": "hip"})["GPU_MAX_HW_QUEUES"], "2")
+                own = {"gpu": [0], "backend": "hip", "env": {"GPU_MAX_HW_QUEUES": "4"}}
+                self.assertEqual(server.child_env(own)["GPU_MAX_HW_QUEUES"], "4")   # the config's wins
+                self.assertNotIn("GPU_MAX_HW_QUEUES", server.child_env({"gpu": [0]}))   # CUDA: untouched
+            with mock.patch.dict(os.environ, {"GPU_MAX_HW_QUEUES": "1"}):
+                self.assertEqual(server.child_env({"gpu": [0], "backend": "hip"})["GPU_MAX_HW_QUEUES"], "1")   # the shell's
+
     def test_amd_igpu_index(self):
         import tempfile
         from serve.server import amd_igpu_index

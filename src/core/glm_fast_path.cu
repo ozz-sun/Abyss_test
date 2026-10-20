@@ -3138,6 +3138,14 @@ void Glm5Model::fast_service() {
     }();
     auto last_route = std::chrono::steady_clock::now();
     auto igpu_route = last_route, igpu_poked = last_route;   // the iGPU lane's keep-alive (below)
+    // ... for how long after a route: STRATA_GLM_IGPU_POKE_MS (500; it was 20).  DeepSeek V4.1 waits on the SSD
+    // between routes for longer than 20 ms, and the idle iGPU then took 21-27 ms to answer its next call (the CPU lane
+    // took over): V4.1 Q2 on an AI PRO R9700 + 8060S, the slowest held-out sequence, 433 such calls and 136 ms a token;
+    // 500 ms: 3 calls, 65.6 ms (the same sequence with 2 hardware queues and 20 ms: 123 calls, 80.4 ms)
+    static const auto poke_win = std::chrono::milliseconds([] {
+        const char* v = getenv("STRATA_GLM_IGPU_POKE_MS");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 500;
+    }());
     int idle = 0;                        // 0 spinning, 1 short sleeps, 2 long sleeps
     unsigned int polls = 0;
     // STRATA_GLM_SVC_STAT=1 (investigation): where this thread's time goes per route - from seeing the request to
@@ -3148,6 +3156,7 @@ void Glm5Model::fast_service() {
     struct SvcStat {
         uint64_t n = 0, pre_us = 0, pre_max = 0, lane_us = 0, lane_max = 0, post_us = 0, post_max = 0;
         uint64_t gaps = 0, gap_us = 0, gap_max = 0, iters = 0;
+        uint64_t ne_n[9] = {}, ne_us[9] = {};   // the lane's calls by their expert count
     } ss;
     auto last_iter = std::chrono::steady_clock::now();
     auto t_seen = last_iter;
@@ -3210,11 +3219,10 @@ void Glm5Model::fast_service() {
                             ss.gap_max = std::max(ss.gap_max, g);
                         }
                     }
-                    // the iGPU lane: a no-op kernel every 50 us within 20 ms of a route keeps its clocks up
+                    // the iGPU lane: a no-op kernel every 50 us within poke_win of a route keeps its clocks up
                     if (F->igpu_poke != nullptr && (polls & 63u) == 0) {
                         const auto now = std::chrono::steady_clock::now();
-                        if (now - igpu_poked > std::chrono::microseconds(50) &&
-                            now - igpu_route < std::chrono::milliseconds(20)) {
+                        if (now - igpu_poked > std::chrono::microseconds(50) && now - igpu_route < poke_win) {
                             F->igpu_poke();
                             igpu_poked = now;
                         }
@@ -3651,6 +3659,8 @@ void Glm5Model::fast_service() {
                 ss.pre_us += pre; ss.pre_max = std::max(ss.pre_max, pre);
                 ss.lane_us += lane; ss.lane_max = std::max(ss.lane_max, lane);
                 ss.post_us += post; ss.post_max = std::max(ss.post_max, post);
+                ss.ne_n[std::min(ne, 8)] += 1;
+                ss.ne_us[std::min(ne, 8)] += lane;
                 if (ss.n % 4096 == 0) {
                     std::fprintf(stderr, "svc stat CUDA%d: %llu routes | seen->lane %.1f us (max %llu) | lane %.1f us (max %llu) | "
                                          "lane->answer %.1f us (max %llu) | spin iterations %llu, > 20 us: %llu (%.1f%%), "
@@ -3661,6 +3671,12 @@ void Glm5Model::fast_service() {
                                  (unsigned long long) ss.post_max, (unsigned long long) ss.iters,
                                  (unsigned long long) ss.gaps, 100.0 * (double) ss.gaps / (double) std::max<uint64_t>(1, ss.iters),
                                  (double) ss.gap_us / 1000.0, (unsigned long long) ss.gap_max);
+                    std::string by;
+                    for (int k = 1; k <= 8; ++k)
+                        if (ss.ne_n[k] > 0)
+                            by += " " + std::to_string(k) + ": " + std::to_string(ss.ne_n[k]) + " x " +
+                                  std::to_string((int) (ss.ne_us[k] / ss.ne_n[k])) + " us";
+                    std::fprintf(stderr, "svc stat CUDA%d: the lane's calls by their experts:%s\n", dev_, by.c_str());
                     ss = SvcStat{};
                 }
                 last_iter = t2;

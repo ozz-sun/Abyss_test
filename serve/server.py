@@ -973,6 +973,10 @@ def child_env(cfg: dict) -> dict:
         if igpu is not None and igpu not in gpus:
             gpus = gpus + [igpu]
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpus)
+        # two hardware queues a device unless the shell or the config says otherwise: an AI PRO R9700's DeepSeek V4
+        # prompts 8K / 16K ran 586-650 / 676-684 tok/s on 1 (a setting R9700 guides spread against a MES firmware's
+        # idle power; the same 12 W idle here either way), 653-737 / 748-756 on ROCm's 4 and 866-995 / 999-1,011 on 2
+        env.setdefault("GPU_MAX_HW_QUEUES", "2")
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
