@@ -19,11 +19,12 @@ void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 /// then an add (MSVC's) - set from native_expert.cpp's check against this build's ggml-cpu.
 void iq512_set_q5k_fused(bool fused) noexcept;
 
-/// One token (iq_avx512_1t.cpp): IQ2_XXS (16) / IQ2_XS (17) / IQ3_XXS (18) / IQ2_S (22) rows with the grid looked up in registers, bit-identical to
-/// ggml-cpu's dot; needs cpu_avx512_ok() (VNNI, VBMI).  iq512_rows1_ready() builds its tables on the first call.
-bool iq512_rows1_supported(int ggml_type) noexcept;
-bool iq512_rows1_ready() noexcept;
-void iq512_rows1(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+/// iq_avx512_vbmi.cpp: IQ2_XXS (16) / IQ2_XS (17) / IQ3_XXS (18) / IQ2_S (22) rows for 1+ tokens with the grid looked
+/// up in registers, each token bit-identical to ggml-cpu's dot; needs cpu_avx512_ok() (VNNI, VBMI).  iq512v_ready()
+/// builds its tables on the first call.
+bool iq512v_supported(int ggml_type) noexcept;
+bool iq512v_ready() noexcept;
+void iq512v_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                  float* const* out, int r0, int r1);
 
 }  // namespace strata::kernels::cpu

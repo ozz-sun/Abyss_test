@@ -259,6 +259,11 @@ v1.3.40 (two hardware queues, the gfx1201 kernels): DeepSeek V4 UD-Q2_K_XL promp
 tok/s, decode one token at a time 52.2-52.9 tok/s with the iGPU lane and 41.8-42.8 without it (v1.3.39: 44.7-45.5
 with the lane); GLM-5.3-Flash Maya-S-v2 prompts 644-716 / 797-843, decode unchanged.
 
+v1.3.41 (the CPU lane's IQ2 / IQ3 rows in AVX-512): without the iGPU lane, decode one token at a time 46.1-46.5 tok/s
+(v1.3.40: 41.8-42.8) and the 6 swe-bench tasks with drafts 49.6 tok/s, against 51.7 with the lane (v1.3.39: 36.4 /
+42.4) - a PC without an iGPU is now 4% behind on those tasks (12% one token at a time). Prompts without the lane: 8K /
+16K 844 / 977-1,026 tok/s, about the same as with it.
+
 - **Accuracy:** KL against the CUDA build's reference is 0.0059 (0.0052 in v1.3.39, before the one-launch GEMVs), the
   same level as the spread between two CUDA runs (0.0057-0.0060).
 - **Decode:** 0.42-0.58x an RTX 5090 + iGPU, and 0.73-0.91x an RTX 3090 + iGPU (v1.3.39).

@@ -159,8 +159,8 @@ int main() {
         if (avx512) check_kernel("avx512", cpu::iq512_rows, cpu::iq512_set_q5k_fused, t, rng);
         if (avx2) check_kernel("avx2", cpu::iq256_rows, cpu::iq256_set_q5k_fused, t, rng);
         if (avx2 && cpu::iq256_rows1_supported(t)) check_kernel("avx2-1t", cpu::iq256_rows1, cpu::iq256_set_q5k_fused, t, rng);
-        if (cpu::cpu_avx512_ok() && cpu::iq512_rows1_supported(t) && cpu::iq512_rows1_ready())
-            check_kernel("avx512-1t", cpu::iq512_rows1, cpu::iq512_set_q5k_fused, t, rng);
+        if (cpu::cpu_avx512_ok() && cpu::iq512v_supported(t) && cpu::iq512v_ready())
+            check_kernel("avx512-vbmi", cpu::iq512v_rows, cpu::iq512_set_q5k_fused, t, rng);
     }
     for (int t : types) check_split(t, rng);
     if (failures != 0) {

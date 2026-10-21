@@ -7,6 +7,37 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.41 - 2026-10-21
+
+**The CPU lane's IQ2 / IQ3_XXS rows in AVX-512 with the grids looked up in registers: decode on one GPU without an
+iGPU +8-10%, bit-identical.** Measured on an AI PRO R9700 (OCuLink, PCIe Gen4 x4) in a Ryzen AI Max+ 395 PC (Zen 5,
+16 cores, ~113 GB/s from RAM), DeepSeek V4 UD-Q2_K_XL unless named.
+- **Why:** without an iGPU the CPU threads compute the RAM-tier experts (the CPU lane). ggml-cpu's AVX2 dots for
+  these formats rebuild every weight from table lookups in memory, so the lane read ~65 GB/s of the RAM's ~113: a call
+  with one expert took 147 us, each more expert ~124 us.
+- **`src/kernels/cpu/iq_avx512_vbmi.cpp`** (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS, one token or several): the IQ2 grids
+  hold only the bytes 8 / 25 / 43 and IQ3_XXS's only 4, 12, ..., 52, 62, so each entry is a 16-bit code. The codes stay
+  in registers (IQ2_S's are read from L1) and vpermt2w looks 32 entries up at once; vpmultishiftqb + vpshufb turn them
+  into the grid bytes, vpermi2b turns the 7-bit sign indices into ksigns_iq2xs's masks, and maddubs + vpdpwssd take
+  ggml's integer steps. A block is decoded once for up to 4 tokens (verify windows, prompt chunks). Each token's
+  result is bit-identical to ggml-cpu's dot: checked against it at every start (a mismatch keeps v1.3.40's rows), and
+  `native_rows_exact_test` checks 1-11 tokens.
+- **An expert** (glm_cpu_bench): one thread 1,175 -> 665 us (an IQ2_XXS gate/up 848 -> 424); 16 threads 109 -> 90-102
+  us, memory-bound now (~89 GB/s).
+- **Decode without the iGPU lane, one token at a time:** 41.8-42.8 -> 46.1-46.5 tok/s; GLM-5.3-Flash Maya-S-v2 +6-9%,
+  DeepSeek V4 huihui Q2 +3-5%.
+- **swe-bench, 6 tasks with drafts** (temperature 1.0, +-5% run to run): 49.6 tok/s without the iGPU lane (v1.3.39:
+  36.4), 51.7 with it (v1.3.39: 42.4). Prompts without the lane 8K / 16K 844 / 977-1,026 tok/s, about as with it.
+- Needs AVX-512 with VNNI and VBMI (Zen 4 / Zen 5, Ice Lake and later: the check the other AVX-512 rows use); other
+  CPUs keep v1.3.40's rows. `STRATA_NO_IQ512_VBMI=1` turns these off.
+- KL against the reference, 1,000 tokens, with the CPU lane: 0.005687, the same as v1.3.40.
+- Measured and left out: more VRAM promotion churn (hits 77-79% but 40-43 tok/s: the PCIe copies hold up the lane's
+  host-mapped reads; 4/16 stays); HIP graphs (a launch costs 0.9-1.7 us on the host, and a kernel switch ~2.3 us on
+  the GPU either way: only fewer kernels would help). Expert deferral (`STRATA_GLM_DEFER=1`, lossy, off by default)
+  without the lane: 53.0-53.2 tok/s at KL 0.059 (the reference's top token 90% of the time, 97% off) - now in the
+  manual's row.
+- The CUDA build compiles; it was not run (no NVIDIA card attached). The CPU rows are the same code in both builds.
+
 ## v1.3.40 - 2026-10-21
 
 **AMD AI PRO R9700: prompts ~2x (ROCm's single hardware queue handled), decode +17% (gfx1201 kernels), the verify
