@@ -7,6 +7,42 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.42 - 2026-10-21
+
+**AMD (HIP) decode: the GPU waits for the CPU lane's answer with one poller, and two launches a layer fewer - DeepSeek
+V4 without an iGPU +2.5-3.6% a token, swe-bench +2.5%, bit-identical.** Measured on an AI PRO R9700 (OCuLink, PCIe Gen4
+x4) in a Ryzen AI Max+ 395 PC, DeepSeek V4 UD-Q2_K_XL unless named.
+- **Polling the answer slowed the CPU lane itself.** While the GPU waits for the CPU lane's answer it reads the
+  host-mapped answer over PCIe, and the CPU's memory serves every read while the lane reads its experts from it: 32
+  polling blocks made the lane's own time 7.46 -> 8.43 ms a token. One block polls the host now, the others wait on a
+  word in device memory (moe_cpu_wait, and hc3 below).
+- **The answer added inside the next layer's mHC read** (`STRATA_GLM_HC_CPU`, deepseek4): no wait kernel of its own -
+  hc3's 32 blocks read their 512 bytes each instead of the wait kernel's 8 blocks reading all 16 KB, and the paced
+  promotion copies still go out after the answer is read.  Single tokens and the verify window's columns.
+- **moe_wait and moe_fetch in one launch** (`STRATA_GLM_WAIT_FETCH`): a route without disk misses goes straight to the
+  copies; with misses, block 0 applies the host's response first and the other blocks wait for it.
+- The route's request x (16 KB into host memory) in 16-byte stores: 3.8 -> 1.6 us.
+- **Without the iGPU lane**, one token at a time, 6 alternating starts: prose 44.45 -> 46.05 tok/s (+3.6%), code 46.50
+  -> 47.65 (+2.5%); engine 22.51 / 21.51 -> 21.48 / 20.80 ms a token.  swe-bench 6 tasks with drafts (temperature
+  1.0, +-5% run to run): 47.2 -> 48.4 tok/s, windows 30.3 -> 29.5 ms, single tokens 22.9 -> 22.2.
+- **With the iGPU lane**, 2 alternating starts: prose 50.95 -> 51.85 tok/s, code 52.45 -> 53.65.
+- **The same results:** KL 0.005687 (CPU lane) / 0.005922 (iGPU lane) as in v1.3.41; greedy answers with drafts
+  (pipelined windows, gate off) identical to v1.3.41's; GLM-5.3-Flash Maya-S-v2's nll identical (1.64344 with the iGPU
+  lane, 1.63961 with the CPU lane, no speed change there); DeepSeek V4.1 (nazeshinjite Q2, 8 held-out sequences,
+  its SSD reads through the one-launch wait + fetch) KL 0.2280 against 0.2284 before (a run before v1.3.40's
+  keep-alive), 58.1 ms a token, 0-7 late iGPU calls a sequence.
+- HIP only by default: NVIDIA keeps the separate kernels (`STRATA_GLM_HC_CPU=1`, `STRATA_GLM_WAIT_FETCH=1` turn them on
+  there, not measured).  The CUDA build compiles; it was not run (no NVIDIA card attached).
+- Measured and left out: merging a verify window's CPU-lane requests (the pipelined window is GPU-bound: 29-31 ms a
+  window with the iGPU lane, 30-33 with the CPU lane); ROCm's dispatch settings (`HSA_ALLOCATE_QUEUE_DEV_MEM`,
+  `HIP_FORCE_DEV_KERNARG`, `ROC_SYSTEM_SCOPE_SIGNAL=0`, `DEBUG_CLR_AQL_DEV_QUEUE`, `AMD_DIRECT_DISPATCH=0`: a dependent
+  kernel takes ~3 us whatever); the CPU lane's threads (12-28 all ~90 us an expert: RAM-bound); huge pages for the RAM
+  tier (the CPU reads 120 GB/s either way); the answer pushed into VRAM through the 32 GB BAR (a round trip 16.7 ->
+  15.8 us).
+- Known, also before this version: answers can differ slightly between runs.  A token boundary makes a background tier
+  move live once its copy has landed (`cudaEventQuery`), so whether an expert runs on the GPU (q8_1) or on the CPU lane
+  (q8_K) at a given token depends on the copy's timing.
+
 ## v1.3.41 - 2026-10-21
 
 **The CPU lane's IQ2 / IQ3_XXS rows in AVX-512 with the grids looked up in registers: decode on one GPU without an

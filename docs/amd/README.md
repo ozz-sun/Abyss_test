@@ -264,6 +264,10 @@ v1.3.41 (the CPU lane's IQ2 / IQ3 rows in AVX-512): without the iGPU lane, decod
 42.4) - a PC without an iGPU is now 4% behind on those tasks (12% one token at a time). Prompts without the lane: 8K /
 16K 844 / 977-1,026 tok/s, about the same as with it.
 
+v1.3.42 (one poller for the CPU lane's answer, two launches a layer fewer): without the iGPU lane, one token at a
+time +2.5-3.6% (prose 44.5 -> 46.1, code 46.5 -> 47.7 tok/s) and swe-bench 47.2 -> 48.4 tok/s (the same afternoon);
+with the lane +2% (51.0 -> 51.9 / 52.5 -> 53.7). The same results as v1.3.41.
+
 - **Accuracy:** KL against the CUDA build's reference is 0.0059 (0.0052 in v1.3.39, before the one-launch GEMVs), the
   same level as the spread between two CUDA runs (0.0057-0.0060).
 - **Decode:** 0.42-0.58x an RTX 5090 + iGPU, and 0.73-0.91x an RTX 3090 + iGPU (v1.3.39).

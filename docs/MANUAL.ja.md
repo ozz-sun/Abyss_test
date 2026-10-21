@@ -445,6 +445,8 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 | `STRATA_GLM_MV_SPLIT` | auto | dense GEMV の 1 行を 4 warp で分担する: 未設定 = 256 block 未満と、Q6_K は 4,096 block まで（v1.3.18）。`0` 常に 1 warp、`2` / `4` 常にその分担。1 warp のときとビットは一致しない |
 | `STRATA_GLM_MV_FUSE` | on（HIP） | 型の違う小さな GEMV の組（DeepSeek V4 の x の射影）を 1 回の起動で、1 行 4 wave で計算する（v1.3.40。AI PRO R9700 では小さな GEMV が大きさによらず 1 回 15〜29 µs かかる）。`0`: 型ごとに起動。型ごとのカーネルとはビットが一致しない |
 | `STRATA_GLM_GRID_PAD` | on（HIP） | wave 数が GPU の wave スロット数の倍数ちょうどかその直前になる起動に、空のブロックを足す（v1.3.40）。gfx1201 ではそういう起動の次の起動が 8〜14 µs 遅れ（ROCm/TheRock#9300）、DeepSeek V4 の 4096 行の GEMV と expert の down が 1 token に約 275 回当たっていた（AI PRO R9700: 22.2 → 20.2 ms/token）。ビット一致。`0` で切る |
+| `STRATA_GLM_HC_CPU` | on（HIP）、off（NVIDIA） | deepseek4: MoE の層のうち CPU / iGPU レーンが計算した分を、専用の待ちカーネルではなく次の層の attention 側の mHC 読み出し（hc3）の中で足す（1 層あたり起動が 1 回減り、答えは hc3 の 32 ブロックで読む。v1.3.42）。ビット一致。`0` で待ちカーネル、NVIDIA でも `1` で有効（未測定） |
+| `STRATA_GLM_WAIT_FETCH` | on（HIP）、off（NVIDIA） | MoE の層のディスク読み込みの待ちと、RAM 層の expert のコピーを 2 回ではなく 1 回の起動で行う（v1.3.42。処理は同じ）。`0` で 2 回の起動 |
 | `STRATA_HIP_EXPERTS_LEGACY` | off | `1`: decode の expert を RDNA 版ではなく元のカーネルで計算する（gfx1100、v1.3.40 から gfx1201 も: AI PRO R9700 で gate/up と down が約 2 割速い。gfx1151 は IQ3_XXS の down 以外）。どちらでもビット一致 |
 | `STRATA_GLM_PROMOTE_RATIO` / `_MARGIN` | 4 / 16 | RAM 層のエキスパートの使用回数が「VRAM 側の ratio 倍 + margin」を超えたら入れ替える（2 / 4 は以前の、入れ替えの多い規則） |
 | `STRATA_GLM_BG_PACE_KB` | 1024 | tier の入れ替えのコピー（prompt の後の補充、入れ替え）を、token の境目でまとめて出さず、MoE 層ごとに最大この KB ずつ、次の層の mixer の間に流す（v1.3.28）。まとめて出すと、次の token の host-mapped の読みがコピーの終わりまで待たされていた（8K prompt の後、約 10 token が 35〜39 ms）。`0`: 従来どおり境目で |
