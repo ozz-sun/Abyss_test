@@ -458,7 +458,7 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 | `STRATA_DS4_IDX`, `STRATA_DS4_ATTN` | 0 | `1`: lightning indexer / prompt の attention を tensor core 版ではなく従来の FP32 カーネルで計算する（A/B 確認用） |
 | `STRATA_GLM_MMQ_GLU` | オン | prompt の expert の gate/up の積で SwiGLU まで済ませる（NVIDIA Turing 以降）。`0` で別カーネル（以前のビルドとビット一致） |
 | `STRATA_GLM_CPU_MT` | オン | 複数トークンが同じ expert を使うとき（prompt、検証窓）、CPU は重みの行を 1 回だけ展開する。ggml の内積とビット一致。`0` で無効 |
-| `STRATA_GLM_CPU_1T` | オン | CPU レーンの 1 トークン用 IQ3_S / IQ3_XXS の行を軽くする。ggml の内積とビット一致。`0` で無効 |
+| `STRATA_GLM_CPU_1T` | オン | CPU レーンの 1 トークン用の行を軽くする（ggml の内積とビット一致）。VNNI と VBMI のある AVX-512 の CPU（Zen 4 / Ice Lake 以降）では、IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS の格子をレジスタの中で引く（v1.3.41。Ryzen AI Max+ 395 の 16 スレッドで DeepSeek V4 のエキスパート 1 個が 109 → 90 µs、内蔵 GPU なしの生成が +3〜9%。`STRATA_NO_IQ512_1T=1` でこれだけ無効）。それ以外の CPU では AVX2 の IQ3_S / IQ3_XXS。`0` で無効 |
 | `STRATA_GLM_VRAM_EVICT` | 使用回数 | `lru`: VRAM 層の入れ替えで、最も長く使われていない expert を追い出す（キャッシュの調査用） |
 | `STRATA_GLM_DISK_READERS` | オフ | prompt 処理で SSD 上の expert をこの数のスレッドで読む（DRAM なしの NVMe 向け。環境ごとに測ること。DeepSeek V4.1 は `8` で 1K トークンの prompt が 33 → 27 秒） |
 | `STRATA_GLM_DISK_LANE` | オフ | `1`: SSD から RAM に読んだエキスパートを、VRAM に送らずその場で CPU / iGPU レーンが計算する（v1.3.29。V4.1 の Q2_K/Q3_K エキスパートで −5%、小さい Q2 では効果なし） |

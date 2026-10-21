@@ -466,7 +466,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_DS4_IDX`, `STRATA_DS4_ATTN` | 0 | `1`: the older FP32 kernels for the lightning indexer / the prompt attention instead of the tensor-core ones (A/B checks) |
 | `STRATA_GLM_MMQ_GLU` | on | the prompt path's expert gate/up product writes the SwiGLU itself (NVIDIA Turing and newer); `0`: the separate SwiGLU kernel, bit-identical to older builds |
 | `STRATA_GLM_CPU_MT` | on | CPU experts shared by several tokens (prompts, verify windows) decode each weight row once for all of them, bit-identical to ggml's dot; `0` off |
-| `STRATA_GLM_CPU_1T` | on | cheaper one-token IQ3_S / IQ3_XXS rows on the CPU lane, bit-identical to ggml's dot; `0` off |
+| `STRATA_GLM_CPU_1T` | on | cheaper one-token rows on the CPU lane, bit-identical to ggml's dot: on an AVX-512 CPU with VNNI and VBMI (Zen 4 / Ice Lake and later) IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS with the grid looked up in registers (v1.3.41; a Ryzen AI Max+ 395's 16 threads, a DeepSeek V4 expert 109 -> 90 us, decode without the iGPU lane +3-9%; `STRATA_NO_IQ512_1T=1` only these off), else IQ3_S / IQ3_XXS in AVX2; `0` off |
 | `STRATA_GLM_VRAM_EVICT` | counts | `lru`: the VRAM tier's refill evicts the least recently used expert (for cache studies) |
 | `STRATA_GLM_DISK_READERS` | off | prompts read SSD-held experts with this many threads (try it on a DRAM-less NVMe; DeepSeek V4.1: `8`, a 1K-token prompt 33 -> 27 s) |
 | `STRATA_GLM_DISK_LANE` | off | `1`: an expert read from the SSD into RAM is computed there by the CPU / iGPU lane instead of being copied to VRAM (v1.3.29; -5% on V4.1 with Q2_K/Q3_K experts, nothing with the smaller Q2 ones) |

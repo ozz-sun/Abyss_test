@@ -130,8 +130,21 @@ RowsFn pick_rows1(int type) {
         const char* v = std::getenv("STRATA_GLM_CPU_1T");
         return (mt == nullptr || std::atoi(mt) != 0) && (v == nullptr || std::atoi(v) != 0);
     }();
-    if (!on || !iq256_rows1_supported(type)) return nullptr;
+    if (!on) return nullptr;
     init_once();
+    // E-3: IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS in 512-bit lanes with the grid looked up in registers where
+    // cpu_avx512_ok() (VNNI and VBMI): bit-identical to ggml's dot, checked the same way.  Ryzen AI Max+ 395 (Zen 5),
+    // DeepSeek V4's experts (glm_cpu_bench): one thread an IQ2_XS / IQ3_XXS expert 1175 -> 665 us, an IQ2_XXS gate/up
+    // 848 -> 424; 16 threads 109 -> 90-102 us and 111 -> 80 (now ~89 GB/s of the ~113 the RAM gives: memory-bound).
+    // Decode without the iGPU lane (AI PRO R9700): DeepSeek V4 UD-Q2_K_XL 42.3-42.9 -> 44.8-45.6 tok/s, huihui Q2
+    // +3-5%, GLM-5.3-Flash Maya-S-v2 +6-9%.  STRATA_NO_IQ512_1T=1 keeps the rows below
+    if (iq512_rows1_supported(type) && cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512_1T") == nullptr &&
+        iq512_rows1_ready()) {
+        if (rows_match_ggml(iq512_rows1, type, {1}, 306)) return iq512_rows1;
+        std::fprintf(stderr, "native experts: the AVX-512 one-token %s rows differ from ggml-cpu's dot in this build - "
+                             "the AVX-2 ones\n", ggml_type_name((ggml_type) type));
+    }
+    if (!iq256_rows1_supported(type)) return nullptr;
     if (!cpu_avx2_ok() || std::getenv("STRATA_NO_IQ256") != nullptr) return nullptr;
     if (rows_match_ggml(iq256_rows1, type, {1}, 306)) return iq256_rows1;
     std::fprintf(stderr, "native experts: the one-token %s rows differ from ggml-cpu's dot in this build - "
