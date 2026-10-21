@@ -1595,7 +1595,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // updates, but omit the output projection and FFN (including both mHC write halves). Split boundaries and seam
     // dumps consume these rows, so keep their full path. STRATA_GLM_PREFILL_TAIL_SKIP=0 is the A/B baseline.
     const char* tail_env = getenv("STRATA_GLM_PREFILL_TAIL_SKIP");
-    const bool tail_skip = l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr && mtp_il_ < 0 &&
+    const bool tail_skip = l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr && mtp_il_ < 0 && dsp_ == nullptr &&
                            (cb_dir == nullptr || !cb_dir[0]) && (tail_env == nullptr || std::atoi(tail_env) != 0);
     const auto dump_row = [&](const std::string& name, const float* rows, int width, int row = -1) {
         if (cb_dir == nullptr || !cb_dir[0]) return;
@@ -1946,6 +1946,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     il == l0_ ? S->onehot : S->pre2, S->pre);
         } else {
             hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
+            if (dsp_ != nullptr && il > l0_) dspark_capture_rows(il - 1, S->R, T, s);   // DSpark's features
         }
         S->mark("hc", s);
         dump_row("attn_norm-" + std::to_string(il), S->x, E);
@@ -3131,6 +3132,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (!tail_skip) {
         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
+        if (dsp_ != nullptr) {   // DSpark: the chunk's last rows into its context
+            dspark_capture_rows(l1_ - 1, S->R, T, s);
+            const int n = std::min(T, 128);
+            if (!dspark_commit(p0 + T - n, n, true, s)) {
+                err = "dspark: the prompt's context commit";
+                return false;
+            }
+        }
     }
     // ---- the NextN block's caches for these positions (the half that carries it): position p reads h_p and the
     //      embedding of the token at p + 1, so only the cache-writing half of the block runs - eh_proj, the attention
@@ -3261,6 +3270,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     err.clear();
     prefill_next_ = next_token;
     if (fast_ == nullptr || tokens.empty()) return false;
+    dspark_settle();
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // (a tail lent to the vision encoder: the
         if (m->pf_ == nullptr || m->fast_ == nullptr || m->vis_lent_) return false;   // token path, until it is back)
     // a handful of tokens costs less through the token path (the batched path streams every expert they touch)

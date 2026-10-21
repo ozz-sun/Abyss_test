@@ -421,6 +421,20 @@ public:
     // a token on its own stream; verify_moe's route waits for wait_ev and records done_ev when they are set)
     bool verify_attn(int il, int64_t p0, int tb, int n, cudaStream_t s, std::string& err);
     void fast_dump_feat(int il, const float* R);   // STRATA_DS4_DUMP_FEAT (the DSpark probe)
+    // ---- DSpark, DeepSeek V4 Flash's block drafter (src/core/dspark.cu, STRATA_DS4_DSPARK=<its GGUF>)
+    void* dsp_ = nullptr;
+    bool dspark_load(std::string& err);            // in fast_setup, before the expert pool takes the VRAM left
+    void dspark_destroy();
+    size_t dspark_vram_bytes() const;              // the drafter's device memory (the RAM tier is that much smaller)
+    void dspark_reset();                           // a new sequence / a restored snapshot: an empty context
+    // a target layer's output streams R (4 x n_embd) -> the feature of column col (the token path's: 0); the prompt
+    // path's chunk of T rows -> its last rows'
+    void dspark_capture(int il_out, const float* R, int col, cudaStream_t s);
+    void dspark_capture_rows(int il_out, const float* R, int T, cudaStream_t s);
+    // positions p0 .. p0 + n - 1 into the context rings, from the columns' features (prompt: the prompt rows')
+    bool dspark_commit(int64_t p0, int n, bool prompt, cudaStream_t s);
+    void dspark_window(int64_t p0, int T);         // verify: its columns wait for spec_rewind's position
+    void dspark_settle();                          // ... which commits the kept ones
     bool verify_moe(int il, int tb, int n, const std::vector<int32_t>& toks, cudaStream_t s, cudaEvent_t wait_ev,
                     cudaEvent_t done_ev, std::string& err);
     // one part's share of a window (verify): its layers on the columns' residuals in its own buffers, then, a part
@@ -527,7 +541,15 @@ public:
     int verify_argmax(int i) const;
     int verify_sample(int i, strata::kernels::SamplerParams& sp, std::string& err);
     bool verify_logits(int i, std::vector<float>& out, std::string& err);   // column i's logits to the host
-    void spec_rewind(int64_t pos) { pos_ = pos; }
+    void spec_rewind(int64_t pos);                         // (DSpark: the kept columns into its context)
+    /// DSpark (src/core/dspark.cu): loaded with STRATA_DS4_DSPARK=<the drafter GGUF>; its context follows every
+    /// token, window (the kept columns) and prompt chunk by itself.  dspark_draft(y): the block at position() with y,
+    /// the pending token -> 5 drafts and their confidences (host; waits for the device).  dspark_upload: the expert
+    /// cache's copies the last draft planned - after the window is queued, so they run under it.
+    bool dspark_ready() const { return dsp_ != nullptr; }
+    bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
+    void dspark_upload();
+    void dspark_report() const;
     bool decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                      int64_t& produced, std::string& err);
     uint64_t spec_steps_ = 0, spec_hits_ = 0;              // speculative positions, accepted

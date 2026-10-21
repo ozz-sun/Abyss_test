@@ -37,7 +37,8 @@ struct MvJob {
 constexpr int kMaxMvJobs = 8;
 /// One launch for up to kMaxMvJobs independent GEMVs (they share nothing but the launch).
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
-/// mv() for nc (1..4) activation columns at once - a verify window's tokens: the weight rows are read once. Column c
+/// mv() for nc activation columns at once (1..8 a launch, wider calls in runs) - a verify window's tokens, the DSpark
+/// drafter's block: the weight rows are read once. Column c
 /// of a job reads xq + c * n_in / 32 (q8_1 blocks) or xf + c * n_in (BF16 / F32) and writes y + c * n_out.
 bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s);
 bool mvn_supported(int type);

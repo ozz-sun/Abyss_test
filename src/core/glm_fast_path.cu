@@ -888,6 +888,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
         if (!prefill_setup(err)) return false;
+        // DSpark (STRATA_DS4_DSPARK): the drafter's weights and expert cache before the pool takes what is left
+        if (!dspark_load(err)) return false;
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         {
@@ -1306,6 +1308,19 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (part_ > 0 && !fixed_ram) {
                 const int64_t now = avail_ram_now();
                 if (now > 0) budget = std::min<int64_t>(budget, std::max<int64_t>(0, now - head_b / 2 - unseen_pf));
+            }
+        }
+        // DSpark's VRAM came out of the expert pool, and the tier would pin those experts instead: on a 94 GB machine
+        // 73.9 GB pinned instead of 67.4 left 13 GB free, an 8K prompt took 301 s instead of 11 and the decode ran at
+        // 1.6 tok/s (the same without the drafter and a pool as small).  The tier keeps its size without the drafter;
+        // the coldest experts come from the disk (0.01 reads a token in the decode)
+        if (dsp_ != nullptr && !fixed_ram && budget > 0) {
+            const int64_t keep = std::max<int64_t>(0, (int64_t) wsum - (int64_t) dspark_vram_bytes());
+            if (budget > keep) {
+                std::fprintf(stderr, "glm fast: CUDA%d RAM tier without the %.2f GB the DSpark drafter took from the pool "
+                                     "(those experts read from the disk)\n", dev_,
+                             (double) dspark_vram_bytes() / 1073741824.0);
+                budget = keep;
             }
         }
         F->rc.assign(cls_stride.size(), FastState::RamClass{});
@@ -2971,6 +2986,8 @@ void Glm5Model::fast_destroy() {
     FastState* F = fast_;
     if (F == nullptr) return;
     cudaSetDevice(dev_);
+    dspark_report();
+    dspark_destroy();
     prefill_destroy();
     F->quit.store(true);
     if (F->svc.joinable()) F->svc.join();
@@ -5119,6 +5136,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             gf::hc_defer_add(F->md, F->post_defer, g.n_embd, Rc, s);
             if (F->prof_on) F->mark("hc_defer_add");
         }
+        // DSpark's features: the layer before's complete output (its deferred part added above)
+        if (dsp_ != nullptr && il > l0_) dspark_capture(il - 1, Rc, 0, s);
         // ---- the FFN-side read (fused with the mixer's write)
         h.block_out = F->mixer;
         h.R_old = Rc;
@@ -5190,6 +5209,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     gf::hc_post(F->ffn, Rc, F->post, F->comb, g.n_embd, Ro, s);
     if (F->prof_on) F->mark("hc_post_end");
     fast_dump_feat(l1_ - 1, Ro);
+    if (dsp_ != nullptr) dspark_capture(l1_ - 1, Ro, 0, s);
     // keep the convention "the residual lives at state_" for the hop and the head: copy back
     if (Ro != state_)
         cudaMemcpyAsync(state_, Ro, (size_t) g.hc * g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, s);
@@ -5200,6 +5220,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
 bool Glm5Model::fast_token(int32_t token, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
+    dspark_settle();   // (a window's kept columns before this token's features take column 0)
     const int64_t p = pos_++;
     const bool gp = F->gap_on && split_next_ == nullptr;
     if (gp) {
@@ -5243,6 +5264,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         F->gap_emb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te0).count();
     }
     if (!fast_layers(p, false, err)) return false;
+    if (dsp_ != nullptr && !dspark_commit(p, 1, false, F->cs)) {
+        err = "dspark: the context commit";
+        return false;
+    }
     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
     // copy ordered on the devices by an event (the host never waits between the parts)
     Glm5Model* tail = this;
@@ -6001,6 +6026,7 @@ bool Glm5Model::snapshot_restore() {
         m->pos_ = m->snap_pos_;
     }
     cudaSetDevice(dev_);
+    dspark_reset();   // (its rings were written past the snapshot: the next prompt fills them again)
     return true;
 }
 

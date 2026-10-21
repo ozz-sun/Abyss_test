@@ -3734,11 +3734,11 @@ bool mvn_supported(int type) {
 bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
     if (nc == 1) return mv(jobs, n, s);
     if (n <= 0 || n > kMaxMvJobs || nc < 1) return false;
-    if (nc > 4) {
-        // a wider window: runs of 2-4 columns (never 1: the one-column kernels sum in another order), each column's
+    if (nc > 8) {
+        // a wider call: runs of 2-8 columns (never 1: the one-column kernels sum in another order), each column's
         // sum the same as in any run
         for (int c0 = 0; c0 < nc;) {
-            const int rem = nc - c0, take = rem > 4 ? (rem == 5 ? 3 : 4) : rem;
+            const int rem = nc - c0, take = rem > 8 ? (rem == 9 ? 5 : 8) : rem;
             MvJob sub[kMaxMvJobs];
             for (int i = 0; i < n; ++i) {
                 const MvJob& J = jobs[i];
@@ -3782,7 +3782,11 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
         switch (nc) {                                                                   \
             case 2: mvn_kernel_t<TT, 2><<<acc, 256, 0, s>>>(b); break;                  \
             case 3: mvn_kernel_t<TT, 3><<<acc, 256, 0, s>>>(b); break;                  \
-            default: mvn_kernel_t<TT, 4><<<acc, 256, 0, s>>>(b); break;                 \
+            case 4: mvn_kernel_t<TT, 4><<<acc, 256, 0, s>>>(b); break;                  \
+            case 5: mvn_kernel_t<TT, 5><<<acc, 256, 0, s>>>(b); break;                  \
+            case 6: mvn_kernel_t<TT, 6><<<acc, 256, 0, s>>>(b); break;                  \
+            case 7: mvn_kernel_t<TT, 7><<<acc, 256, 0, s>>>(b); break;                  \
+            default: mvn_kernel_t<TT, 8><<<acc, 256, 0, s>>>(b); break;                 \
         }
         switch (T) {
             case 14: GF_MVN(14) break;
@@ -3793,7 +3797,11 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
                 switch (nc) {
                     case 2: mvn_kernel_f<2><<<acc, 256, 0, s>>>(b); break;
                     case 3: mvn_kernel_f<3><<<acc, 256, 0, s>>>(b); break;
-                    default: mvn_kernel_f<4><<<acc, 256, 0, s>>>(b); break;
+                    case 4: mvn_kernel_f<4><<<acc, 256, 0, s>>>(b); break;
+                    case 5: mvn_kernel_f<5><<<acc, 256, 0, s>>>(b); break;
+                    case 6: mvn_kernel_f<6><<<acc, 256, 0, s>>>(b); break;
+                    case 7: mvn_kernel_f<7><<<acc, 256, 0, s>>>(b); break;
+                    default: mvn_kernel_f<8><<<acc, 256, 0, s>>>(b); break;
                 }
         }
 #undef GF_MVN

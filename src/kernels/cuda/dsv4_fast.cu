@@ -1518,6 +1518,175 @@ __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict_
         y[i] = __half_as_ushort(__float2half(x[i]));
 }
 
+// ---------------------------------------------------------------- DSpark (the block drafter, src/core/dspark.cu)
+// the drafter's context rows: prep's kv half, one block a row, at positions p0 + t
+__global__ void __launch_bounds__(512) kv_rows_kernel(const float* __restrict__ kv_raw, const float* __restrict__ kv_norm,
+                                                      int D, int n_rot, Rope rope, int p0, uint16_t* __restrict__ ring,
+                                                      int n_ring, float eps) {
+    __shared__ float sh[32];
+    __shared__ float v[1024];
+    const int t = blockIdx.x, tid = threadIdx.x;
+    const float* x = kv_raw + (size_t) t * D;
+    float ss = 0.0f;
+    for (int i = tid; i < D; i += blockDim.x) ss += x[i] * x[i];
+    const float inv = rsqrtf(block_sum(ss, sh) / (float) D + eps);
+    for (int i = tid; i < D; i += blockDim.x) v[i] = x[i] * inv * kv_norm[i];
+    __syncthreads();
+    if (tid < n_rot / 2) rope_pair(v, D, n_rot, rope, p0 + t, true, tid);
+    __syncthreads();
+    uint16_t* row = ring + (size_t) ((p0 + t) % n_ring) * D;
+    for (int i = tid; i < D; i += blockDim.x) row[i] = __half_as_ushort(__float2half(v[i]));
+}
+
+// a target layer's output -> the drafter's feature: the mean of the 4 streams, row y of n
+__global__ void stream_mean_kernel(const float* __restrict__ R, size_t rs, int E, float* __restrict__ out, size_t os) {
+    const float* Rr = R + (size_t) blockIdx.y * rs;
+    float* o = out + (size_t) blockIdx.y * os;
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e < E) o[e] = 0.25f * (Rr[e] + Rr[E + e] + Rr[2 * E + e] + Rr[3 * E + e]);
+}
+
+// the drafter's router, a block a row: sc = sqrt(softplus(logit)), the top k of sc + bias (ties: the lower id), the
+// weights sc / sum * w_scale over the experts with a VRAM slot (tab[e] != 0; the others are left out)
+__global__ void __launch_bounds__(256) dspark_route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
+                                                           int n_expert, int k, float w_scale,
+                                                           const unsigned long long* __restrict__ tab,
+                                                           unsigned long long* __restrict__ plan_ptr,
+                                                           float* __restrict__ plan_w, int* __restrict__ ids) {
+    __shared__ float s_sc[512], s_sel[512];
+    __shared__ int s_pick[8];
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const float* lg = logits + (size_t) r * n_expert;
+    for (int e = tid; e < n_expert; e += blockDim.x) {
+        const float x = lg[e];
+        const float sc = sqrtf(x > 20.0f ? x : log1pf(expf(x)));
+        s_sc[e] = sc;
+        s_sel[e] = sc + bias[e];
+    }
+    __syncthreads();
+    if (tid < 32) {
+        for (int i = 0; i < k; ++i) {
+            float bv = -INFINITY;
+            int bi = 0x7fffffff;
+            for (int e = tid; e < n_expert; e += 32) {
+                const float v = s_sel[e];
+                if (v > bv || (v == bv && e < bi)) { bv = v; bi = e; }
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if (bi >= n_expert) bi = i;   // (NaN logits: any id)
+            if (tid == 0) {
+                s_pick[i] = bi;
+                s_sel[bi] = -INFINITY;
+            }
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i)
+            if (tab[s_pick[i]] != 0ull) sum += s_sc[s_pick[i]];
+        const float m = w_scale / fmaxf(sum, 6.103515625e-5f);
+        int n = 0;
+        for (int i = 0; i < k; ++i) {
+            const int e = s_pick[i];
+            ids[r * k + i] = e;
+            const unsigned long long ptr = tab[e];
+            if (ptr == 0ull) continue;
+            plan_ptr[r * 8 + n] = ptr;
+            plan_w[r * 8 + n] = s_sc[e] * m;
+            ++n;
+        }
+        for (; n < 8; ++n) {
+            plan_ptr[r * 8 + n] = 0ull;
+            plan_w[r * 8 + n] = 0.0f;
+        }
+    }
+}
+
+// head_prep_kernel keeping h (the drafter's confidence reads it before the norm)
+__global__ void __launch_bounds__(1024) dspark_head_kernel(const float* __restrict__ R, const uint16_t* __restrict__ fn,
+                                                           const float* __restrict__ scale, const float* __restrict__ base,
+                                                           float hc_eps, const float* __restrict__ norm_w, float eps,
+                                                           int n_embd, float* __restrict__ hout, float* __restrict__ x,
+                                                           block_q8_1* __restrict__ xq) {
+    __shared__ float sh[32];
+    __shared__ float s_pre[4];
+    const int tid = threadIdx.x, F = 4 * n_embd;
+    float ss = 0.0f, m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
+    for (int i = tid; i < F; i += blockDim.x) {
+        const float r = R[i];
+        ss += r * r;
+        m0 += bf(fn[i]) * r;
+        m1 += bf(fn[(size_t) F + i]) * r;
+        m2 += bf(fn[(size_t) 2 * F + i]) * r;
+        m3 += bf(fn[(size_t) 3 * F + i]) * r;
+    }
+    const float inv = rsqrtf(block_sum(ss, sh) / (float) F + eps);
+    m0 = block_sum(m0, sh);
+    m1 = block_sum(m1, sh);
+    m2 = block_sum(m2, sh);
+    m3 = block_sum(m3, sh);
+    if (tid == 0) {
+        const float mm[4] = {m0, m1, m2, m3};
+        for (int s = 0; s < 4; ++s) s_pre[s] = 1.0f / (1.0f + expf(-(mm[s] * inv * scale[0] + base[s]))) + hc_eps;
+    }
+    __syncthreads();
+    float hs = 0.0f;
+    for (int e = tid; e < n_embd; e += blockDim.x) {
+        const float h = s_pre[0] * R[e] + s_pre[1] * R[n_embd + e] + s_pre[2] * R[2 * n_embd + e] +
+                        s_pre[3] * R[3 * n_embd + e];
+        hout[e] = h;
+        x[e] = h;
+        hs += h * h;
+    }
+    const float inv2 = rsqrtf(block_sum(hs, sh) / (float) n_embd + eps);
+    for (int e = tid; e < n_embd; e += blockDim.x) {
+        const float y = x[e] * inv2 * norm_w[e];
+        x[e] = y;
+        q8_1_store_warp_ds(y, xq + e / 32, tid & 31);
+    }
+}
+
+// a row of the drafter's Markov chain: m = w1[*prev] (rank 256, F16), out[v] = logits[v] + w2[v] . m (Q8_0 rows of
+// 256, a warp a row, lane l the values 8 l .. 8 l + 7); block 0 also the confidence sigmoid(cp . [h; m])
+__global__ void __launch_bounds__(256) dspark_markov_kernel(const float* __restrict__ logits,
+                                                            const block_q8_0* __restrict__ w2,
+                                                            const __half* __restrict__ w1, int n_vocab,
+                                                            const int* __restrict__ prev, const float* __restrict__ cp,
+                                                            const float* __restrict__ h, int n_embd,
+                                                            float* __restrict__ out, float* __restrict__ conf) {
+    constexpr int RANK = 256;
+    __shared__ float s_m[RANK];
+    __shared__ float sh[32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int pv = *prev;
+    for (int i = tid; i < RANK; i += blockDim.x) s_m[i] = __half2float(w1[(size_t) pv * RANK + i]);
+    __syncthreads();
+    if (blockIdx.x == 0) {
+        float a = 0.0f;
+        for (int i = tid; i < n_embd; i += blockDim.x) a += cp[i] * h[i];
+        for (int i = tid; i < RANK; i += blockDim.x) a += cp[n_embd + i] * s_m[i];
+        a = block_sum(a, sh);
+        if (tid == 0) *conf = 1.0f / (1.0f + expf(-a));
+    }
+    const int b = lane >> 2, j0 = (lane & 3) * 8;
+    const int wpb = blockDim.x >> 5;
+    for (int v = blockIdx.x * wpb + warp; v < n_vocab; v += gridDim.x * wpb) {
+        const block_q8_0& B = w2[(size_t) v * (RANK / 32) + b];
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc += (float) B.qs[j0 + j] * s_m[b * 32 + j0 + j];
+        acc = warp_sum(acc * __half2float(B.d));
+        if (lane == 0) out[v] = logits[v] + acc;
+    }
+}
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "dsv4_fast %s: %s\n", what, cudaGetErrorString(e));
@@ -1880,6 +2049,39 @@ void to_f16(const float* x, uint16_t* y, int64_t n, cudaStream_t s) {
     if (n <= 0) return;
     to_f16_kernel<<<(unsigned) std::min<int64_t>(4096, (n + 255) / 256), 256, 0, s>>>(x, y, n);
     check("to_f16");
+}
+
+
+// ---------------------------------------------------------------- DSpark
+void kv_rows(const float* kv_raw, int n, const float* kv_norm, int head_dim, int n_rot, const Rope& rope, int p0,
+             uint16_t* ring, int n_ring, float eps, cudaStream_t s) {
+    if (n <= 0) return;
+    kv_rows_kernel<<<n, 512, 0, s>>>(kv_raw, kv_norm, head_dim, n_rot, rope, p0, ring, n_ring, eps);
+    check("kv_rows");
+}
+void stream_mean(const float* R, int n, size_t rs, int n_embd, float* out, size_t os, cudaStream_t s) {
+    if (n <= 0) return;
+    stream_mean_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) n), 256, 0, s>>>(R, rs, n_embd, out, os);
+    check("stream_mean");
+}
+bool dspark_route(const float* logits, const float* bias, int n_expert, int k, float w_scale,
+                  const unsigned long long* tab, int nr, unsigned long long* plan_ptr, float* plan_w, int* ids,
+                  cudaStream_t s) {
+    if (n_expert > 512 || k > 8 || nr <= 0) return false;
+    dspark_route_kernel<<<nr, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, tab, plan_ptr, plan_w, ids);
+    check("dspark_route");
+    return true;
+}
+void dspark_head(const float* R, const uint16_t* fn, const float* scale, const float* base, float hc_eps,
+                 const float* norm_w, float eps, int n_embd, float* h, float* x, void* xq, cudaStream_t s) {
+    dspark_head_kernel<<<1, 1024, 0, s>>>(R, fn, scale, base, hc_eps, norm_w, eps, n_embd, h, x, (block_q8_1*) xq);
+    check("dspark_head");
+}
+void dspark_markov(const float* logits, const void* w2, const uint16_t* w1, int n_vocab, const int* prev,
+                   const float* cp, const float* h, int n_embd, float* out, float* conf, cudaStream_t s) {
+    dspark_markov_kernel<<<1024, 256, 0, s>>>(logits, (const block_q8_0*) w2, (const __half*) w1, n_vocab, prev, cp, h,
+                                              n_embd, out, conf);
+    check("dspark_markov");
 }
 
 }  // namespace strata::kernels::dsv4

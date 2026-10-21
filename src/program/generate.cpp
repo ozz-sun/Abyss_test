@@ -1607,6 +1607,194 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+        } else if (model.dspark_ready() && model.fast() && model.verify_ready()) {
+            // DSpark's speculative decode (STRATA_DS4_DSPARK=<the drafter GGUF>): after each token the drafter
+            // proposes the next 5 with a confidence each; the leading ones at or above STRATA_DS4_DSPARK_THR (default
+            // 0.7, ds4's) go through a verify window behind the token, compared and kept as the n-gram decode's below
+            // (the same samples: only the time per token changes).  No confident draft: the token alone.  A repeat
+            // first (STRATA_DS4_DSPARK_NGRAM, default 1): when the last spec_min tokens occurred before, the tokens
+            // after that occurrence are the window's drafts and the drafter does not run - free, and on a swe-bench
+            // task's copied code as good as its drafts (t003: 87% of 5 accepted against 92%) - while the repeats'
+            // drafts keep being accepted: every step checks the repeat's proposal against the tokens that came
+            // (whichever drafter ran), and below STRATA_DS4_DSPARK_NGRAM_P (default 0.75) of them right the drafter
+            // takes over (new code: 22% of 5 accepted, which cost DSpark's steps their windows)
+            static const float d_thr = [] {
+                const char* v = std::getenv("STRATA_DS4_DSPARK_THR");
+                return v != nullptr ? (float) std::atof(v) : 0.7f;
+            }();
+            static const int d_max = [] {   // STRATA_DS4_DSPARK_K: drafts a window at most (1..5)
+                const char* v = std::getenv("STRATA_DS4_DSPARK_K");
+                return v != nullptr ? std::max(1, std::min(5, std::atoi(v))) : 5;
+            }();
+            static const bool d_ngram = [] {
+                const char* v = std::getenv("STRATA_DS4_DSPARK_NGRAM");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            // STRATA_DS4_DSPARK_CHAIN=<p> (> 0): keep draft i while the product of the confidences up to it is >= p
+            // (the chance the window still holds) instead of each one >= the threshold
+            static const double d_chain = [] {
+                const char* v = std::getenv("STRATA_DS4_DSPARK_CHAIN");
+                return v != nullptr ? std::atof(v) : 0.0;
+            }();
+            static const double d_ngp = [] {
+                const char* v = std::getenv("STRATA_DS4_DSPARK_NGRAM_P");
+                return v != nullptr ? std::atof(v) : 0.75;
+            }();
+            NgramDrafter dr(spec_min);
+            for (const int64_t t : prompt) dr.push((int32_t) t);
+            std::vector<int32_t> ng, came;   // the repeat's proposal; the tokens the step produced after tok
+            double ng_p = 0.8;               // the repeats' drafts: the share right (a running mean, each position)
+            int64_t n_ngw = 0, n_ngd = 0, n_nga = 0;   // the repeats' windows, drafts, accepted
+            int tok = model.sample_token(sp, err);
+            if (tok < 0) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+            tok = model.forced(tok);
+            sp.counter += 1;
+            std::vector<int32_t> win;
+            int64_t n_win = 0, n_one = 0, n_draft = 0, n_acc = 0;
+            int64_t n_k[6] = {0, 0, 0, 0, 0, 0};
+            double ms_win = 0.0, ms_one = 0.0, ms_dr = 0.0;
+            const auto ms_since = [](std::chrono::steady_clock::time_point a) {
+                return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+            };
+            for (;;) {
+                if (stop_req.load()) {
+                    finish = "cancel";
+                    break;
+                }
+                if (!on_token(tok)) break;
+                dr.push(tok);
+                const int64_t p0 = model.position();
+                const int room = (int) std::min<int64_t>(d_max, o.max_context - p0 - 1);
+                int32_t d[5];
+                float c[5];
+                int k = 0;
+                bool rep = false;   // the drafts are a repeat's (the n-gram's)
+                ng.clear();
+                if (d_ngram && room > 0) {
+                    dr.propose(room, ng);
+                    rep = !ng.empty() && ng_p >= d_ngp;
+                    for (k = 0; rep && k < (int) ng.size(); ++k) d[k] = ng[(size_t) k];
+                }
+                // the repeat's proposal against what the step produces (its accepted drafts, then the next token)
+                const auto ng_learn = [&]() {
+                    for (size_t i = 0; i < ng.size() && i < came.size(); ++i) {
+                        const bool hit = ng[i] == came[i];
+                        ng_p = 0.95 * ng_p + 0.05 * (hit ? 1.0 : 0.0);
+                        if (!hit) break;
+                    }
+                };
+                came.clear();
+                const auto td = std::chrono::steady_clock::now();
+                if (!rep && room > 0) {
+                    if (!model.dspark_draft(tok, d, c, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    if (d_chain > 0.0) {
+                        double pc = 1.0;
+                        while (k < room && (pc *= c[k]) >= d_chain) ++k;
+                    } else {
+                        while (k < room && c[k] >= d_thr) ++k;
+                    }
+                    ms_dr += ms_since(td);
+                }
+                if (!rep) ++n_k[k];
+                const auto tw = std::chrono::steady_clock::now();
+                if (k == 0) {
+                    ++n_one;
+                    model.dspark_upload();
+                    if (!model.forward({(int32_t) tok}, lg, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    tok = model.sample_token(sp, err);
+                    if (tok < 0) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    tok = model.forced(tok);
+                    sp.counter += 1;
+                    ms_one += ms_since(tw);
+                    came.push_back(tok);
+                    ng_learn();
+                    continue;
+                }
+                win.assign(1, (int32_t) tok);
+                win.insert(win.end(), d, d + k);
+                if (!model.verify(win, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                model.dspark_upload();   // (the expert cache's copies under the window)
+                model.spec_steps_ += (uint64_t) k;
+                ++n_win;
+                n_draft += k;
+                if (rep) {
+                    ++n_ngw;
+                    n_ngd += k;
+                }
+                int next = -1, kept = 1;
+                bool stopped = false;
+                for (int i = 0; i <= k; ++i) {
+                    int s2 = model.verify_sample(i, sp, err);
+                    if (s2 < 0) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    s2 = model.forced(s2);
+                    sp.counter += 1;
+                    came.push_back(s2);
+                    if (i == k || s2 != d[i]) {
+                        next = s2;
+                        break;
+                    }
+                    ++model.spec_hits_;
+                    ++n_acc;
+                    n_nga += rep ? 1 : 0;
+                    if (stop_req.load() || !on_token(s2)) {
+                        stopped = true;
+                        break;
+                    }
+                    dr.push(s2);
+                    ++kept;
+                }
+                model.spec_rewind(p0 + kept);
+                ng_learn();
+                const double mw = ms_since(tw);
+                ms_win += mw;
+                // STRATA_DS4_DSPARK_LOG=<n>: every n windows, their mean time and size (the decode's drift)
+                static const int d_log = [] {
+                    const char* v = std::getenv("STRATA_DS4_DSPARK_LOG");
+                    return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+                }();
+                static double lg_ms = 0.0;
+                static int64_t lg_n = 0, lg_cols = 0;
+                lg_ms += mw;
+                lg_cols += k + 1;
+                if (d_log > 0 && ++lg_n == d_log) {
+                    std::fprintf(stderr, "ds4 dspark: windows %lld: the last %d %.1f ms each, %.2f columns\n",
+                                 (long long) n_win, d_log, lg_ms / d_log, (double) lg_cols / d_log);
+                    lg_ms = 0.0;
+                    lg_n = lg_cols = 0;
+                }
+                if (stopped) break;
+                tok = next;
+            }
+            const int64_t steps = n_win + n_one, n_dsp = steps - n_ngw;
+            std::fprintf(stderr, "ds4 dspark: thr %.2f: %lld windows (%lld drafted, %lld accepted = %.0f%%) and %lld single "
+                                 "tokens; the repeats' windows %lld (%lld drafted, %lld accepted); the drafter's steps "
+                                 "%lld, drafts kept 0..5: %lld %lld %lld %lld %lld %lld; %.1f ms a window, %.1f a single "
+                                 "token, %.2f a draft; %.2f tokens a step\n",
+                         d_thr, (long long) n_win, (long long) n_draft, (long long) n_acc,
+                         100.0 * (double) n_acc / (double) std::max<int64_t>(1, n_draft), (long long) n_one,
+                         (long long) n_ngw, (long long) n_ngd, (long long) n_nga, (long long) n_dsp,
+                         (long long) n_k[0], (long long) n_k[1], (long long) n_k[2], (long long) n_k[3],
+                         (long long) n_k[4], (long long) n_k[5], ms_win / (double) std::max<int64_t>(1, n_win),
+                         ms_one / (double) std::max<int64_t>(1, n_one), ms_dr / (double) std::max<int64_t>(1, n_dsp),
+                         (double) (steps + n_acc) / (double) std::max<int64_t>(1, steps));
         } else if (spec_k > 0 && model.fast() && model.verify_ready()) {
             // deepseek4's n-gram speculative decode (STRATA_DS4_SPEC=<k>): after each token, the latest earlier
             // occurrence of the last spec_min tokens in the prompt + the answer so far proposes the next k; the token

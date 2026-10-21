@@ -144,4 +144,25 @@ void attend_batch(const float* q, const uint16_t* keys, int n_hist, int n_swa, c
 /// x (n floats) -> FP16.
 void to_f16(const float* x, uint16_t* y, int64_t n, cudaStream_t s);
 
+// ---------------------------------------------------------------- DSpark, the block drafter (src/core/dspark.cu)
+
+/// Rows t < n: rope(rms(kv_raw[t]) * kv_norm) at position p0 + t -> ring row (p0 + t) % n_ring (FP16) - prep's kv.
+void kv_rows(const float* kv_raw, int n, const float* kv_norm, int head_dim, int n_rot, const Rope& rope, int p0,
+             uint16_t* ring, int n_ring, float eps, cudaStream_t s);
+/// out row r (os floats apart) = the mean of the 4 streams of R row r (rs floats apart), n rows.
+void stream_mean(const float* R, int n, size_t rs, int n_embd, float* out, size_t os, cudaStream_t s);
+/// The drafter's router over nr rows of logits: sc = sqrt(softplus), the top k of sc + bias (ties: the lower id) ->
+/// ids[r][k]; the plan (plan_ptr / plan_w, [nr][8]) keeps the experts with a VRAM slot (tab[e] != 0), weights
+/// sc / sum(kept sc) * w_scale.  False: n_expert > 512 or k > 8.
+bool dspark_route(const float* logits, const float* bias, int n_expert, int k, float w_scale,
+                  const unsigned long long* tab, int nr, unsigned long long* plan_ptr, float* plan_w, int* ids,
+                  cudaStream_t s);
+/// head_prep that also keeps h = sum_s pre_s R_s (before the norm) -> h.
+void dspark_head(const float* R, const uint16_t* fn, const float* scale, const float* base, float hc_eps,
+                 const float* norm_w, float eps, int n_embd, float* h, float* x, void* xq, cudaStream_t s);
+/// A Markov row (rank 256): m = w1[*prev] (F16), out[v] = logits[v] + w2[v] . m (w2: Q8_0 rows), and
+/// *conf = sigmoid(cp . [h; m]) (cp: n_embd + 256 floats).
+void dspark_markov(const float* logits, const void* w2, const uint16_t* w1, int n_vocab, const int* prev,
+                   const float* cp, const float* h, int n_embd, float* out, float* conf, cudaStream_t s);
+
 }  // namespace strata::kernels::dsv4

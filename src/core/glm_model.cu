@@ -1035,6 +1035,7 @@ void Glm5Model::reset() {
         cudaStreamSynchronize(0);
     }
     pos_ = 0;
+    dspark_reset();
     if (split_next_) {
         split_next_->reset();
         cudaSetDevice(dev_);

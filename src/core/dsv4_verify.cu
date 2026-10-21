@@ -89,8 +89,12 @@ struct VerifyBuf {
     size_t hpart_n = 0, hq_n = 0, score_n = 0;
     bool pipe = false;                        // the per-column scratch slots allocated: the pipelined window possible
     bool pipe_now = true;                     // this window pipelined (verify's choice, STRATA_DS4_SPEC_PIPE)
-    int pipe_choice = -1;                     // (the first part's) the kind kept on this machine: -1 still timing both
-    std::vector<double> ms_pipe, ms_batch;    // ... the timed windows' ms a token of each kind
+    // (the first part's) the kind kept on this machine, a width each (-1: still timing both): the kinds are close at
+    // 3 columns and far apart at 6 (61 against 75 ms) - a choice made at one width does not hold at another
+    int pipe_choice[Glm5Model::kVerifyMax + 1] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+    // ... the timed windows' ms of each kind, by width (windows of different widths are not comparable: DSpark's
+    // vary 2..6 columns, and 3 + 3 of mixed widths once kept the batched window at 78 ms against 56)
+    std::vector<double> ms_pipe[Glm5Model::kVerifyMax + 1], ms_batch[Glm5Model::kVerifyMax + 1];
     cudaStream_t st[Glm5Model::kVerifyMax] = {};   // column t's stream (st[0]: the compute stream)
     cudaEvent_t ev_attn[Glm5Model::kVerifyMax] = {}, ev_route[Glm5Model::kVerifyMax] = {},
                 ev_fin[Glm5Model::kVerifyMax] = {}, ev_start = nullptr;
@@ -515,17 +519,19 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         return 1;
 #endif
     }();
-    bool timed = pipe_env < 0 && V->pipe_choice < 0 && T > 1 && !F->prof_on;
+    bool timed = pipe_env < 0 && V->pipe_choice[T] < 0 && T > 1 && !F->prof_on;
     const bool use_pipe = pipe_env >= 0 ? pipe_env != 0
-                        : V->pipe_choice >= 0 ? V->pipe_choice != 0
-                        : V->ms_pipe.size() <= V->ms_batch.size();   // (timing: alternate, pipelined first)
+                        : V->pipe_choice[T] >= 0 ? V->pipe_choice[T] != 0
+                        : V->ms_pipe[T].size() <= V->ms_batch[T].size();   // (timing: alternate a width, pipelined first)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         auto* VM = (VerifyBuf*) m->vb_;
         VM->pipe_now = use_pipe;
         timed = timed && VM->pipe;   // (no scratch slots: every window is batched)
     }
+    dspark_settle();
     const int64_t p0 = pos_;
     pos_ += T;
+    dspark_window(p0, T);   // (DSpark: the kept columns into its context at spec_rewind)
     const bool gp = F->gap_on && split_next_ == nullptr;   // (as the token path: one device's events)
     if (gp) {
         cudaEventRecord(F->ev_g0, s);
@@ -585,19 +591,19 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
     }
     const double wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     F->ms += wms;
-    if (timed) {   // (the window kind still being timed: this one's ms a token; 3 of each decide)
-        (use_pipe ? V->ms_pipe : V->ms_batch).push_back(wms / T);
-        if (V->ms_pipe.size() >= 3 && V->ms_batch.size() >= 3) {
+    if (timed) {   // (the window kind still being timed: 3 of each at one width decide)
+        (use_pipe ? V->ms_pipe[T] : V->ms_batch[T]).push_back(wms);
+        if (V->ms_pipe[T].size() >= 3 && V->ms_batch[T].size() >= 3) {
             const auto median = [](std::vector<double> v) {
                 std::sort(v.begin(), v.end());
                 return v[v.size() / 2];
             };
-            const double mp = median(V->ms_pipe), mb = median(V->ms_batch);
-            V->pipe_choice = mp <= mb ? 1 : 0;
-            std::fprintf(stderr, "deepseek4 verify: the %s window here (%.1f ms a token against %.1f %s) - kept "
+            const double mp = median(V->ms_pipe[T]), mb = median(V->ms_batch[T]);
+            V->pipe_choice[T] = mp <= mb ? 1 : 0;
+            std::fprintf(stderr, "deepseek4 verify: the %s window here at %d columns (%.1f ms against %.1f %s) - kept "
                                  "(STRATA_DS4_SPEC_PIPE=0 batched, 1 pipelined)\n",
-                         V->pipe_choice ? "pipelined" : "batched", std::min(mp, mb), std::max(mp, mb),
-                         V->pipe_choice ? "batched" : "pipelined");
+                         V->pipe_choice[T] ? "pipelined" : "batched", T, std::min(mp, mb), std::max(mp, mb),
+                         V->pipe_choice[T] ? "batched" : "pipelined");
         }
     }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
@@ -707,6 +713,8 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
                 if (!verify_attn(il, p0, c0, nc, st, err)) return false;
                 cudaEventRecord(V->ev_attn[gi], st);
                 for (int t = c0; t < c0 + nc; ++t) defer_add(il, t, st);
+                if (dsp_ != nullptr && il > l0_)   // DSpark's features: the layer before's complete output
+                    for (int t = c0; t < c0 + nc; ++t) dspark_capture(il - 1, Rc[(size_t) t], t, st);
                 for (int t = c0; t < c0 + nc; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false, st);
                 cudaEvent_t after = gi > 0 ? V->ev_route[gi - 1] : il > l0_ ? V->ev_route[n_grp - 1] : nullptr;
                 if (!verify_moe(il, c0, nc, toks, st, after, V->ev_route[gi], err)) return false;
@@ -718,6 +726,8 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
             if (!verify_attn(il, p0, 0, T, s, err)) return false;
             mark(1);
             for (int t = 0; t < T; ++t) defer_add(il, t, s);
+            if (dsp_ != nullptr && il > l0_)
+                for (int t = 0; t < T; ++t) dspark_capture(il - 1, Rc[(size_t) t], t, s);
             for (int t = 0; t < T; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false, s);
             mark(2);
             if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
@@ -773,6 +783,7 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
         cudaStream_t st = pipe && !pipe_env1 ? V->st[t / grp] : s;
         gf::hc_post(V->ffn + (size_t) t * E, Rc[(size_t) t], V->post + (size_t) t * 8, V->comb + (size_t) t * 16,
                     g.n_embd, Ro[(size_t) t], st);
+        if (dsp_ != nullptr) dspark_capture(l1_ - 1, Ro[(size_t) t], t, st);
         ds::head_prep(Ro[(size_t) t], fn->second, sc->second, bs->second, g.hc_eps, nw->second, g.norm_eps, g.n_embd,
                       V->head_x + (size_t) t * E, (uint8_t*) V->head_xq + (size_t) t * (E / 32) * kQ8, st);
         if (pipe && t / grp > 0) {
