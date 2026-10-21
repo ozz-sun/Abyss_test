@@ -4,6 +4,7 @@
     ./setup-deepseek.sh                      everything below; each step is skipped when it is already done
     ./setup-deepseek.sh --quant UD-IQ3_XXS   another quant of unsloth/DeepSeek-V4-Flash-0731-GGUF
     ./setup-deepseek.sh --tools-only         only (re)create the Abyss-tools folder
+    ./setup-deepseek.sh --dspark             also DeepSeek's DSpark drafter (6.9 GB): faster answers (--no-dspark: off)
 
 What it does:
 
@@ -14,7 +15,9 @@ What it does:
      (asks first, or --download-model), every file checked against Hugging Face's SHA-256
   5. the pack next to the shards (tools/iq_pack.py --compat-bf16)
   6. the run config abyss-<name>.json and the start script run-abyss-<name>.sh in the Abyss folder
-  7. the Abyss-tools folder (abyss.sh start / stop / status / update / log / models) from ops/abyss-tools/
+  7. the DSpark drafter (asked when the config is new, or --dspark): bleysg's GGUF of DeepSeek's block drafter into
+     <data>/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF, its path in the config's env (STRATA_DS4_DSPARK)
+  8. the Abyss-tools folder (abyss.sh start / stop / status / update / log / models) from ops/abyss-tools/
 
 The data folder defaults to Abyss-data beside Abyss, the tools folder to Abyss-tools beside it.  The helpers (the PC
 checks, pip, llama.cpp's source, resumable downloads) are setup.py's, inherited from Maya and Strata.
@@ -48,6 +51,14 @@ KNOWN = {
          "a4bae0788c025c1b2388754592c98fefa1372981748ac9875039bf6a30e6eeb4"),
     ],
 }
+# DeepSeek's DSpark block drafter for V4-Flash-0731 (v1.3.43): bleysg's GGUF of the official drafter (3 layers over the
+# target's layers 40-42, Q2_K experts, the Markov head in Q8_0; MIT), pinned to the commit it was measured with.  The
+# engine loads it from the config's STRATA_DS4_DSPARK (src/core/dspark.cu) and takes ~6.5 GB of VRAM for it
+DSPARK_REPO = "bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF"
+DSPARK_REV = "57fae967d0c5dac1f32a444ea8884ec46459247b"
+DSPARK_FILE = ("DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf", 6940214304,
+               "d2025be3a4351f20d9f3d4c58eda9d8577cfda878bee7377bbb71af2087d9181")
+DSPARK_URL = "https://huggingface.co/{repo}/resolve/{rev}/{file}"
 TOOL_TEMPLATES = ROOT / "ops" / "abyss-tools"
 MANAGED = ("abyss.sh", "common.sh")        # replaced when the template changes (the old one kept as .bak)
 ONCE = ("README.md",)                      # written only when missing: the user's own notes go there
@@ -232,6 +243,60 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
     return cfg, run
 
 
+def dspark_step(a, data: Path, cfg: Path, fresh: bool, had: str | None, gpus, backend: str) -> None:
+    """The DSpark drafter: --dspark downloads it (SHA-256 checked) and names it in the config's env; --no-dspark takes
+    it out.  A new config asks (default no); a config that has it keeps it - also through --rewrite-config."""
+    conf = json.loads(cfg.read_text(encoding="utf-8"))
+    env = conf.setdefault("env", {})
+    have = env.get("STRATA_DS4_DSPARK") or None
+
+    def save(what: str) -> None:
+        cfg.write_text(json.dumps(conf, indent=1) + "\n", encoding="utf-8")
+        S.ok(what)
+
+    if a.no_dspark:
+        if have:
+            del env["STRATA_DS4_DSPARK"]
+            save(f"DSpark drafter off in {cfg.name} (the file stays: {have})")
+        else:
+            S.ok("DSpark drafter: off")
+        return
+    if len(gpus) > 1:   # (the engine runs the drafter on one device only)
+        S.ok("DSpark drafter: not with a layer split" + (" - left out of the config" if have else ""))
+        if have:
+            del env["STRATA_DS4_DSPARK"]
+            save(f"{cfg.name} written without STRATA_DS4_DSPARK")
+        return
+    if have and not a.dspark:
+        S.ok(f"DSpark drafter: on ({have})")
+        return
+    if had and not a.dspark and Path(had).exists():   # (--rewrite-config: the old config's drafter)
+        env["STRATA_DS4_DSPARK"] = had
+        save(f"DSpark drafter: on, as before ({had})")
+        return
+    name, size, sha = DSPARK_FILE
+    dst = data / "models" / DSPARK_REPO / name
+    if not a.dspark:
+        if not fresh:
+            S.ok("DSpark drafter: off (./setup-deepseek.sh --dspark downloads it, 6.9 GB, and turns it on)")
+            return
+        S.say("  DeepSeek's DSpark drafter (6.9 GB) proposes up to 5 tokens a step, and the model checks them in one pass")
+        S.say("  (the answers are still the model's own): on an AI PRO R9700 + 94 GB RAM, swe-bench coding tasks ran at")
+        S.say("  61.9 tok/s against 48.4. It takes ~6.5 GB of VRAM from the experts" +
+              (" (measured on AMD; the NVIDIA build compiles, not yet measured)" if backend == "cuda" else ""))
+        if min((g.get("vram_gb") or 0) for g in gpus) < 30:
+            S.say("  (measured on a 32 GB card; on a smaller one it takes a larger share of the experts' room)")
+        if S.ask("  Download it and turn it on?", ["y", "n"], "n", a.yes) != "y":
+            S.ok("DSpark drafter: off (./setup-deepseek.sh --dspark turns it on later)")
+            return
+    S.say(f"  {name}, {size / 1e9:.2f} GB -> {dst.parent}")
+    S.download(DSPARK_URL.format(repo=DSPARK_REPO, rev=DSPARK_REV, file=name), dst, name)
+    if not verified(dst, sha):
+        S.fail(f"{dst.name} does not match Hugging Face's SHA-256", "delete it and run again")
+    env["STRATA_DS4_DSPARK"] = str(dst)
+    save(f"DSpark drafter on in {cfg.name} (STRATA_DS4_DSPARK)")
+
+
 def make_tools(tools: Path) -> None:
     """The Abyss-tools folder from ops/abyss-tools: abyss.sh and common.sh follow the template (a changed one is kept
     as .bak), README.md is written once."""
@@ -274,8 +339,14 @@ def main() -> int:
     ap.add_argument("--download-model", action="store_true", help="download the model without asking")
     ap.add_argument("--yes", action="store_true", help="the defaults for every question (the download still needs --download-model)")
     ap.add_argument("--rewrite-config", action="store_true", help="write abyss-<name>.json again")
+    ap.add_argument("--dspark", action="store_true", help="download DeepSeek's DSpark drafter (6.9 GB) and turn it on in "
+                    "the config: drafts checked a step at a time, ~+28%% on swe-bench tasks on an AI PRO R9700 (~6.5 GB "
+                    "of VRAM; one GPU, DeepSeek V4 Flash 0731). Asked when the config is new")
+    ap.add_argument("--no-dspark", action="store_true", help="turn the DSpark drafter off in the config (the file stays)")
     ap.add_argument("--tools-only", action="store_true", help="only create / update the Abyss-tools folder")
     a = ap.parse_args()
+    if a.dspark and a.no_dspark:
+        ap.error("--dspark and --no-dspark together")
     tools = Path(a.tools_dir).expanduser().resolve()
     if a.tools_only:
         make_tools(tools)
@@ -346,10 +417,21 @@ def main() -> int:
         S.ok(f"pack: {pack}")
 
     S.step(6, "the run config")
-    write_config(name, pack, a.context, a.port, a.rewrite_config, gpus if len(gpus) > 1 and backend == "cuda" else None,
-                 hip_extra)
+    cfg_path = ROOT / f"abyss-{name}.json"
+    fresh = a.rewrite_config or not cfg_path.exists()
+    had = None
+    if cfg_path.exists():
+        try:
+            had = (json.loads(cfg_path.read_text(encoding="utf-8")).get("env") or {}).get("STRATA_DS4_DSPARK")
+        except (OSError, ValueError):
+            pass
+    cfg, _ = write_config(name, pack, a.context, a.port, a.rewrite_config,
+                          gpus if len(gpus) > 1 and backend == "cuda" else None, hip_extra)
 
-    S.step(7, "Abyss-tools")
+    S.step(7, "the DSpark drafter")
+    dspark_step(a, data, cfg, fresh, had, gpus, backend)
+
+    S.step(8, "Abyss-tools")
     make_tools(tools)
 
     S.say()
