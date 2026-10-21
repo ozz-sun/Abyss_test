@@ -95,6 +95,9 @@ struct VerifyBuf {
     cudaEvent_t ev_attn[4] = {}, ev_route[4] = {}, ev_fin[4] = {}, ev_start = nullptr;
     cudaEvent_t done = nullptr;
     int T = 0;                                // the last window's size
+    // column t's CPU-lane answer of the last layer, left to its next attention-side hc3 read (verify_moe, as fast_moe's
+    // STRATA_GLM_HC_CPU) - and the paced promotion copies, which go out after that read
+    bool hc_cpu[4] = {}, bg_after[4] = {};
 };
 }  // namespace
 
@@ -411,12 +414,24 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                       (uint8_t*) V->sh_hq + (size_t) tb * (FFs / 32) * kQ8, s);
     }
     // ... then each token's resident experts (its own plan and h) ...
+    static const bool wait_fetch = [] {   // STRATA_GLM_WAIT_FETCH, as fast_moe's
+        const char* v = getenv("STRATA_GLM_WAIT_FETCH");
+#if defined(STRATA_USE_HIP)
+        return v == nullptr || std::atoi(v) != 0;
+#else
+        return v != nullptr && std::atoi(v) != 0;
+#endif
+    }();
     for (int t = tb; t < tb + T; ++t) {
         const gf::MoeDev& md = V->md[(size_t) t];
         float* sh_out = V->sh_out + (size_t) t * E;
         void* hq = (uint8_t*) V->hq + (size_t) t * V->hq_n;
-        gf::moe_wait(md, E, s);
-        gf::moe_fetch(md, k, Ly.blob, s);
+        if (wait_fetch && !F->prof_on) {   // (one launch: gf::moe_wait_fetch, as fast_moe)
+            gf::moe_wait_fetch(md, E, k, Ly.blob, s);
+        } else {
+            gf::moe_wait(md, E, s);
+            gf::moe_fetch(md, k, Ly.blob, s);
+        }
         // the next route may find this one's promotions resident: it goes after their copies have landed
         if (done_ev != nullptr && t == tb + T - 1) cudaEventRecord(done_ev, s);
         gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
@@ -428,13 +443,25 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     // ... and the CPU lane's answers, in request order.  Deferred (F->defer, as fast_ffn): a column's part is
     // written into its streams after the next layer's attention (verify's hc_defer_add) with these write weights,
     // saved now; the trunk's (or this part's) last layer waits for its own
+    static const bool hc_cpu_env = [] {   // STRATA_GLM_HC_CPU, as fast_moe's
+        const char* v = getenv("STRATA_GLM_HC_CPU");
+#if defined(STRATA_USE_HIP)
+        return v == nullptr || std::atoi(v) != 0;
+#else
+        return v != nullptr && std::atoi(v) != 0;
+#endif
+    }();
+    const bool hc_cpu = lane && hc_cpu_env && !F->defer && !Ly.mtp && !F->prof_on && il != l1_ - 1 && gf::hc_fuses_cpu(E);
     if (F->defer && Ly.moe && !Ly.mtp && il != l1_ - 1) {
         if (lane)
             for (int t = tb; t < tb + T; ++t) gf::copy_floats(V->post_defer + (size_t) t * 8, V->post + (size_t) t * 8, 8, s);
+    } else if (hc_cpu) {
+        for (int t = tb; t < tb + T; ++t) V->hc_cpu[t] = true;
     } else if (lane) {
         for (int t = tb; t < tb + T; ++t) gf::moe_cpu_wait(V->md[(size_t) t], E, V->ffn + (size_t) t * E, s);
     }
-    F->bg_drain(s, F->bg_pace);   // the paced promotions' next bytes, as fast_moe
+    if (hc_cpu) V->bg_after[tb] = true;
+    else F->bg_drain(s, F->bg_pace);   // the paced promotions' next bytes, as fast_moe
     return true;
 }
 
@@ -608,8 +635,18 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
         h.xq = (uint8_t*) V->xq + (size_t) t * (E / 32) * kQ8;
         h.part = V->hpart + (size_t) t * V->hpart_n;
         h.counter = V->hcnt + (size_t) t * 16;
+        const bool cpu = attn && block_out != nullptr && V->hc_cpu[t];   // the column's last MoE answer, added here
+        if (cpu) {
+            h.cpu_seq = V->md[(size_t) t].cpu_seq;
+            h.cpu_ans = V->md[(size_t) t].cpu_ans;
+            V->hc_cpu[t] = false;
+        }
         gf::hc(h, hs);
         if (block_out != nullptr) std::swap(Rc[(size_t) t], Ro[(size_t) t]);
+        if (attn && V->bg_after[t]) {
+            V->bg_after[t] = false;
+            F->bg_drain(hs, F->bg_pace);
+        }
     };
     // expert deferral (F->defer, as fast_layers): the layer before's CPU-lane part of column t into its streams after
     // this layer's attention, with the weights verify_moe saved (its own md: the last route is the layer before's)
@@ -629,6 +666,7 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
             for (const char* ph : {"hc_attn", "attn", "hc_ffn", "moe"}) names.push_back("v" + std::to_string(n) + "_" + ph);
     const auto mark = [&](int ph) { if (prof) F->mark(names[(size_t) (T - 1) * 4 + ph].c_str()); };
     if (prof) F->mark("v_start");
+    for (int t = 0; t < 4; ++t) V->hc_cpu[t] = V->bg_after[t] = false;
     if (pipe) {
         // column t on stream t, after the embedding; per layer, its attention after column t - 1's (ring rows,
         // compressor state) and its route after column t - 1's (column 0: after the last column's of the layer before)
@@ -657,6 +695,18 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
             mark(2);
             if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
             mark(3);
+        }
+    }
+    // (verify_moe leaves no answer to a read past the part's last layer; the check is for safety)
+    for (int t = 0; t < T; ++t) {
+        cudaStream_t st = pipe && !pipe_env1 ? V->st[t] : s;
+        if (V->hc_cpu[t]) {
+            gf::moe_cpu_wait(V->md[(size_t) t], g.n_embd, V->ffn + (size_t) t * E, st);
+            V->hc_cpu[t] = false;
+        }
+        if (V->bg_after[t]) {
+            V->bg_after[t] = false;
+            F->bg_drain(st, F->bg_pace);
         }
     }
     // the last layer's write half; a part before the last: the columns' residuals to the next part (as a token's hop);

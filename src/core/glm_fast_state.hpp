@@ -590,6 +590,11 @@ struct Glm5Model::FastState {
     // ---- STRATA_GLM_PROF=1: a cudaEvent after every launch, the gaps summed per kernel name (debug only)
     bool prof_on = false;
     bool kda_graph_on = false;   // experimental, single-device ordinary decode only
+    // the CPU lane's answer of the last MoE, left to the next layer's attention-side hc3 read (fast_moe, HIP:
+    // STRATA_GLM_HC_CPU) - with the paced promotion copies, which go out after that read as they did after the wait
+    bool hc_cpu_on = false, bg_after_hc = false;
+    const unsigned int* hc_cpu_seq = nullptr;
+    const void* hc_cpu_ans = nullptr;
     glmfast::LayerGraphs kda_graphs;
     std::vector<cudaEvent_t> pev;
     std::vector<const char*> pname;

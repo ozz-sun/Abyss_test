@@ -1556,13 +1556,51 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__
 #pragma unroll
         for (int d = 0; d < 4; ++d) wv[r][d] = *(const uint2*) (wr + (size_t) d * n_embd);
     }
+    // the CPU LANE's answer for the last route (moe_cpu_wait, fused): block 0 alone polls the host-mapped answer and
+    // passes its seq on in device memory (cpu_seq[2]), where the other blocks wait - each poll is a PCIe read the
+    // CPU's memory serves while the lane reads its experts.  Then every block adds its own 128 values into
+    // block_out (moe_cpu_wait's float add, written back as it leaves them) and reads them from shared memory
+    __shared__ float s_bo[HC2_EB];
+    __shared__ unsigned int s_need;
+    const bool cpu = a.cpu_seq != nullptr && a.block_out != nullptr;
+    if (cpu) {
+        if (tid == 0) {
+            s_need = *a.cpu_seq;
+            if (s_need != 0u) {
+                volatile unsigned int* seen = (volatile unsigned int*) a.cpu_seq + 2;   // (as moe_cpu_wait's)
+                const long long t0 = clock64();   // bounded like moe_cpu_wait (~60 s)
+                if (b == 0) {
+                    const CpuAnswer* r = (const CpuAnswer*) a.cpu_ans + (s_need % kCpuAnswers);
+                    while (r->seq != s_need) {
+                        if (clock64() - t0 > (1ll << 36)) break;
+                    }
+                    __threadfence_system();
+                    *seen = s_need;
+                } else {
+                    while (*seen != s_need) {
+                        if (clock64() - t0 > (1ll << 36)) break;
+                    }
+                    __threadfence_system();
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < HC2_EB) {
+            float o = a.block_out[e0 + tid];
+            if (s_need != 0u)
+                o += ((const volatile float*) ((const CpuAnswer*) a.cpu_ans + (s_need % kCpuAnswers))->part)[e0 + tid];
+            ((float*) a.block_out)[e0 + tid] = o;
+            s_bo[tid] = o;
+        }
+        __syncthreads();
+    }
     // R_new for this block's 4 x 128 values (thread t: stream t / 64... two values per thread)
     float ss = 0.0f;
     for (int i = tid; i < 4 * HC2_EB; i += HC_THREADS) {
         const int d = i / HC2_EB, j = i - d * HC2_EB, e = e0 + j;
         float r;
         if (a.block_out != nullptr) {
-            r = a.block_out[e] * a.post_in[d];
+            r = (cpu ? s_bo[j] : a.block_out[e]) * a.post_in[d];
 #pragma unroll
             for (int s = 0; s < hc; ++s) r += a.comb_in[d * hc + s] * a.R_old[s * n_embd + e];
             a.R_new[d * n_embd + e] = r;
@@ -2738,7 +2776,14 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     ROUTE_PROF(6)
     MoeRequest* rq = (MoeRequest*) a.d.ring + (s_seq % kRingSize);
     if ((s_cpu != 0u || (a.promote_min < 0 && s_mask != 0u)) && !a.early_x) {   // (the disk lane reads x too)
-        for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq->x[e] = a.x[e];
+        // 16-byte stores, as EARLY X's: the 16 KB over PCIe in 1.6 us instead of 3.8 (AI PRO R9700, Gen4 x4)
+        if ((a.n_embd & 3) == 0) {
+            const float4* xs = (const float4*) a.x;
+            float4* xd = (float4*) rq->x;
+            for (int e = tid; e < a.n_embd / 4; e += ROUTE_THREADS) xd[e] = xs[e];
+        } else {
+            for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq->x[e] = a.x[e];
+        }
         route_put_xq(a, rq, tid);
     }
     if (tid == 0) {
@@ -2779,12 +2824,9 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     ROUTE_PROF(8)
 }
 
-__global__ void moe_wait_kernel(MoeDev d, int n_embd) {
-    __shared__ unsigned int s_need;
+// moe_wait's work for a route with misses (`s_need`, the whole block): the host's response, applied
+__device__ void moe_wait_apply(const MoeDev& d, int n_embd, unsigned int s_need) {
     const int tid = threadIdx.x;
-    if (tid == 0) s_need = *d.wait_seq;
-    __syncthreads();
-    if (s_need == 0) return;
     const MoeResponse* r = (const MoeResponse*) d.resp + (s_need % kCpuAnswers);   // (the host answers seq there)
     if (tid == 0) {
         // spin on the host's answer (bounded: a dead host must not hang the GPU forever - ~60 s)
@@ -2814,6 +2856,14 @@ __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
     }
 }
 
+__global__ void moe_wait_kernel(MoeDev d, int n_embd) {
+    __shared__ unsigned int s_need;
+    if (threadIdx.x == 0) s_need = *d.wait_seq;
+    __syncthreads();
+    if (s_need == 0) return;
+    moe_wait_apply(d, n_embd, s_need);
+}
+
 // the CPU LANE's answer for the last route (when it sent experts to the host): spin, then out += its weighted sum.
 // which: 0 the last route's (cpu_seq[0]), 1 the route before it (cpu_seq[1]: EXPERT DEFERRAL - the host's part of
 // layer l is added one layer late, into layer l + 1's FFN output, so the lane is never waited for)
@@ -2825,11 +2875,31 @@ __global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out, int which)
     if (s_need == 0) return;
     const CpuAnswer* r = (const CpuAnswer*) d.cpu_ans + (s_need % kCpuAnswers);
     if (tid == 0) {
+#if defined(STRATA_USE_HIP)
+        // block 0 alone polls the host-mapped answer and passes its seq on in device memory (cpu_seq[2]), where the
+        // other blocks wait: every poll is a PCIe read the CPU's memory serves while the lane reads its experts
+        // (hc3's 32 pollers made an R9700 host's CPU lane ~12% slower; not measured on NVIDIA, which keeps 8)
+        volatile unsigned int* seen = (volatile unsigned int*) d.cpu_seq + 2;
+        const long long t0 = clock64();   // bounded like moe_wait (~60 s)
+        if (blockIdx.x == 0) {
+            while (r->seq != s_need) {
+                if (clock64() - t0 > (1ll << 36)) break;
+            }
+            __threadfence_system();
+            *seen = s_need;
+        } else {
+            while (*seen != s_need) {
+                if (clock64() - t0 > (1ll << 36)) break;
+            }
+            __threadfence_system();
+        }
+#else
         const long long t0 = clock64();   // bounded like moe_wait (~60 s)
         while (r->seq != s_need) {
             if (clock64() - t0 > (1ll << 36)) break;
         }
         __threadfence_system();
+#endif
     }
     __syncthreads();
     // the host's part: 16-byte uncached loads spread over the grid's blocks (each block waits for the answer
@@ -2904,7 +2974,7 @@ __global__ void __launch_bounds__(256) moe_prefetch_kernel(MoeDev d, size_t n16)
 }
 
 // one block per SM, 16-byte loads: the PCIe pull measured 11.5 GB/s (a little over cudaMemcpy's 10.7)
-__global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t n16) {
+__device__ __forceinline__ void moe_fetch_body(const MoeDev& d, int k, size_t n16) {
     for (int i = 0; i < k; ++i) {
         const unsigned long long src = d.fetch_src[i];
         if (src == 0ull) continue;
@@ -2915,16 +2985,15 @@ __global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t 
     }
 }
 
+__global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t n16) { moe_fetch_body(d, k, n16); }
+
 // STREAMED: the host posted the response before its disk reads finished, and each read job sets a bit of
 // ready[i] (part * n_chunks + chunk, fast_read_part's layout) once its chunk is in the landing slot.  Block b copies
 // the chunks whose bit is b modulo the grid, each as soon as it is set - the PCIe pull (~6 GB/s) runs behind the
 // SSD (~3.4) instead of after it, so only the last chunk's copy stays exposed.  Entries outside stream_mask are
 // whole blobs, as above.  A bit that never comes (a dead host) gives up after ~60 s like moe_wait.
-__global__ void __launch_bounds__(256) moe_fetch_stream_kernel(MoeDev d, int k, size_t n16, unsigned long long gu,
-                                                               unsigned long long dn, int rch) {
-    __shared__ unsigned int s_need;
-    if (threadIdx.x == 0) s_need = *d.wait_seq;
-    __syncthreads();
+__device__ void moe_fetch_stream_body(const MoeDev& d, int k, size_t n16, unsigned long long gu, unsigned long long dn,
+                                      int rch, unsigned int s_need) {
     const volatile MoeResponse* r = s_need != 0u ? (const volatile MoeResponse*) d.resp + (s_need % kCpuAnswers) : nullptr;
     const unsigned int sm = r != nullptr ? r->stream_mask : 0u;
     for (int i = 0; i < k; ++i) {
@@ -2962,6 +3031,48 @@ __global__ void __launch_bounds__(256) moe_fetch_stream_kernel(MoeDev d, int k, 
             __syncthreads();
         }
     }
+}
+
+__global__ void __launch_bounds__(256) moe_fetch_stream_kernel(MoeDev d, int k, size_t n16, unsigned long long gu,
+                                                               unsigned long long dn, int rch) {
+    __shared__ unsigned int s_need;
+    if (threadIdx.x == 0) s_need = *d.wait_seq;
+    __syncthreads();
+    moe_fetch_stream_body(d, k, n16, gu, dn, rch, s_need);
+}
+
+// moe_wait and moe_fetch in one launch: a route without disk misses - the rule once warm - goes straight to the
+// copies; with misses, block 0 waits for the host's response and applies it as moe_wait does, then passes the seq on
+// in device memory (wait_seq[1]), where the other blocks wait before they read the plan
+template <bool STREAM>
+__global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_embd, int k, size_t n16,
+                                                             unsigned long long gu, unsigned long long dn, int rch) {
+    __shared__ unsigned int s_need;
+    if (threadIdx.x == 0) s_need = *d.wait_seq;
+    __syncthreads();
+    const unsigned int need = s_need;
+    if (need != 0u) {
+        volatile unsigned int* done = (volatile unsigned int*) d.wait_seq + 1;
+        if (blockIdx.x == 0) {
+            moe_wait_apply(d, n_embd, need);
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                __threadfence();
+                *done = need;
+            }
+        } else {
+            if (threadIdx.x == 0) {
+                const long long t0 = clock64();   // bounded like moe_wait (~60 s)
+                while (*done != need) {
+                    if (clock64() - t0 > (1ll << 36)) break;
+                }
+                __threadfence();
+            }
+            __syncthreads();
+        }
+    }
+    if (STREAM) moe_fetch_stream_body(d, k, n16, gu, dn, rch, need);
+    else moe_fetch_body(d, k, n16);
 }
 
 constexpr int GU_ROWS = 32;   // h values (gate rows = up rows) per block: one q8_1 block of h
@@ -3790,9 +3901,9 @@ void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s) {
     launch_check("quantize");
 }
 
-void hc(const HcArgs& a, cudaStream_t s) {
-    // the grid-barrier kernel needs every block resident at once; checked once per process (and per device count
-    // of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).
+// the grid-barrier kernel needs every block resident at once; checked once per process (and per device count
+// of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).
+static int hc_mode(int n_embd) {
     static int mode = -1;
     if (mode < 0) {
         int dev = 0, sms = 0, per = 0, per3 = 0;
@@ -3800,9 +3911,27 @@ void hc(const HcArgs& a, cudaStream_t s) {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, hc2_kernel, HC_THREADS, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3, hc3_kernel, HC_THREADS, 0);
-        mode = (getenv("STRATA_GLM_HC1") == nullptr && per * sms >= a.n_embd / HC2_EB) ? 2 : 1;
-        if (mode == 2 && getenv("STRATA_GLM_HC2") == nullptr && a.n_embd == 4096 && per3 * sms >= a.n_embd / HC2_EB)
+        mode = (getenv("STRATA_GLM_HC1") == nullptr && per * sms >= n_embd / HC2_EB) ? 2 : 1;
+        if (mode == 2 && getenv("STRATA_GLM_HC2") == nullptr && n_embd == 4096 && per3 * sms >= n_embd / HC2_EB)
             mode = 3;
+    }
+    return mode;
+}
+
+bool hc_fuses_cpu(int n_embd) { return hc_mode(n_embd) == 3 && n_embd == 4096; }
+
+void hc(const HcArgs& a, cudaStream_t s) {
+    const int mode = hc_mode(a.n_embd);
+    if (a.cpu_seq != nullptr && a.block_out != nullptr && !(mode == 3 && a.pre_use == nullptr)) {
+        // (a caller that asked hc_fuses_cpu() never lands here: the CPU lane's answer in its own launch first)
+        MoeDev d;
+        d.cpu_seq = (unsigned int*) a.cpu_seq;
+        d.cpu_ans = a.cpu_ans;
+        moe_cpu_wait(d, a.n_embd, (float*) a.block_out, s);
+        HcArgs b = a;
+        b.cpu_seq = nullptr;
+        hc(b, s);
+        return;
     }
     if (mode == 3 && a.pre_use == nullptr) {   // (hc3 has no lagged collapse: deepseek41 runs hc2)
         HcArgs g3 = a;
@@ -4103,6 +4232,23 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, size_t
     else
         moe_fetch_kernel<<<sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16);
     launch_check("moe_fetch");
+}
+
+void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s, size_t gu_bytes,
+                    size_t dn_bytes, int n_chunks) {
+    static int sms = 0;
+    if (sms == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (sms <= 0) sms = 80;
+    }
+    if (n_chunks > 0 && gu_bytes > 0 && dn_bytes > 0)
+        moe_wait_fetch_kernel<true><<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16, gu_bytes, dn_bytes,
+                                                        n_chunks);
+    else
+        moe_wait_fetch_kernel<false><<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16, 0, 0, 0);
+    launch_check("moe_wait_fetch");
 }
 
 #if defined(STRATA_USE_HIP)

@@ -83,8 +83,13 @@ struct HcArgs {
                                       // grid barrier; set by hc() from STRATA_GLM_HC_GRAM, default on)
     const float* pre_use = nullptr;   // deepseek41: the collapse weights (the PREVIOUS sublayer's pre, 4 floats); null =
                                       // this sublayer's own pre.  pre still receives the new one (another buffer)
+    const unsigned int* cpu_seq = nullptr;   // the CPU LANE's answer for the last route (MoeDev::cpu_seq[0], 0 = none):
+    const void* cpu_ans = nullptr;           // added into block_out first (MoeDev::cpu_ans) - moe_cpu_wait, fused
 };
 void hc(const HcArgs& a, cudaStream_t s);
+/// hc() runs hc3 for this width (the kernel that can take HcArgs::cpu_seq itself; the others wait in moe_cpu_wait's
+/// kernel first)
+bool hc_fuses_cpu(int n_embd);
 /// The write half alone (the split boundary / the head): R_new = post (x) block_out + comb . R_old.
 void hc_post(const float* block_out, const float* R_old, const float* post, const float* comb, int n_embd,
              float* R_new, cudaStream_t s);
@@ -181,13 +186,15 @@ struct MoeDev {
     unsigned long long* pf_dst = nullptr;      // [8] ... their (claimed spare) slot,
     int* pf_n = nullptr;                       // ... and how many (the side-stream fetch kernel reads these)
     unsigned int* seq = nullptr;               // the device's request counter
-    unsigned int* wait_seq = nullptr;          // the seq the wait kernel must see answered (0 = none)
+    unsigned int* wait_seq = nullptr;          // the seq the wait kernel must see answered (0 = none); [1] the last
+                                               // one moe_wait_fetch's block 0 applied (the other blocks wait on it)
     void* ring = nullptr;                      // host-mapped request ring (device pointer)
     const void* resp = nullptr;                // host-mapped response (device pointer)
     float* cpu_part = nullptr;                 // n_embd: the host's contribution (misses computed off-GPU)
     int* cpu_flag = nullptr;                   // 1 when cpu_part holds this layer's contribution
     unsigned int* cpu_seq = nullptr;           // the CPU LANE: [0] the seq whose answer moe_cpu_wait must see (0 = none),
-                                               // [1] the route before's (expert deferral)
+                                               // [1] the route before's (expert deferral), [2] the last answer
+                                               // the waits' polling block saw (the other blocks wait on it)
     const void* cpu_ans = nullptr;             // ... host-mapped CpuAnswer (device pointer)
     unsigned int* dcnt = nullptr;              // ... [n_keys] routes per key (halved every 4096 routes): the coldest
                                                //     RAM-tier experts go to the host, the hot ones are promoted
@@ -281,6 +288,9 @@ void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
 /// chunk as the host's reads land (gu_bytes / dn_bytes / n_chunks: the layout of fast_read_part's chunks)
 void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, size_t gu_bytes = 0, size_t dn_bytes = 0,
                int n_chunks = 0);
+/// moe_wait then moe_fetch in one launch (the same work; a route without misses skips the wait)
+void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s, size_t gu_bytes = 0,
+                    size_t dn_bytes = 0, int n_chunks = 0);
 /// One host-mapped blob copied into VRAM the way moe_fetch copies a RAM-tier expert (SMs reading over PCIe, not the
 /// copy engine): the CPU lane's calibration times the decode's own PCIe path with it.
 void zero_copy(const void* src, void* dst, size_t bytes, cudaStream_t s);

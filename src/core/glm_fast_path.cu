@@ -4683,12 +4683,28 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         if (F->prof_on) F->mark("shexp_mv");
     }
     // disk-only experts (rare once warm) park the device until the host has read them; everything not
-    // in VRAM is then pulled over PCIe into its slot, and all 8 run from VRAM
-    gf::moe_wait(md, g.n_embd, s);
-    if (F->prof_on) F->mark("moe_wait");
-    if (F->stream_fetch) gf::moe_fetch(md, g.n_exp_used, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks);
-    else gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
-    if (F->prof_on) F->mark("moe_fetch");
+    // in VRAM is then pulled over PCIe into its slot, and all 8 run from VRAM.  STRATA_GLM_WAIT_FETCH (default on with
+    // HIP; 0 off, 1 on CUDA too - not measured there): the wait and the copies in one launch (gf::moe_wait_fetch)
+    static const bool wait_fetch = [] {
+        const char* v = getenv("STRATA_GLM_WAIT_FETCH");
+#if defined(STRATA_USE_HIP)
+        return v == nullptr || std::atoi(v) != 0;
+#else
+        return v != nullptr && std::atoi(v) != 0;
+#endif
+    }();
+    if (wait_fetch && !F->prof_on) {
+        if (F->stream_fetch)
+            gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks);
+        else
+            gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s);
+    } else {
+        gf::moe_wait(md, g.n_embd, s);
+        if (F->prof_on) F->mark("moe_wait");
+        if (F->stream_fetch) gf::moe_fetch(md, g.n_exp_used, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks);
+        else gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
+        if (F->prof_on) F->mark("moe_fetch");
+    }
     if (pf && pf_at == 1) issue_prefetch();
     // this layer's own prefetched experts (issued one layer ago) must have landed before they are read
     if (pf_pending) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
@@ -4727,6 +4743,20 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     // the CPU lane's experts last: the device's own down rows ran while the CPU worked.  Deferred (F->defer): the
     // layer before's part is added here instead, this layer's by the next (the last trunk layer adds both; in a
     // layer split each part's last layer, so the hop carries a complete residual and the next part starts clean)
+    // STRATA_GLM_HC_CPU (default on with HIP; 0 off, 1 on CUDA too - not measured there): deepseek4's answer is added
+    // by the next layer's attention-side hc3 read instead (gf::HcArgs::cpu_seq) - a launch less a layer, and the
+    // answer's 16 KB read by hc3's 32 blocks instead of the wait kernel's 8.  The same float add: bit-identical
+    static const bool hc_cpu_env = [] {
+        const char* v = getenv("STRATA_GLM_HC_CPU");
+#if defined(STRATA_USE_HIP)
+        return v == nullptr || std::atoi(v) != 0;
+#else
+        return v != nullptr && std::atoi(v) != 0;
+#endif
+    }();
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    const bool hc_cpu = lane && hc_cpu_env && g.dsv4() && !g.v41 && !F->defer && !Ly.mtp && !Ly.exl3 && !F->prof_on &&
+                        !dumps && il + 1 < l1_ && !(pf && pf_at == 2) && !F->kda_graph_on && gf::hc_fuses_cpu(g.n_embd);
     if (F->defer && !Ly.mtp) {
         if (il == l1_ - 1) {   // the trunk's (or this part's) last layer: nothing after it here to defer into
             gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
@@ -4734,6 +4764,10 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         } else if (lane) {            // its write weights, for the add after the next layer's attention
             gf::copy_floats(F->post_defer, F->post, 8, s);
         }
+    } else if (hc_cpu) {
+        F->hc_cpu_on = true;
+        F->hc_cpu_seq = md.cpu_seq;
+        F->hc_cpu_ans = md.cpu_ans;
     } else if (lane) {
         gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
         if (F->prof_on) F->mark("moe_cpu_wait");
@@ -4744,7 +4778,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         pf_pending = true;
     }
     // the paced promotions' next bytes: across the link while the next layer's mixer runs (no zero-copy reads there)
-    if (!F->kda_graph_on) F->bg_drain(s, F->bg_pace);
+    if (hc_cpu) F->bg_after_hc = true;
+    else if (!F->kda_graph_on) F->bg_drain(s, F->bg_pace);
     return true;
 }
 
@@ -4763,6 +4798,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
                         getenv("GLM_DUMP_H") == nullptr;
     F->kda_graph_on = graphs;
     if (graphs) F->bg_drain(nullptr, SIZE_MAX);   // (paced copies are not issued from inside a capture)
+    F->hc_cpu_on = F->bg_after_hc = false;
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -4804,7 +4840,18 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             h.pre = F->v41_pre[0];
             h.pre_use = F->v41_pre[1];
         }
+        if (F->hc_cpu_on && wrote) {   // the last MoE's CPU-lane answer, added by this read (fast_moe)
+            h.cpu_seq = F->hc_cpu_seq;
+            h.cpu_ans = F->hc_cpu_ans;
+            F->hc_cpu_on = false;
+        }
         gf::hc(h, s);
+        h.cpu_seq = nullptr;
+        h.cpu_ans = nullptr;
+        if (F->bg_after_hc) {
+            F->bg_after_hc = false;
+            F->bg_drain(s, F->bg_pace);
+        }
         if (F->prof_on) F->mark("hc_attn");
         if (wrote) std::swap(Rc, Ro);
         if (dumps) {
@@ -4920,7 +4967,19 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             return false;
         }
     }
-    // the last layer's write half: R (in the OTHER buffer) = post x ffn + comb . R
+    // the last layer's write half: R (in the OTHER buffer) = post x ffn + comb . R  (fast_moe leaves no answer to a
+    // hc3 read past the part's last layer; the check is for safety)
+    if (F->hc_cpu_on) {
+        gf::MoeDev d;
+        d.cpu_seq = (unsigned int*) F->hc_cpu_seq;
+        d.cpu_ans = F->hc_cpu_ans;
+        gf::moe_cpu_wait(d, g.n_embd, F->ffn, s);
+        F->hc_cpu_on = false;
+    }
+    if (F->bg_after_hc) {
+        F->bg_after_hc = false;
+        F->bg_drain(s, F->bg_pace);
+    }
     gf::hc_post(F->ffn, Rc, F->post, F->comb, g.n_embd, Ro, s);
     if (F->prof_on) F->mark("hc_post_end");
     // keep the convention "the residual lives at state_" for the hop and the head: copy back
