@@ -1610,17 +1610,19 @@ static int glm_pack_generate(const Options& o) {
         } else if (model.dspark_ready() && model.fast() && model.verify_ready()) {
             // DSpark's speculative decode (STRATA_DS4_DSPARK=<the drafter GGUF>): after each token the drafter
             // proposes the next 5 with a confidence each; the leading ones at or above STRATA_DS4_DSPARK_THR (default
-            // 0.7, ds4's) go through a verify window behind the token, compared and kept as the n-gram decode's below
+            // 0.6; ds4's 0.7: swe-bench 61.3 against 61.9 tok/s, 0.8 59.8) go through a verify window behind the token, compared and kept as the n-gram decode's below
             // (the same samples: only the time per token changes).  No confident draft: the token alone.  A repeat
             // first (STRATA_DS4_DSPARK_NGRAM, default 1): when the last spec_min tokens occurred before, the tokens
             // after that occurrence are the window's drafts and the drafter does not run - free, and on a swe-bench
             // task's copied code as good as its drafts (t003: 87% of 5 accepted against 92%) - while the repeats'
             // drafts keep being accepted: every step checks the repeat's proposal against the tokens that came
-            // (whichever drafter ran), and below STRATA_DS4_DSPARK_NGRAM_P (default 0.75) of them right the drafter
-            // takes over (new code: 22% of 5 accepted, which cost DSpark's steps their windows)
+            // (whichever drafter ran), a share right for each of its 5 positions (the one before right).  The first
+            // below STRATA_DS4_DSPARK_NGRAM_P (default 0.75): the drafter takes over (new code: 22% of 5 accepted,
+            // which cost DSpark's steps their windows); else the repeat's drafts while the product of the shares
+            // stays >= STRATA_DS4_DSPARK_NGRAM_CHAIN (default 0.5: swe-bench t025's 5 drafts were 53% accepted)
             static const float d_thr = [] {
                 const char* v = std::getenv("STRATA_DS4_DSPARK_THR");
-                return v != nullptr ? (float) std::atof(v) : 0.7f;
+                return v != nullptr ? (float) std::atof(v) : 0.6f;
             }();
             static const int d_max = [] {   // STRATA_DS4_DSPARK_K: drafts a window at most (1..5)
                 const char* v = std::getenv("STRATA_DS4_DSPARK_K");
@@ -1640,10 +1642,15 @@ static int glm_pack_generate(const Options& o) {
                 const char* v = std::getenv("STRATA_DS4_DSPARK_NGRAM_P");
                 return v != nullptr ? std::atof(v) : 0.75;
             }();
+            static const double d_ngc = [] {
+                const char* v = std::getenv("STRATA_DS4_DSPARK_NGRAM_CHAIN");
+                return v != nullptr ? std::atof(v) : 0.5;
+            }();
             NgramDrafter dr(spec_min);
             for (const int64_t t : prompt) dr.push((int32_t) t);
             std::vector<int32_t> ng, came;   // the repeat's proposal; the tokens the step produced after tok
-            double ng_p = 0.8;               // the repeats' drafts: the share right (a running mean, each position)
+            double ng_pp[5] = {0.8, 0.8, 0.8, 0.8, 0.8};   // the repeats' drafts: the share right at each position
+                                                            // (running means, the positions before right)
             int64_t n_ngw = 0, n_ngd = 0, n_nga = 0;   // the repeats' windows, drafts, accepted
             int tok = model.sample_token(sp, err);
             if (tok < 0) {
@@ -1675,14 +1682,18 @@ static int glm_pack_generate(const Options& o) {
                 ng.clear();
                 if (d_ngram && room > 0) {
                     dr.propose(room, ng);
-                    rep = !ng.empty() && ng_p >= d_ngp;
-                    for (k = 0; rep && k < (int) ng.size(); ++k) d[k] = ng[(size_t) k];
+                    rep = !ng.empty() && ng_pp[0] >= d_ngp;
+                    double pc = 1.0;
+                    for (k = 0; rep && k < (int) ng.size() && (k == 0 || pc * ng_pp[k] >= d_ngc); ++k) {
+                        pc *= ng_pp[k];
+                        d[k] = ng[(size_t) k];
+                    }
                 }
                 // the repeat's proposal against what the step produces (its accepted drafts, then the next token)
                 const auto ng_learn = [&]() {
-                    for (size_t i = 0; i < ng.size() && i < came.size(); ++i) {
+                    for (size_t i = 0; i < ng.size() && i < came.size() && i < 5; ++i) {
                         const bool hit = ng[i] == came[i];
-                        ng_p = 0.95 * ng_p + 0.05 * (hit ? 1.0 : 0.0);
+                        ng_pp[i] = 0.95 * ng_pp[i] + 0.05 * (hit ? 1.0 : 0.0);
                         if (!hit) break;
                     }
                 };
