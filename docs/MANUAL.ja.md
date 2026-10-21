@@ -17,6 +17,7 @@ Abyss は [Project Maya](https://github.com/mw00/project-maya)（MIT）をコピ
 - [DeepSeek V4.1 Flash](#deepseek-v41-flash)
 - [EXL3 量子化（GLM-5.3-Flash）](#exl3-量子化glm-53-flash)
 - [メモリと速度](#メモリと速度)
+- [DSpark のドラフトモデル（DeepSeek V4 Flash）](#dspark-のドラフトモデルdeepseek-v4-flash)
 - [設定項目](#設定項目)
 - [llama.cpp との照合](#llamacpp-との照合)
 - [うまくいかないとき](#うまくいかないとき)
@@ -55,7 +56,10 @@ cd ~/llm/apps/Abyss
    なければ先に確認する）。全ファイルを Hugging Face の SHA-256 と照合する
 5. シャードと同じフォルダに pack を作る
 6. Abyss のフォルダに設定 `abyss-<名前>.json` と起動スクリプト `run-abyss-<名前>.sh` を書く
-7. Abyss の隣に **Abyss-tools** フォルダを作る（`abyss.sh start | stop | restart | status | update | build | log | models`。
+7. DSpark のドラフトモデル（v1.3.43、任意）: 設定が新しいときは、DeepSeek の DSpark ドラフトモデル（6.9 GB）をダウンロードして
+   使うかを確認する（`--dspark` なら確認なし）。SHA-256 を照合し、設定の `env` に書く
+   （[DSpark のドラフトモデル](#dspark-のドラフトモデルdeepseek-v4-flash)）
+8. Abyss の隣に **Abyss-tools** フォルダを作る（`abyss.sh start | stop | restart | status | update | build | log | models`。
    雛形は本体の `ops/abyss-tools/`）。セットアップを再実行すると `abyss.sh` / `common.sh` は雛形に合わせて更新し
    （前のものは `.bak` に残す）、自分で書いた `README.md` はそのまま残す
 
@@ -74,7 +78,8 @@ cd ~/llm/apps/Abyss
 | `--nvcc PATH` | ビルドに使う CUDA コンパイラ（V100 には CUDA 12 のもの） |
 | `--gpus 0,1`, `--gpus all` | 複数の GPU に層を分けて載せる（下の「複数の GPU」）。全 GPU のアーキテクチャをまとめてビルドする |
 | `--download-model`, `--yes` | 確認せずにダウンロード、すべての質問に既定値で答える |
-| `--rewrite-config` | `abyss-<名前>.json` を書き直す（なければ既存のものを残す） |
+| `--rewrite-config` | `abyss-<名前>.json` を書き直す（なければ既存のものを残す。書いてあった DSpark ドラフトモデルはそのまま使う） |
+| `--dspark`, `--no-dspark` | DeepSeek の DSpark ドラフトモデル（6.9 GB、`../Abyss-data/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF` へ）をダウンロードして設定でオンにする / 設定でオフにする（ファイルは残す）。GPU 1 枚のときだけ |
 | `--tools-only` | Abyss-tools だけを作る / 更新する |
 
 以下の節は、同じことを手で行う手順。
@@ -319,7 +324,8 @@ Radeon 8060S（gfx1151）。
 - **確認済みの範囲:** Radeon 8060S（gfx1151）単体と、AI PRO R9700（gfx1201）で 8060S を iGPU レーンにした構成。
   R9700 では DeepSeek V4 が swe-bench の問題で 36〜42 tok/s（v1.3.39）、51.7 tok/s（v1.3.41。レーンなしで 49.6）、
   1 トークンずつで 52 tok/s（v1.3.40。レーンなしは v1.3.41 で 46）で、CUDA 版との KL はぶれの範囲内（0.005〜0.006）
-  だった。
+  だった。DSpark のドラフトモデル（v1.3.43）を使うと、同じ swe-bench の問題がレーンなしで 61.9 tok/s、レーンありで
+  67.3 tok/s（[DSpark のドラフトモデル](#dspark-のドラフトモデルdeepseek-v4-flash)）。
 - **ROCm の HW キュー:** `GPU_MAX_HW_QUEUES` は 2 のままにする（セットアップが書く）。R9700 向けの手順にある 1 では、
   prompt が 3 分の 1 ほど遅くなる（[docs/amd](amd/README.ja.md#3-環境変数)）。
 - **Ryzen AI Max に単体の Radeon をつないだ場合:** NVIDIA のカードのときと同じく、iGPU が RAM 層のエキスパートを
@@ -411,6 +417,69 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 学習するゲートがあり、割に合わない間は候補を出さない。コーディングの prompt で +10〜13%（候補の 77〜85% が採用）、
 文章ではほぼ変わらない（採用は約 50%）。`STRATA_DS4_SPEC=0` でオフ。GPU を分割しているときも使う（v1.3.26）。
 
+## DSpark のドラフトモデル（DeepSeek V4 Flash）
+
+v1.3.43 から、DeepSeek V4 Flash 0731 に DeepSeek の DSpark ブロックドラフトモデルを並べて動かせる。DeepSeek V4 の 3 層が
+本体の 40〜42 層の出力を読み、次の 5 トークンをそれぞれの確信度つきでまとめて提案する。確信度 0.6 以上が続く先頭の下書きを、
+そのトークンと一緒に 1 回の検証の窓に通し、本体のサンプリングと一致したものだけを残す。回答は本体が出すものとして変わらず、
+変わるのは 1 トークンあたりの時間だけ。ファイルは公式のドラフトモデルを bleysg が GGUF にした
+[`DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf`](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)
+（6.94 GB、MIT。expert は Q2_K、Markov ヘッドは Q8_0）。
+
+**オンにする。** `./setup-deepseek.sh --dspark` がダウンロードして SHA-256 を照合し、設定に書き足す:
+
+```json
+"env": {"STRATA_DS4_DSPARK": "/home/you/llm/apps/Abyss-data/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF/DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf"}
+```
+
+そのあとサーバーを再起動する（`../Abyss-tools/abyss.sh restart`）。`./setup-deepseek.sh --no-dspark`（またはこの行を消す）で
+オフに戻る。起動時のエンジンのログの `dspark:` の行に、読んだファイルと使った VRAM が出る（`3 stages over target layers
+40-42, 5 drafts a step; 6.48 GB on CUDA0 ...`）。使えるのは DeepSeek V4 Flash 0731 を GPU 1 枚で動かすときだけで、層の分割、
+DeepSeek V4.1、MTP ブロックとは併用できない。そのときは `dspark: not loaded - <理由>` と出て、本体はドラフトモデルなしで動く。
+
+**かかるもの。** ドラフトモデルは重みと expert をすべて VRAM に置く。6.48 GB で、その分 expert のプールが小さくなる。RAM 層は
+ドラフトモデルなしのときの大きさのままにするので、いちばん使われない約 6.5 GB の expert は SSD から読むことになる（下の
+マシンの生成中で 1 トークンあたり 0.01 回）。RAM に余裕のある PC では、これまでどおり `STRATA_GLM_RAM_GB` で RAM 層の大きさを
+手で決められる。この上限がないと、RAM 層がその expert まで pinned で持とうとする。RAM 94 GB の PC では 73.9 GB を pinned に
+して空きが 13 GB になり、8K の prompt に 11 秒ではなく 301 秒かかった。下書き 1 回は AI PRO R9700 で約 4.4 ms。
+
+**速さ**（AI PRO R9700、OCuLink PCIe Gen4 x4。RAM 94 GB の Ryzen AI Max+ 395 の PC。UD-Q2_K_XL と Q5_K の attention pack、
+サーバー経由）:
+
+| | ドラフトモデルなし | DSpark |
+| --- | :---: | :---: |
+| swe-bench のコーディング 6 問（サンプリングあり、通し）、内蔵 GPU なし | 48.4 tok/s（v1.3.42） | 61.9 tok/s |
+| 同じく内蔵 GPU レーンあり | 51.7 tok/s（v1.3.41） | 67.3 tok/s |
+| 1,024 トークンの回答、コード / 散文（貪欲、内蔵 GPU なし） | 46.6〜48.6 / 47.2〜47.5 tok/s | 63.4〜66.4 / 50.5〜51.4 tok/s |
+| prompt 8K / 16K | 850 / 978〜1,028 tok/s | 799 / 977〜1,000 tok/s |
+
+swe-bench の問題ごとに +16〜32%。これらの問題では下書きの 68〜82% が受理され、1 回の確認で 2.7〜3.7 トークン進む（コードを
+写す問題では 4.7）。散文の伸びがいちばん小さい（1 回 2 トークンほど）。検証の窓は 1 列あたり約 9 ms かかり、これは CPU
+レーンが 1 トークン分の RAM 層 expert を計算する時間（8.4 ms。RAM の約 93 GB/s で約 93 個）とほぼ同じ。速さを決めているのは
+ドラフトモデルではなく窓なので、速い GPU より速い CPU / RAM や内蔵 GPU レーンのほうが効く。NVIDIA はビルドが通るだけで、
+まだ動かしていない。
+
+**1 回ごとの選び方。** 直前の 3 トークンが prompt か回答の前のほうに出ていれば、その続き（最大 5 トークン）を窓の下書きに
+して、ドラフトモデルは動かさない。ただし、その繰り返しが当たり続けている間だけ: 毎回、繰り返しの提案を実際に出たトークンと
+照らし、位置ごとの当たり率を追う。先頭の位置が 0.75 を下回るとドラフトモデルに切り替え、そうでなければ位置ごとの当たり率の
+積が 0.5 以上の長さまで繰り返しを使う。確信度の高い下書きがなければ、そのトークンだけを処理する。回答ごとにエンジンの
+ログに出る `ds4 dspark:` の行に、窓の数、下書きと受理の数、1 回で進んだトークン数が出る。
+
+**設定項目**（設定ファイルの `env`）:
+
+| 設定 | 既定 | |
+| --- | --- | --- |
+| `STRATA_DS4_DSPARK` | オフ | `<ドラフトモデルの GGUF>`: DeepSeek の DSpark ドラフトモデルを読み、それで生成する |
+| `STRATA_DS4_DSPARK_THR` | 0.6 | 下書きに必要な確信度。下回る最初の下書きで窓を打ち切る（swe-bench: 0.7 で 61.3、0.8 で 59.8 tok/s、0.6 は 61.9。ds4 は 0.7） |
+| `STRATA_DS4_DSPARK_K` | 5 | 1 回の窓の下書きの上限（1〜5） |
+| `STRATA_DS4_DSPARK_CHAIN` | オフ | `<p>`: 1 つずつのしきい値の代わりに、確信度の積が p 以上の間の下書きを使う |
+| `STRATA_DS4_DSPARK_NGRAM` | オン | 文中の繰り返しを先に使う（上の説明）。`0`: 毎回ドラフトモデル |
+| `STRATA_DS4_DSPARK_NGRAM_P` / `_NGRAM_CHAIN` | 0.75 / 0.5 | 繰り返しを使う先頭位置の当たり率 / その長さを決める位置ごとの当たり率の積 |
+| `STRATA_DS4_DSPARK_EXPERTS` | 256（全部） | ドラフトモデルの 1 段あたりの VRAM の expert 枠（8〜256。256 で 1 段 2.1 GB）。枠のない expert はその行から外し、下書きのあとによく使うものを入れ替える。128 / 64 で 3〜5 GB 返せるが、本体の VRAM ヒットは 2 ポイントしか上がらず、下書きは 30〜50% 遅くなる（24 GB のカード向けの選択肢。そこでは未計測） |
+| `STRATA_DS4_DSPARK_UPLOADS` | 4 | 下書きのあとに 1 段あたり枠へコピーする expert の数（0〜8） |
+| `STRATA_DS4_DSPARK_PROF` | オフ | `1`: 終了時の報告に、ドラフトモデルの GPU 時間を段階ごとに出す |
+| `STRATA_DS4_DSPARK_LOG` | オフ | `<n>`: n 回の窓ごとに、平均の時間と幅を出す（stderr） |
+
 ## 設定項目
 
 エンジンへの環境変数。設定ファイルの `"env"` に書く（Maya の全項目は [docs/maya/README.md](maya/README.md#tuning)。
@@ -471,7 +540,10 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 | `STRATA_DS4_SPEC` | 1（オン） | prompt と応答から作る投機デコード。1 回に試す候補トークン数（1〜3。実測では 1 が最速）。`0` でオフ |
 | `STRATA_DS4_SPEC_GATE` | オン | リクエストの採用率が検証窓の分に見合わない間は候補を出さない。`0`: 常に出す |
 | `STRATA_DS4_SPEC_MIN` | 3 | 候補を探すときに一致させるトークン数（2〜4） |
-| `STRATA_DS4_SPEC_PIPE` | auto（HIP）、1（NVIDIA） | 検証の窓: `1` pipelined（token ごとのストリームで、レーンの待ちを重ねる）、`0` batched（dense の重みを窓で 1 回だけ読む）、`auto`: 最初の窓で両方を 3 回ずつ測り、速いほうを使い続ける（v1.3.40。HIP の既定。NVIDIA ではまだ確認していない）。RTX 5090 + iGPU では pipelined（swe-bench 90 対 73 tok/s）、AI PRO R9700 + iGPU では batched（HW キュー 1 本で 2 token の窓 30.6 対 44.5 ms） |
+| `STRATA_DS4_SPEC_PIPE` | auto（HIP）、1（NVIDIA） | 検証の窓: `1` pipelined（v1.3.43 から列を 2 つのグループに分けて 2 本の HW キューに流し、グループの中はまとめて計算）、`0` batched（dense の重みを窓で 1 回だけ読む）、`auto`: 窓の幅ごとに、最初の窓で両方を 3 回ずつ測り、速いほうをその幅で使い続ける（v1.3.40。幅ごとは v1.3.43 から。HIP の既定。NVIDIA ではまだ確認していない）。RTX 5090 + iGPU では pipelined（swe-bench 90 対 73 tok/s）、AI PRO R9700（HW キュー 2 本、v1.3.43）ではどの幅も pipelined（2 / 4 / 6 / 8 列で 34〜36 / 52〜56 / 71 / 88 ms、batched は 41 / 68.5 / 98 / 133） |
+| `STRATA_DS4_SPEC_GROUP` | 窓の半分 | pipelined の窓の 1 グループの列数（v1.3.43）。既定は ceil(T / 2) 列ずつの 2 グループ |
+| `STRATA_DS4_WIN_COLS` | オン | 窓のグループで、VRAM にある expert の gate/up と down を列ごとではなく全列まとめて 1 回ずつ起動する（v1.3.43。ビット一致: `STRATA_DS4_WIN_COLS_CHECK=1` で 16 グループに 1 回、列ごとの起動と照合）。`0`: 列ごと |
+| `STRATA_GLM_CPU_MULTI` | オン | batched の窓で、1 層ぶんの CPU レーンの expert を全列まとめて 1 回で計算し、重みの行は全列で 1 回だけ読む（v1.3.43。ビット一致）。`0`: 列ごと |
 
 コンテキスト長は `--max-context` で決める。DeepSeek V4 の学習は 1M トークンだが、既定は 65536 で、131072（125K の
 prompt）まで測った。アテンションのキャッシュは小さい（65536 で 0.44 GB）が、prompt 用のバッファはコンテキストに

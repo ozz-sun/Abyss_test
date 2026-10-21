@@ -17,6 +17,7 @@ installer) is kept under [docs/maya/](maya/README.md).
 - [DeepSeek V4.1 Flash](#deepseek-v41-flash)
 - [EXL3 quants (GLM-5.3-Flash)](#exl3-quants-glm-53-flash)
 - [Memory and speed](#memory-and-speed)
+- [The DSpark drafter (DeepSeek V4 Flash)](#the-dspark-drafter-deepseek-v4-flash)
 - [Settings](#settings)
 - [Checking the output against llama.cpp](#checking-the-output-against-llamacpp)
 - [Something went wrong?](#something-went-wrong)
@@ -56,7 +57,10 @@ so it can be run again at any time:
    `--download-model` is given - and checks every file against Hugging Face's SHA-256;
 5. makes the pack next to the shards;
 6. writes the run config `abyss-<name>.json` and the start script `run-abyss-<name>.sh` in the Abyss folder;
-7. creates the **Abyss-tools** folder beside Abyss: `abyss.sh start | stop | restart | status | update | build | log |
+7. the DSpark drafter (v1.3.43, optional): when the config is new it asks whether to download DeepSeek's DSpark
+   drafter (6.9 GB) and turn it on - `--dspark` without asking - then checks its SHA-256 and names it in the config's
+   `env` ([The DSpark drafter](#the-dspark-drafter-deepseek-v4-flash));
+8. creates the **Abyss-tools** folder beside Abyss: `abyss.sh start | stop | restart | status | update | build | log |
    models`, from the templates in `ops/abyss-tools/`. Running the setup again brings `abyss.sh` / `common.sh` up to date
    with the templates (the old ones kept as `.bak`) and keeps your own `README.md` there.
 
@@ -75,7 +79,8 @@ so it can be run again at any time:
 | `--nvcc PATH` | the CUDA compiler to build with (a CUDA 12 one for a V100) |
 | `--gpus 0,1`, `--gpus all` | split the layers across several GPUs (see "Several GPUs"); builds for every GPU's architecture |
 | `--download-model`, `--yes` | download without asking; the defaults for every question |
-| `--rewrite-config` | write `abyss-<name>.json` again (otherwise an existing one is kept) |
+| `--rewrite-config` | write `abyss-<name>.json` again (otherwise an existing one is kept; a DSpark drafter it named stays on) |
+| `--dspark`, `--no-dspark` | download DeepSeek's DSpark drafter (6.9 GB, to `../Abyss-data/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF`) and turn it on in the config; turn it off (the file stays). One GPU only |
 | `--tools-only` | only create / update Abyss-tools |
 
 The sections below are the same steps by hand.
@@ -323,7 +328,8 @@ the Ryzen AI Max's Radeon 8060S (gfx1151).
 - **What has been checked:** the Radeon 8060S (gfx1151) alone, and an AI PRO R9700 (gfx1201) with the 8060S as its
   iGPU lane: DeepSeek V4 over swe-bench tasks 36-42 tok/s in v1.3.39 and 51.7 in v1.3.41 (49.6 without the lane), one
   token at a time 52 tok/s in v1.3.40 (46 without the lane in v1.3.41), KL against the CUDA build within the
-  run-to-run spread (0.005-0.006).
+  run-to-run spread (0.005-0.006). With the DSpark drafter (v1.3.43) the same swe-bench tasks run at 61.9 tok/s
+  without the lane and 67.3 with it ([The DSpark drafter](#the-dspark-drafter-deepseek-v4-flash)).
 - **ROCm's hardware queues:** keep `GPU_MAX_HW_QUEUES` at 2 (setup writes it); 1, which R9700 guides suggest, cuts
   the prompts by a third ([docs/amd](amd/README.md#3-environment-variables)).
 - **A discrete Radeon on a Ryzen AI Max:** the iGPU computes the RAM-tier experts as it does beside an NVIDIA card
@@ -419,6 +425,72 @@ changes. A gate learns each request's acceptance and skips the draft while it wo
 (77-85% of the drafts accepted); prose: about even (~50% accepted). `STRATA_DS4_SPEC=0` turns it off; a layer split
 across GPUs runs it too (v1.3.26).
 
+## The DSpark drafter (DeepSeek V4 Flash)
+
+From v1.3.43 the engine can run DeepSeek's DSpark block drafter beside DeepSeek V4 Flash 0731 - three DeepSeek V4
+layers that read the model's own layer 40-42 outputs and propose the next 5 tokens at once, each with a confidence.
+The leading drafts at 0.6 or above go through one verify window together with the token, and each is kept when the
+model's own sampling agrees with it, so the answers come from the model as before; only the time per token changes.
+The file is bleysg's GGUF of the official drafter,
+[`DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf`](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)
+(6.94 GB, MIT; Q2_K experts, its Markov head in Q8_0).
+
+**Turning it on.** `./setup-deepseek.sh --dspark` downloads it, checks its SHA-256 and adds it to the config:
+
+```json
+"env": {"STRATA_DS4_DSPARK": "/home/you/llm/apps/Abyss-data/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF/DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf"}
+```
+
+Then restart the server (`../Abyss-tools/abyss.sh restart`). `./setup-deepseek.sh --no-dspark` (or taking the line
+out) turns it off. At start the engine log's `dspark:` line names the file and the VRAM it took (`3 stages over
+target layers 40-42, 5 drafts a step; 6.48 GB on CUDA0 ...`). It runs with DeepSeek V4 Flash 0731 on one GPU - not
+with a layer split, DeepSeek V4.1 or the MTP block; then the line says `dspark: not loaded - <why>` and the model runs
+on without it.
+
+**What it costs.** The drafter keeps its weights and all of its experts in VRAM: 6.48 GB that the expert pool gives
+up. The RAM tier keeps the size it has without the drafter, so the coldest ~6.5 GB of experts are read from the SSD
+instead (0.01 reads a token in the decode on the machine below; `STRATA_GLM_RAM_GB` still sets the tier's size by
+hand, for a PC with RAM to spare). Without that cap the tier pinned those experts too: on a 94 GB PC 73.9 GB pinned
+left 13 GB free, and an 8K prompt took 301 s instead of 11. A draft takes ~4.4 ms on an AI PRO R9700.
+
+**Speed** (AI PRO R9700, OCuLink PCIe Gen4 x4, in a Ryzen AI Max+ 395 PC with 94 GB RAM; UD-Q2_K_XL with the Q5_K
+attention pack, through the server):
+
+| | Without the drafter | DSpark |
+| --- | :---: | :---: |
+| 6 swe-bench coding tasks (sampled, end to end), no iGPU lane | 48.4 tok/s (v1.3.42) | 61.9 tok/s |
+| The same with the iGPU lane | 51.7 tok/s (v1.3.41) | 67.3 tok/s |
+| 1,024-token answers, code / prose (greedy, no iGPU lane) | 46.6-48.6 / 47.2-47.5 tok/s | 63.4-66.4 / 50.5-51.4 tok/s |
+| Prompt 8K / 16K | 850 / 978-1,028 tok/s | 799 / 977-1,000 tok/s |
+
+Per swe-bench task the drafter gives +16-32%. On these tasks 68-82% of the drafts are accepted and a step moves 2.7-3.7
+tokens (4.7 on a task that copies code); prose gains least (~2 tokens a step). A window's column costs ~9 ms here,
+about what the CPU lane needs for one token's RAM-tier experts (8.4 ms: ~93 experts at the RAM's ~93 GB/s), so the
+window, not the drafter, sets the speed - a faster CPU / RAM or an iGPU lane helps more than a faster GPU. NVIDIA: the
+build compiles; it has not been run there yet.
+
+**How a step is chosen.** When the last 3 tokens occurred earlier in the prompt or the answer, their continuation
+(up to 5 tokens) is the window's drafts and the drafter does not run - while those repeats keep being right: every
+step checks the repeat's proposal against the tokens that came, a share right per position. Below 0.75 at the first
+position the drafter takes over; otherwise the repeat's drafts are used while the product of the shares stays at 0.5
+or above. With no confident draft the token runs alone. The engine log's `ds4 dspark:` line after each answer counts
+the windows, the drafts and the acceptance, and the tokens a step.
+
+**Settings** (the config's `env`):
+
+| Setting | Default | |
+| --- | --- | --- |
+| `STRATA_DS4_DSPARK` | off | `<the drafter GGUF>`: load DeepSeek's DSpark drafter and decode with it |
+| `STRATA_DS4_DSPARK_THR` | 0.6 | the confidence a draft needs; the window stops at the first one below (swe-bench: 0.7 61.3, 0.8 59.8 tok/s against 0.6's 61.9; ds4 uses 0.7) |
+| `STRATA_DS4_DSPARK_K` | 5 | drafts a window at most (1-5) |
+| `STRATA_DS4_DSPARK_CHAIN` | off | `<p>`: keep drafts while the product of their confidences stays >= p, instead of each one >= the threshold |
+| `STRATA_DS4_DSPARK_NGRAM` | on | repeats from the text first (above); `0`: the drafter at every step |
+| `STRATA_DS4_DSPARK_NGRAM_P` / `_NGRAM_CHAIN` | 0.75 / 0.5 | a repeat is used while its first position is right this often; its length while the product of the positions' shares stays at this |
+| `STRATA_DS4_DSPARK_EXPERTS` | 256 (all) | the drafter's expert slots in VRAM a stage (8-256; 2.1 GB a stage at 256): an expert without a slot is left out of its row and the most used are copied in after each draft. 128 / 64 give 3-5 GB back for 2 more points of VRAM hits but make the drafts 30-50% slower (an option for a 24 GB card, not measured there) |
+| `STRATA_DS4_DSPARK_UPLOADS` | 4 | experts a stage copied into the cache after a draft (0-8) |
+| `STRATA_DS4_DSPARK_PROF` | off | `1`: the drafter's GPU time by phase in the report at exit |
+| `STRATA_DS4_DSPARK_LOG` | off | `<n>`: every n windows, their mean time and width (stderr) |
+
 ## Settings
 
 Environment variables for the engine, in the config's `"env"` block (all of Maya's are listed in
@@ -479,7 +551,10 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_DS4_SPEC` | 1 (on) | speculative decoding from the prompt and the answer: draft tokens a step (1-3; 1 is the fastest measured); `0` off |
 | `STRATA_DS4_SPEC_GATE` | on | drop a draft while the request's acceptance does not pay for the verify window; `0`: always draft |
 | `STRATA_DS4_SPEC_MIN` | 3 | the tokens a draft's lookup matches (2-4) |
-| `STRATA_DS4_SPEC_PIPE` | auto (HIP), 1 (NVIDIA) | the verify window: `1` pipelined (a token a stream, the lane's wait overlapped), `0` batched (the dense weights read once for the window), `auto`: the first windows time both (3 each) and the faster stays (v1.3.40; the HIP default - not yet checked on an NVIDIA card). An RTX 5090 + iGPU: pipelined (swe-bench 90 against 73 tok/s); an AI PRO R9700 + iGPU: batched (2-token windows 30.6 against 44.5 ms with one hardware queue) |
+| `STRATA_DS4_SPEC_PIPE` | auto (HIP), 1 (NVIDIA) | the verify window: `1` pipelined (v1.3.43: the columns in two groups on the two hardware queues, batched inside a group), `0` batched (the dense weights read once for the window), `auto`: the first windows of each width time both (3 each) and the faster stays for that width (v1.3.40; per width from v1.3.43; the HIP default - not yet checked on an NVIDIA card). An RTX 5090 + iGPU: pipelined (swe-bench 90 against 73 tok/s); an AI PRO R9700 (two hardware queues, v1.3.43): pipelined at every width (2 / 4 / 6 / 8 columns 34-36 / 52-56 / 71 / 88 ms against 41 / 68.5 / 98 / 133 batched) |
+| `STRATA_DS4_SPEC_GROUP` | half the window | the pipelined window's columns a group (v1.3.43); the default makes two groups of ceil(T / 2) |
+| `STRATA_DS4_WIN_COLS` | on | a window group's VRAM-resident experts in one gate/up and one down launch for all its columns instead of a launch a column (v1.3.43; bit-identical: `STRATA_DS4_WIN_COLS_CHECK=1` compares every 16th group with a launch a column); `0`: a launch a column |
+| `STRATA_GLM_CPU_MULTI` | on | a batched verify window's CPU-lane experts of a layer in one call for all its columns, a weight row decoded once for all of them (v1.3.43; bit-identical); `0`: a call a column |
 
 `--max-context` sets the context. DeepSeek V4 is trained for 1M tokens; 65536 is the default and 131072 (a 125K
 prompt) has been measured. The attention caches are small (0.44 GB at 65536), but the prompt path's buffers grow with

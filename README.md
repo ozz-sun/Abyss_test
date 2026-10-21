@@ -31,6 +31,11 @@ with nazeshinjite's Q2 GGUF: ~28 tok/s decode with the disk tail skip (17.7 with
 on swe-bench coding tasks. Its 366 GB include ~200 GB of Engram tables, read row by row from the SSD, and ~43% of its
 experts stay on the SSD. What changed from V4: [the V4.1 spec](docs/deepseek41/SPEC.md).
 
+**New: [DeepSeek's DSpark drafter](docs/MANUAL.md#the-dspark-drafter-deepseek-v4-flash)** (v1.3.43, opt-in:
+`./setup-deepseek.sh --dspark`) — a 6.9 GB block drafter proposes up to 5 tokens a step and the model checks them in
+one pass. On an AMD AI PRO R9700 without an iGPU, swe-bench coding tasks run at 61.9 tok/s instead of 48.4 (67.3 with
+the APU's iGPU as a lane).
+
 > [!NOTE]
 > Abyss is a fork of [Project Maya](https://github.com/mw00/project-maya), which grew out of
 > [Strata](https://github.com/Niko1221/Strata). It adds DeepSeek V4 and V4.1 to Maya's engine. See [Credits](#-credits).
@@ -48,6 +53,9 @@ experts stay on the SSD. What changed from V4: [the V4.1 spec](docs/deepseek41/S
   in place, for decode and for prompts (ROCm; picked at start when it is faster than the CPU).
 - **Speculative decoding without a draft model** — n-gram drafts from the prompt and the answer, verified in one pass;
   the same output, +10–13% on code. On by default.
+- **DeepSeek's DSpark drafter (opt-in)** — three DeepSeek V4 layers read the model's own layer 40–42 outputs and draft
+  5 tokens a step, verified in windows of up to 6 tokens: +28% on swe-bench tasks on an AI PRO R9700 (48.4 → 61.9
+  tok/s without an iGPU). It takes ~6.5 GB of VRAM.
 - **Checked against llama.cpp** — same next-token accuracy over 3,000 tokens (KL 0.009).
 - **Full DeepSeek V4 / V4.1 attention** — sliding window, CSA/HCA compressed KV (V4.1: four shared slots and candidate
   blocks past 16K), the lightning indexer's top-512, sinks.
@@ -67,6 +75,7 @@ experts stay on the SSD. What changed from V4: [the V4.1 spec](docs/deepseek41/S
 | DeepSeek V4 Flash 0731 | unsloth [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) (the setup's default) | 96.8 GB | measured, swe-bench 59 of 60 resolved |
 | | huihui-ai's abliterated Q2, antirez's deepseek-v4-gguf (`--compat-bf16`) | ~83 GB | runs (KL 0.0075 against llama.cpp) |
 | | unsloth's other quants with these expert types: IQ1_S-IQ4_XS, Q2_K-Q6_K, MXFP4 | | should run, untested |
+| | DeepSeek's DSpark drafter for it, bleysg's [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF) (`--dspark`, v1.3.43) | 6.9 GB | measured on an AI PRO R9700 (swe-bench +28%); NVIDIA: builds, not measured |
 | DeepSeek V4.1 Flash 1017 | nazeshinjite [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) (the default) | 366 GB | measured, swe-bench 34 of the first 35 |
 | | unsloth [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (v1.3.38) | 233 GB | measured: 32% faster, lower quality |
 | | mrfakename Q2_K; Lucebox dense + Engram with mrfakename's experts (a hybrid) | 247 / 201 GB | runs: low quality alone / the most accurate, slow |
@@ -117,6 +126,27 @@ prestaging run in a split from v1.3.26 / v1.3.27.
 </details>
 
 <details>
+<summary><b>AMD AI PRO R9700 with the DSpark drafter (v1.3.43)</b></summary>
+
+AI PRO R9700 (32 GB, OCuLink PCIe Gen4 x4) in the same Ryzen AI Max+ 395 PC (94 GB RAM), UD-Q2_K_XL with the Q5_K
+attention pack, through the server:
+
+| | Without the drafter | DSpark |
+| --- | :---: | :---: |
+| 6 swe-bench coding tasks (sampled, end to end), no iGPU lane | 48.4 tok/s (v1.3.42) | **61.9 tok/s** |
+| The same with the iGPU lane | 51.7 tok/s (v1.3.41) | **67.3 tok/s** |
+| 1,024-token answers, code / prose (greedy, no iGPU lane) | 46.6–48.6 / 47.2–47.5 tok/s | **63.4–66.4 / 50.5–51.4 tok/s** |
+| Prompt 8K / 16K | 850 / 978–1,028 tok/s | 799 / 977–1,000 tok/s |
+
+The drafter proposes up to 5 tokens after each one; on these tasks 68–82% of them are accepted and a step moves
+2.7–3.7 tokens (4.7 on a task that copies code). Its 6.5 GB of VRAM push the coldest ~6.5 GB of experts to the SSD
+(0.01 reads a token). A window's extra column costs about what the CPU lane needs for a token's RAM-tier experts, so a
+faster CPU / RAM or an iGPU lane helps more than a faster GPU. The answers and prompts without the drafter are the same
+v1.3.43 build. Not measured on NVIDIA yet. Details: [the manual](docs/MANUAL.md#the-dspark-drafter-deepseek-v4-flash).
+
+</details>
+
+<details>
 <summary><b>DeepSeek V4.1 Flash (1017)</b></summary>
 
 Same machine, nazeshinjite's [Q2 GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)
@@ -143,6 +173,9 @@ cd ~/llm/apps/Abyss
 ../Abyss-tools/abyss.sh start            # → http://127.0.0.1:8082/
 ```
 
+Faster answers with DeepSeek's DSpark drafter (6.9 GB more, ~6.5 GB of VRAM; one GPU): `./setup-deepseek.sh --dspark`,
+then `../Abyss-tools/abyss.sh restart`.
+
 Then talk to it:
 
 ```sh
@@ -159,11 +192,13 @@ curl http://127.0.0.1:8082/v1/chat/completions -H 'Content-Type: application/jso
 4. downloads the model to `../Abyss-data` (asks first without `--download-model`) and checks every SHA-256
 5. builds the pack next to the shards
 6. writes `abyss-<name>.json` and `run-abyss-<name>.sh`
-7. creates `../Abyss-tools` — `abyss.sh start | stop | restart | status | update | build | log | models`
+7. the DSpark drafter: asks when the config is new (or `--dspark`), downloads it, checks its SHA-256 and names it in
+   the config
+8. creates `../Abyss-tools` — `abyss.sh start | stop | restart | status | update | build | log | models`
 
 Every step is skipped when done, so it is safe to run again. Options: `--quant`, `--context`, `--port`, `--gpus 0,1`
-(a layer split), `--backend hip` (AMD), `--nvcc` (a CUDA 12 toolkit for a V100), `--tools-only`, and more in the
-[manual](docs/MANUAL.md#setup-in-one-command).
+(a layer split), `--backend hip` (AMD), `--nvcc` (a CUDA 12 toolkit for a V100), `--dspark` / `--no-dspark`,
+`--tools-only`, and more in the [manual](docs/MANUAL.md#setup-in-one-command).
 
 </details>
 
@@ -195,7 +230,9 @@ Each layer's attention runs on the GPU; its router picks 6 of 256 experts. Exper
 ones are computed where they are — by the APU's integrated GPU when there is one, else by the CPU threads — or copied
 over PCIe (the split is measured at start), and the rest are read from the SSD and promoted as you use them. Long
 prompts go through a batched path with expert GEMMs (MMQ) and tensor-core attention. When the answer repeats
-something from the text, an n-gram draft is verified together with the next token.
+something from the text, an n-gram draft is verified together with the next token; with DeepSeek's DSpark drafter
+(opt-in) three more DeepSeek V4 layers read the model's layer 40–42 outputs and draft the next 5 tokens for the same
+check.
 Details: [docs/deepseek4/PORT.md](docs/deepseek4/PORT.md), the forward pass: [docs/deepseek4/SPEC.md](docs/deepseek4/SPEC.md).
 
 ### DeepSeek V4.1: what changes
@@ -266,7 +303,7 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 - [x] V100 (sm_70) builds with CUDA 12
 - [x] EXL3 quants of GLM-5.3-Flash (exllamav3), on the GPU, the iGPU lane and the CPU lane; a per-PC recommendation in the installer
 - [ ] EXL3 quants of DeepSeek V4 / V4.1; an iGPU trellis kernel built for RDNA
-- [ ] A DSpark drafter (this GGUF has no MTP block)
+- [x] DeepSeek's DSpark drafter for V4 Flash 0731 (v1.3.43, opt-in; measured on an AI PRO R9700, not yet on NVIDIA)
 - [ ] Conversation slots on disk
 - [ ] Windows for DeepSeek V4 (Linux tested; community builds on an RX 7900 XT, see [AMD HIP](docs/maya/AMD_HIP.md))
 - [ ] DeepSeek V4.1: speculative decoding (its MTP / DSpark drafter), a batched prompt attention, a layer split,
@@ -283,7 +320,9 @@ Maya's GLM-5.3-Flash runner, expert tiers, prompt path, server and dashboard are
 [docs/maya/](docs/maya/README.md). The DeepSeek V4 math follows [llama.cpp](https://github.com/ggml-org/llama.cpp)'s
 implementation, and the quantized model is [unsloth](https://huggingface.co/unsloth)'s. The V4.1 port follows
 antirez's DwarfStar (ds4) and llama.cpp's V4.1 pull request; its GGUFs are nazeshinjite's and mrfakename's, and its
-quality reference is Lucebox's held-out set. EXL3 support is Maya's (@needmorevram), after
+quality reference is Lucebox's held-out set. The DSpark drafter is DeepSeek's (the official V4 Flash drafter),
+extracted with [Entrpi/ds4](https://github.com/Entrpi/ds4)'s `gguf-tools` and published as GGUF by bleysg (MIT); its
+forward follows antirez's ds4 and llama.cpp's dflash. EXL3 support is Maya's (@needmorevram), after
 [exllamav3](https://github.com/turboderp-org/exllamav3)'s format, codebooks and kernels (MIT, Copyright (c) 2025
 Turboderp; [third_party/exllamav3/LICENSE](third_party/exllamav3/LICENSE)); the EXL3 quants are turboderp's. Thanks to
 all of them.

@@ -178,6 +178,24 @@ K-only (K = V).
 N DSV4 stages (SWA only). Target features = hc_mean of inputs of target_layers -> `g = RMS(fc @ feat, enc_norm)` -> per-stage K injected.
 Draft block [id_last, MASK x (B-1)] non-causal; markov head `logits_i += w2 @ w1[prev]`, greedy chain; confidence head `sigmoid(proj . [hidden; w1[prev]] + b)`.
 
+As implemented in Abyss (v1.3.43, `src/core/dspark.cu`; bleysg's `deepseek4-dspark` GGUF, ds4's layout: 3 stages,
+target layers 40/41/42, block 5, Markov rank 256, the target's 256 experts):
+- **Context:** `g[p] = rms(main_proj [h40; h41; h42]) * main_norm`, h_L = the mean of layer L's 4 output streams at
+  position p. Each stage keeps `K = V = rope_p(rms(attn_kv g[p]) * attn_kv_a_norm)` in a ring of 256 positions (FP16,
+  like the target's window keys); a draft reads the last 128. The token path, the verify window's kept columns (at
+  `spec_rewind`) and a prompt chunk's last 128 rows leave their layer 40-42 outputs; `dspark_commit` turns them into
+  ring rows (the prompt path's last-layer tail skip is off while the drafter is loaded).
+- **Block:** `[y, noise x 4]` (y = the pending token, `noise_token_id`'s embedding after it) at positions pos .. pos + 4
+  through the stages: the mHC read / write halves, attention over the context and the whole block (no mask; the
+  target's attend kernel with the rows as compressed entries), the MoE (sqrt-softplus router + bias, top 6 of 256,
+  weights x 1.5, the shared expert, the SwiGLU clamped at 10), then `hc_head`, the norm and the target's output head
+  (row i proposes position pos + i + 1).
+- **Chain:** draft i = argmax(logits_i + markov_w2 . markov_w1[draft i-1]) with draft -1 = y; its confidence
+  sigmoid(conf_proj . [h_i; markov_w1[draft i-1]]) with h_i before the norm. The decode keeps the leading drafts at
+  confidence >= `STRATA_DS4_DSPARK_THR` (0.6) and verifies them in one window; the target's samples decide.
+- The same numbers as the numpy reference (Abyss-tools `bench/dspark/dspark_probe.py`): 4.68 against 4.705 tokens a
+  step on a swe-bench answer.
+
 ## 9. Quant types
 Unsloth UD-Q2_K_XL: to be read from shards 2-3 headers. Other files observed:
 - IQ1_M: experts IQ1_M/IQ2_XXS gate-up, IQ3_XXS/MXFP4 down, shexp down MXFP4, attn Q8_0, q_a Q5_K, embd/output Q4_K, gate_inp BF16, hc/norms F32

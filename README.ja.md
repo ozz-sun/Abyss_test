@@ -30,6 +30,10 @@ nazeshinjite の Q2 GGUF で、生成は SSD だけの下位エキスパート�
 コーディング問題を通しで 51.6 tok/s。366 GB のうち約 200 GB は Engram の表で、SSD から行単位で読む。エキスパートも約 43% は
 SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPEC.md)。
 
+**新しく対応: [DeepSeek の DSpark ドラフトモデル](docs/MANUAL.ja.md#dspark-のドラフトモデルdeepseek-v4-flash)**（v1.3.43、
+任意: `./setup-deepseek.sh --dspark`）— 6.9 GB の下書きモデルが 1 回に最大 5 トークンを提案し、本体がまとめて 1 回で確かめる。
+内蔵 GPU なしの AMD AI PRO R9700 で、swe-bench のコーディング問題が 48.4 → 61.9 tok/s（APU の内蔵 GPU をレーンに使うと 67.3）。
+
 > [!NOTE]
 > Abyss は [Project Maya](https://github.com/mw00/project-maya) をコピーして作ったフォークで、Maya は
 > [Strata](https://github.com/Niko1221/Strata) から生まれたプロジェクト。Maya のエンジンに DeepSeek V4 と V4.1 への対応を足した。
@@ -43,6 +47,7 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 - **長いコンテキストでも落ちない** — lightning indexer と prompt の attention を tensor core で計算する。125K トークンの prompt を約 2,800 tok/s で読み、125K でも生成は約 65 tok/s
 - **AMD APU の内蔵 GPU を 2 本目のレーンに** — Ryzen AI Max では Radeon の内蔵 GPU が RAM 層のエキスパートをその場で計算する。生成でも prompt でも使う（ROCm。起動時に CPU より速ければ使う）
 - **ドラフトモデルなしの投機デコード** — prompt や応答に出てきた並び（n-gram）を候補にして、次のトークンと一緒に 1 回で確かめる。出力は同じで、コードで +10〜13%。既定でオン
+- **DeepSeek の DSpark ドラフトモデル（任意）** — DeepSeek V4 の 3 層が本体の 40〜42 層の出力を読んで次の 5 トークンを下書きし、最大 6 トークンの検証の窓でまとめて確かめる。AI PRO R9700 の swe-bench で +28%（内蔵 GPU なしで 48.4 → 61.9 tok/s）。VRAM を約 6.5 GB 使う
 - **llama.cpp と照合済み** — 3,000 トークンで次トークンの的中率が同じ（KL 0.009）
 - **DeepSeek V4 / V4.1 のアテンションを全部実装** — スライディングウィンドウ、CSA/HCA 圧縮 KV（V4.1 は 4 つの共有スロットと 16K 超の候補ブロック）、インデクサの top-512、sinks
 - **思考とツール呼び出し** — 思考レベル `none` / `low` / `high` / `max`、DeepSeek の DSML 形式のツール呼び出し（同時呼び出しも可）
@@ -60,6 +65,7 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 | DeepSeek V4 Flash 0731 | unsloth [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)（セットアップの既定） | 96.8 GB | 計測済み、swe-bench 60問中59問解決 |
 | | huihui-ai の abliterated Q2、antirez の deepseek-v4-gguf（`--compat-bf16`） | 約 83 GB | 動作確認済み（llama.cpp との KL 0.0075） |
 | | unsloth のほかの量子化で、expert の型が IQ1_S〜IQ4_XS、Q2_K〜Q6_K、MXFP4 のもの | | 動くはず、未確認 |
+| | DeepSeek の DSpark ドラフトモデル（bleysg の [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)、`--dspark`、v1.3.43） | 6.9 GB | AI PRO R9700 で計測済み（swe-bench +28%）。NVIDIA はビルドのみ、未計測 |
 | DeepSeek V4.1 Flash 1017 | nazeshinjite の [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)（既定） | 366 GB | 計測済み、swe-bench 最初の35問中34 |
 | | unsloth の [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（v1.3.38） | 233 GB | 計測済み: 32% 速い、品質は下がる |
 | | mrfakename の Q2_K、Lucebox の dense + Engram と mrfakename の expert の組み合わせ（ハイブリッド） | 247 / 201 GB | 動作確認済み: 単体では低品質 / 最も正確だが遅い |
@@ -109,6 +115,28 @@ attention の射影を Q5_K にした「軽い dense pack」（マニュアル�
 </details>
 
 <details>
+<summary><b>AMD AI PRO R9700 と DSpark ドラフトモデル（v1.3.43）</b></summary>
+
+AI PRO R9700（32 GB、OCuLink PCIe Gen4 x4）を同じ Ryzen AI Max+ 395 の PC（RAM 94 GB）につないだ構成。UD-Q2_K_XL と Q5_K の
+attention pack、サーバー経由:
+
+| | ドラフトモデルなし | DSpark |
+| --- | :---: | :---: |
+| swe-bench のコーディング 6 問（サンプリングあり、通し）、内蔵 GPU なし | 48.4 tok/s（v1.3.42） | **61.9 tok/s** |
+| 同じく内蔵 GPU レーンあり | 51.7 tok/s（v1.3.41） | **67.3 tok/s** |
+| 1,024 トークンの回答、コード / 散文（貪欲、内蔵 GPU なし） | 46.6〜48.6 / 47.2〜47.5 tok/s | **63.4〜66.4 / 50.5〜51.4 tok/s** |
+| prompt 8K / 16K | 850 / 978〜1,028 tok/s | 799 / 977〜1,000 tok/s |
+
+下書きモデルは 1 トークンごとに次の最大 5 トークンを提案する。これらの問題では 68〜82% が受理され、1 回の確認で
+2.7〜3.7 トークン進む（コードを写す問題では 4.7）。下書きモデルが使う VRAM 6.5 GB の分だけ、いちばん使われない約 6.5 GB の
+エキスパートが SSD に回る（読み込みは 1 トークンあたり 0.01 回）。検証の窓は 1 列増えるごとに、CPU レーンが 1 トークン分の
+RAM 層エキスパートを計算する時間とほぼ同じだけ延びる。そのため、速い GPU より速い CPU / RAM や内蔵 GPU レーンのほうが効く。
+ドラフトモデルなしの回答と prompt は同じ v1.3.43 のビルド。NVIDIA ではまだ測っていない。詳しくは
+[マニュアル](docs/MANUAL.ja.md#dspark-のドラフトモデルdeepseek-v4-flash)。
+
+</details>
+
+<details>
 <summary><b>DeepSeek V4.1 Flash（1017）</b></summary>
 
 同じマシン、nazeshinjite の [Q2 GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)（366 GB）、
@@ -135,6 +163,9 @@ cd ~/llm/apps/Abyss
 ../Abyss-tools/abyss.sh start            # → http://127.0.0.1:8082/
 ```
 
+DeepSeek の DSpark ドラフトモデルで回答を速くするには（6.9 GB 追加、VRAM 約 6.5 GB、GPU 1 枚のとき）:
+`./setup-deepseek.sh --dspark` のあと `../Abyss-tools/abyss.sh restart`。
+
 API で試す:
 
 ```sh
@@ -151,10 +182,11 @@ curl http://127.0.0.1:8082/v1/chat/completions -H 'Content-Type: application/jso
 4. モデルを `../Abyss-data` にダウンロード（`--download-model` がなければ先に確認）し、全ファイルの SHA-256 を照合
 5. シャードと同じフォルダに pack を作る
 6. `abyss-<名前>.json` と `run-abyss-<名前>.sh` を書く
-7. `../Abyss-tools` を作る — `abyss.sh start | stop | restart | status | update | build | log | models`
+7. DSpark ドラフトモデル: 設定が新しいときに確認する（`--dspark` なら確認なし）。ダウンロードして SHA-256 を照合し、設定に書く
+8. `../Abyss-tools` を作る — `abyss.sh start | stop | restart | status | update | build | log | models`
 
 済んだ手順は飛ばすので、何度実行してもよい。オプション（`--quant`、`--context`、`--port`、`--gpus 0,1`（層の分割）、
-`--backend hip`（AMD）、`--nvcc`（V100 用の CUDA 12）、`--tools-only` など）は
+`--backend hip`（AMD）、`--nvcc`（V100 用の CUDA 12）、`--dspark` / `--no-dspark`、`--tools-only` など）は
 [マニュアル](docs/MANUAL.ja.md#まとめてセットアップ)。
 
 </details>
@@ -187,7 +219,8 @@ flowchart LR
 RAM 層のものはその場で計算する（APU の内蔵 GPU があればそれが、なければ CPU のスレッドが）か、PCIe で GPU に送る
 （配分は起動時に測って決める）。残りは SSD から読み、使われるほど上の層に上がる。長い prompt はエキスパートの行列積
 （MMQ）と tensor core の attention を使うまとめ処理で読む。応答が文中の並びを繰り返すときは、n-gram の候補を次の
-トークンと一緒に確かめる。
+トークンと一緒に確かめる。DeepSeek の DSpark ドラフトモデル（任意）を使うと、DeepSeek V4 の 3 層が本体の 40〜42 層の
+出力を読んで次の 5 トークンを下書きし、同じように確かめる。
 詳しくは [docs/deepseek4/PORT.md](docs/deepseek4/PORT.md)、計算の仕様は [docs/deepseek4/SPEC.md](docs/deepseek4/SPEC.md)。
 
 ### DeepSeek V4.1 で変わるところ
@@ -258,7 +291,7 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 - [x] V100（sm_70）を CUDA 12 でビルド
 - [x] GLM-5.3-Flash の EXL3 量子化（exllamav3）: GPU、iGPU lane、CPU lane で計算。インストーラが PC ごとにおすすめを表示
 - [ ] DeepSeek V4 / V4.1 の EXL3 量子化、RDNA 向けに調整した iGPU のトレリス計算
-- [ ] DSpark のドラフトモデル（この GGUF には MTP ブロックがない）
+- [x] DeepSeek V4 Flash 0731 用の DSpark ドラフトモデル（v1.3.43、任意。AI PRO R9700 で計測、NVIDIA は未計測）
 - [ ] 会話のディスク保存
 - [ ] DeepSeek V4 での Windows（確認したのは Linux。RX 7900 XT でのコミュニティビルドは [AMD HIP](docs/maya/AMD_HIP.md)）
 - [ ] DeepSeek V4.1: 投機デコード（MTP / DSpark のドラフト）、prompt の attention のまとめ処理、層の分割、コマンド 1 つのセットアップ、SSD の読みを減らす（追い出し方の見直し、SSD から届いたエキスパートを lane で計算）
@@ -274,6 +307,8 @@ DeepSeek V4（llama.cpp の `deepseek4` アーキテクチャ）と V4.1（`deep
 [docs/maya/](docs/maya/README.md) に残している。DeepSeek V4 の計算は [llama.cpp](https://github.com/ggml-org/llama.cpp) の
 実装に、量子化モデルは [unsloth](https://huggingface.co/unsloth) のものに拠っている。V4.1 の移植は antirez の DwarfStar（ds4）と
 llama.cpp の V4.1 プルリクエストに拠り、GGUF は nazeshinjite と mrfakename のもの、品質の基準は Lucebox の held-out セット。
+DSpark のドラフトモデルは DeepSeek のもの（V4 Flash の公式ドラフトモデル）で、[Entrpi/ds4](https://github.com/Entrpi/ds4) の
+`gguf-tools` で取り出したものを bleysg が GGUF で公開している（MIT）。計算は antirez の ds4 と llama.cpp の dflash に拠る。
 EXL3 対応は Maya（@needmorevram）のもので、[exllamav3](https://github.com/turboderp-org/exllamav3) の形式・コードブック・
 カーネルに拠る（MIT、Copyright (c) 2025 Turboderp。[third_party/exllamav3/LICENSE](third_party/exllamav3/LICENSE)）。EXL3 の
 量子化モデルは turboderp のもの。すべてに感謝する。

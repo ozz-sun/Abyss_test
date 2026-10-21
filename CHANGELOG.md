@@ -7,6 +7,77 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.43 - 2026-10-22
+
+**DeepSeek's DSpark drafter for DeepSeek V4 Flash 0731 (opt-in, `./setup-deepseek.sh --dspark`): up to 5 drafted
+tokens a step, checked in one verify window - on an AI PRO R9700 without an iGPU, swe-bench 6 tasks 48.4 -> 61.9 tok/s
+(+28%), 1,024-token code answers 47-49 -> 63-66; with the iGPU lane 67.3.** Measured on an AI PRO R9700 (OCuLink, PCIe
+Gen4 x4) in a Ryzen AI Max+ 395 PC with 94 GB RAM, DeepSeek V4 UD-Q2_K_XL with the Q5_K attention pack.
+- **The drafter** (`src/core/dspark.cu`, `STRATA_DS4_DSPARK=<GGUF>`): DeepSeek's DSpark block drafter as bleysg's GGUF
+  (`DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf`, 6.94 GB, MIT) - 3 DeepSeek V4 layers over the target's layer 40-42
+  outputs, a rank-256 Markov head and a confidence head. After each token it proposes the next 5 with a confidence
+  each; the leading ones at 0.6 or above (`STRATA_DS4_DSPARK_THR`) go through one verify window behind the token, and
+  each is kept when the target's own sample agrees - the samples are the target's, only the time per token changes.
+  Its dense weights (Q8_0, 0.57 GB) and every expert (Q2_K, 2.1 GB a stage) sit in VRAM: 6.48 GB. Its context: the
+  token path, the window's kept columns and a prompt chunk's last 128 rows leave their layer 40-42 outputs, projected
+  into each stage's 256-row K = V ring. A draft runs on the target's kernels (mHC, GEMVs, attention, MoE) and five new
+  ones (kv_rows, stream_mean, dspark_route, dspark_head, dspark_markov): ~4.4 ms on the R9700 (a stage's attention
+  0.45 ms and MoE 0.63 ms, the head + Markov chain 1.12 ms). Its acceptance matches the numpy reference (4.68 against
+  4.705 tokens a step on swe-bench t003). One GPU and DeepSeek V4 Flash only: with V4.1, a layer split or the MTP
+  block the engine says why and runs on without it.
+- **Repeats first:** when the last 3 tokens occurred before, their continuation (up to 5) is the window's drafts and
+  the drafter does not run - while the repeats keep being right. Every step checks the repeat's proposal against the
+  tokens that came, a share right per position: below 0.75 at the first position the drafter takes over (new code: 5
+  repeated drafts were 22% accepted, and cost the drafter's steps their windows), otherwise the repeat's drafts while
+  the product of the shares stays >= 0.5 (swe-bench t025's 5 repeated drafts were 53% accepted)
+  (`STRATA_DS4_DSPARK_NGRAM`, `_NGRAM_P`, `_NGRAM_CHAIN`).
+- **Verify windows of up to 8 columns, pipelined by groups** (`kVerifyMax` 4 -> 8): the pipelined window runs its
+  columns in two groups of ceil(T / 2) on the two hardware queues, batched inside a group (`STRATA_DS4_SPEC_GROUP`):
+  2 / 4 / 6 / 8 columns 34-36 / 52-56 / 71 / 88-89 ms against the batched window's 41 / 68.5 / 98 / 133.
+  `STRATA_DS4_SPEC_PIPE=auto` (HIP's default) times the two kinds per width now (3 windows each at the same width;
+  v1.3.40 compared windows of different widths and once kept batched windows at 78 ms against 56). Dense GEMVs of 2-8
+  columns in one launch (wider ones in chunks of 8; bit-identical, the same sums a column). A batched window's
+  CPU-lane experts of a layer in one call for all its columns (`STRATA_GLM_CPU_MULTI`; 7,683 columns bit-identical to
+  a call a column). A group's VRAM-resident experts in one gate/up and one down launch (`gf::moe_gate_up_cols` /
+  `moe_down_cols`, gridDim.z = the columns; `STRATA_DS4_WIN_COLS`, `_CHECK=1`: 2,691 columns bit-identical) - the
+  windows no faster (34.1 / 51.7 / 70.9 / 88.2 against 34.7 / 52.4 / 70.0 / 88.7 ms), the drafter's MoE 0.69 -> 0.63 ms
+  a stage.
+- **The RAM tier with the drafter:** the drafter's 6.5 GB come out of the expert pool, and the tier pinned those
+  experts instead: on the 94 GB machine 73.9 GB pinned (67.4 without) left 13 GB free, an 8K prompt took 301 s (10.6
+  without), the decode ran at 1.6 tok/s and the server's watchdog restarted the engine. Without the drafter and a pool
+  as small (`STRATA_GLM_RESERVE_MB=7200`) the same happened (61 s, 1.6 tok/s). With the drafter the tier keeps its size
+  without it (67.0 GB here) and the coldest experts come from the SSD: 0.01 reads a token in the decode, an 8K prompt
+  11.2 s. `STRATA_GLM_RAM_GB` still sizes the tier by hand.
+- **Setup:** `./setup-deepseek.sh --dspark` downloads the drafter (bleysg's repo at the commit measured, SHA-256
+  checked) into `Abyss-data/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF/` and adds `STRATA_DS4_DSPARK` to the
+  config's env; a new config asks (default no), `--no-dspark` takes it out, `--rewrite-config` keeps it, a layer split
+  leaves it out.
+- **Without the iGPU lane** (through the server; swe-bench 6 tasks sampled at temperature 1.0, +-5% run to run):
+  swe-bench 48.4 tok/s (v1.3.42) -> 61.9 (the drafter's threshold 0.6; 0.7: 61.3, 0.8: 59.8), +16-32% a task (their
+  mean 62.7 against 50.5). 1,024-token answers (greedy, 2 runs, the same build without the drafter): code 46.6 / 48.6
+  -> 63.4 / 66.4, prose 47.2 / 47.5 -> 50.5 / 51.4. Prompts 8K / 16K 850 / 978-1,028 -> 799 / 977-1,000 tok/s (fewer
+  experts in VRAM). The same build without the drafter ran swe-bench at 54.5: its t025 / t030 answers came out long
+  and repetitive (6,583 / 7,413 tokens, n-gram drafts 83-92% accepted), its short tasks as fast as v1.3.42's.
+- **With the iGPU lane:** swe-bench 67.3 tok/s (v1.3.41: 51.7; the drafter's threshold 0.7 in that run), code 68.5 /
+  73.2, prose 51.6 / 53.2.
+- **Where the time goes now:** a window's column costs ~9 ms, the CPU lane's time for a token's RAM-tier experts (8.4
+  ms: ~93 experts at 88 us, the RAM's ~93 GB/s); over a window the GPU is 89% busy (rocprof, a 3.1-column 45.9 ms
+  window: experts ~20 ms, dense GEMVs ~19, mHC 13.5 with the lane's wait, attention ~5).
+- **Measured and left out:** a smaller drafter expert cache (128 / 64 slots a stage: 3-5 GB of VRAM back, the target's
+  VRAM hits +2 points, drafts 4.7 -> 6.2 / 7.1 ms; kept as `STRATA_DS4_DSPARK_EXPERTS`); keeping drafts by the
+  product of their confidences (`STRATA_DS4_DSPARK_CHAIN`); repeats alone at adaptive lengths without the drafter
+  (`STRATA_DS4_SPEC_ADAPT=1`: t010 48.5, t025 47.0, code 47.2 against the default n-gram decode's 47.7 / 48.7 / 48.5);
+  fixed n-gram drafts of 3 or 5 tokens (3 helps t010 and costs code, 5 costs both).
+- **The same results:** without the drafter the token path is unchanged - KL 0.005922 (iGPU lane) / 0.005687 (CPU
+  lane) against the CUDA reference, as in v1.3.42. With the drafter loaded the target's logits stay within the
+  run-to-run spread: KL 0.005472 (fewer experts in VRAM, 64% hits against 70%, so more on the lane). GLM-5.3-Flash
+  Maya-S-v2's nll is identical (1.64344 with the iGPU lane, 1.63961 with the CPU lane). Greedy answers drift from the
+  run without speculation after a while, with the n-gram decode as well (t003 at its 374th token, code at the 82nd,
+  prose at the 5th): the window's sums differ from the token path's in the last bits and the tier moves' timing varies
+  run to run. The first DSpark run of t003 matched all 1,024 tokens.
+- **Not checked:** the CUDA build compiles; it was not run (no NVIDIA card attached) - neither the drafter nor the
+  windows' changes on NVIDIA, which keeps pipelined windows (`STRATA_DS4_SPEC_PIPE=1`).
+
 ## v1.3.42 - 2026-10-21
 
 **AMD (HIP) decode: the GPU waits for the CPU lane's answer with one poller, and two launches a layer fewer - DeepSeek

@@ -21,6 +21,7 @@ DeepSeek V4.1 Flash (`deepseek41`, v1.3.29) is a third architecture on the same 
 | Prompt path (batched): window keys in a linear buffer, batched compressors, the indexer's scores and the attention on tensor cores (`mma.sync`, Q and P as FP16 hi + lo pairs, ~FP32 accuracy; sm_80+), with the FP32 kernels as the fallback (`STRATA_DS4_IDX=1`, `STRATA_DS4_ATTN=1`) | `dsv4_fast.cu` (`*_batch`, `*_mma_kernel`), `glm_prefill.cu` `prefill_ds4_mixer` |
 | Token path on tensor cores: the lightning indexer's scores (sm_80+); the exact top-k select (radix passes, block scan); the score + select launches skipped while every row is visible anyway (positions below 2,047) | `dsv4_fast.cu`, `src/kernels/cuda/dsa_topk.cuh` |
 | Speculative decoding from the text itself (n-gram lookup, a verify window of k + 1 staggered streams, an acceptance gate; on by default) | `src/core/dsv4_verify.cu`, `STRATA_DS4_SPEC*` |
+| DeepSeek's DSpark drafter (v1.3.43, opt-in): its 3 stages read the target's layer 40-42 outputs and draft 5 tokens a step for a verify window of up to 8 columns (pipelined in two groups, a group's experts in one launch); the text's repeats first while they stay right | `src/core/dspark.cu`, `dsv4_fast.cu` (`kv_rows`, `dspark_*`), `STRATA_DS4_DSPARK*`, `setup-deepseek.sh --dspark` |
 | The iGPU lane: an AMD APU's integrated GPU computes the RAM-tier experts in place (decode and prompt) through a dlopen'd HIP library; a call deadline hands late work to the CPU threads | `src/igpu/igpu_lane.cpp`, `libabyss_igpu.so` |
 | AMD (HIP): the build links (MXFP4 in the HIP MMQ instances), the indexer and the prompt attention on RDNA WMMA (gfx11 / gfx12) | `dsv4_fast.cu` (`*_wmma_kernel`), `setup-deepseek.sh --backend hip` |
 | Layer split across NVIDIA GPUs: hash-routed layers get their token ids in every part, one iGPU lane shared by the parts | `glm_prefill.cu`, `igpu_lane.cpp`, `setup-deepseek.sh --gpus` |
@@ -103,8 +104,9 @@ How it got there (each step's measurement and its KL check are in [CHANGELOG.md]
 
 ## Not done yet
 
-- The MTP / DSpark draft (the GGUF has no MTP block; DSpark needs its own model) - speculative decoding drafts from
-  the prompt and the answer instead (n-gram lookup, `STRATA_DS4_SPEC`).
+- The MTP draft (the GGUF has no MTP block) - DeepSeek's DSpark drafter (v1.3.43, its own 6.9 GB GGUF) or the n-gram
+  lookup (`STRATA_DS4_SPEC`) draft instead. The DSpark drafter has been measured on an AI PRO R9700 only (swe-bench
+  48.4 -> 61.9 tok/s without an iGPU), not on NVIDIA.
 - File conversation slots (`STRATA_GLM_SLOTS`) - off for deepseek4; the live snapshot works.
 - Images.
 - A layer split runs with speculative decoding and prestaging (v1.3.26 / v1.3.27), but a slower second card does not

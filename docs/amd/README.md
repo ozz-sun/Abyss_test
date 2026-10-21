@@ -189,6 +189,9 @@ On the machine above, `rocminfo` lists the R9700 (gfx1201), the Radeon 8060S (gf
   the iGPU lane's `build-hip/libabyss_igpu.so` is built with it.
 - The config gets `"backend": "hip"`, `"gpu"` (the HIP numbers), `"gpu_pci"` (the PCI addresses) and `"lib_dirs"`
   (ROCm's `lib`).
+- `--dspark` also downloads DeepSeek's DSpark drafter (6.9 GB) and turns it on in the config (v1.3.43; a new config
+  asks). On a 32 GB card such as the R9700 it is the biggest decode gain so far - section 7 and
+  [the manual](../MANUAL.md#the-dspark-drafter-deepseek-v4-flash).
 
 ## 6. A discrete Radeon and the iGPU together (Ryzen AI Max + an eGPU)
 
@@ -267,6 +270,19 @@ v1.3.41 (the CPU lane's IQ2 / IQ3 rows in AVX-512): without the iGPU lane, decod
 v1.3.42 (one poller for the CPU lane's answer, two launches a layer fewer): without the iGPU lane, one token at a
 time +2.5-3.6% (prose 44.5 -> 46.1, code 46.5 -> 47.7 tok/s) and swe-bench 47.2 -> 48.4 tok/s (the same afternoon);
 with the lane +2% (51.0 -> 51.9 / 52.5 -> 53.7). The same results as v1.3.41.
+
+v1.3.43 (DeepSeek's DSpark drafter, `./setup-deepseek.sh --dspark`): the 6 swe-bench tasks through the server
+
+| | Without the drafter | DSpark |
+|---|---|---|
+| No iGPU lane (R9700 + RAM + SSD) | 48.4 (v1.3.42) | **61.9** |
+| iGPU lane | 51.7 (v1.3.41) | **67.3** |
+| 1,024-token answers, code / prose, no iGPU lane (greedy) | 46.6-48.6 / 47.2-47.5 | 63.4-66.4 / 50.5-51.4 |
+| 8K / 16K prompt | 850 / 978-1,028 | 799 / 977-1,000 |
+
+A PC with an R9700 and enough RAM but no iGPU now decodes these tasks at ~62 tok/s; the iGPU lane adds ~9%. The
+drafter takes 6.5 GB of VRAM, and the coldest ~6.5 GB of experts move to the SSD (0.01 reads a token). The verify
+windows are pipelined in two groups on the two hardware queues - another reason to keep `GPU_MAX_HW_QUEUES=2`.
 
 - **Accuracy:** KL against the CUDA build's reference is 0.0059 (0.0052 in v1.3.39, before the one-launch GEMVs), the
   same level as the spread between two CUDA runs (0.0057-0.0060).
