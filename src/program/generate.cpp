@@ -1009,6 +1009,12 @@ static int glm_pack_generate(const Options& o) {
         const char* v = std::getenv("STRATA_DS4_SPEC_MIN");
         return v ? std::max(2, std::min(4, std::atoi(v))) : 3;
     }();
+    // STRATA_DS4_SPEC_ADAPT=1 (experiment): without the DSpark drafter, its decode's repeats alone - the n-gram's drafts
+    // up to 5, as long as each position's share right says (instead of one a window and the gate below)
+    const bool spec_adapt = [] {
+        const char* v = std::getenv("STRATA_DS4_SPEC_ADAPT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     strata::core::Glm5Model model;
     std::string err;
     // the prompt chunk, set in the config's args like Strata's: --prefill auto | N (a chunk of N tokens) | 0
@@ -1607,7 +1613,7 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-        } else if (model.dspark_ready() && model.fast() && model.verify_ready()) {
+        } else if (spec_k > 0 && (model.dspark_ready() || spec_adapt) && model.fast() && model.verify_ready()) {
             // DSpark's speculative decode (STRATA_DS4_DSPARK=<the drafter GGUF>): after each token the drafter
             // proposes the next 5 with a confidence each; the leading ones at or above STRATA_DS4_DSPARK_THR (default
             // 0.6; ds4's 0.7: swe-bench 61.3 against 61.9 tok/s, 0.8 59.8) go through a verify window behind the token, compared and kept as the n-gram decode's below
@@ -1699,7 +1705,7 @@ static int glm_pack_generate(const Options& o) {
                 };
                 came.clear();
                 const auto td = std::chrono::steady_clock::now();
-                if (!rep && room > 0) {
+                if (!rep && room > 0 && model.dspark_ready()) {
                     if (!model.dspark_draft(tok, d, c, err)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
