@@ -307,6 +307,23 @@ void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, floa
 /// down_off = the byte offset of the down rows inside an expert blob ([gate | up | down]).
 void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
               const float* sh_out, float* out, cudaStream_t s);
+/// What differs between a verify window's columns in one expert launch: each column's own route plan and CPU-lane
+/// part (MoeDev's plan_ptr / plan_w / cpu_flag / cpu_part).
+struct MoeColArgs {
+    const unsigned long long* plan_ptr = nullptr;
+    const float* plan_w = nullptr;
+    const int* cpu_flag = nullptr;
+    const float* cpu_part = nullptr;
+};
+/// moe_gate_up / moe_down for nc columns in one grid (cols: nc entries in device memory): column c's xq at
+/// xq + c * xq_cs bytes, hq + c * hq_cs bytes, sh_hq + c * sh_hq_cs bytes, sh_out / out + c * out_cs floats - the
+/// blocks nc launches would run (the same sums), at once: a window column's ~4 resident experts a layer left the GPU
+/// half idle (83 us a launch against 76 for 8 experts).
+void moe_gate_up_cols(int gu_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, float limit,
+                      const void* xq, size_t xq_cs, void* hq, size_t hq_cs, const void* sh_down, int sh_type,
+                      const void* sh_hq, size_t sh_hq_cs, int n_ff_sh, float* sh_out, size_t out_cs, cudaStream_t s);
+void moe_down_cols(int d_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, size_t down_off,
+                   const void* hq, size_t hq_cs, const float* sh_out, float* out, size_t out_cs, cudaStream_t s);
 
 /// The prompt path's LIGHTLY routed experts (a few rows each - MMQ's 64-128-token tiles would be mostly empty):
 /// light[3 i .. 3 i + 2] = {slot, r0, nr} (device): expert i is the blob at base + slot * stride, its rows are

@@ -3077,6 +3077,13 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
     else moe_fetch_body(d, k, n16);
 }
 
+// a verify window's columns in one expert launch (moe_gate_up_cols / moe_down_cols): the per-column table (device)
+// and the byte / float strides of the columns' buffers; nc 1 and ca null is the one-column launch
+struct MoeCols {
+    const MoeColArgs* ca = nullptr;
+    int nc = 1;
+    size_t xq_cs = 0, hq_cs = 0, shq_cs = 0, out_cs = 0;
+};
 constexpr int GU_ROWS = 32;   // h values (gate rows = up rows) per block: one q8_1 block of h
 constexpr int GU_WARPS = 16;  // ... 2 gate + 2 up rows per warp (8 per warp measured 90 vs 65 us a layer: occupancy)
 
@@ -3096,12 +3103,25 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
                                                                     block_q8_1* __restrict__ hq,
                                                                     const uint8_t* __restrict__ sh_down, int sh_type,
                                                                     const block_q8_1* __restrict__ sh_hq, int n_ff_sh,
-                                                                    float* __restrict__ sh_out) {
+                                                                    float* __restrict__ sh_out,
+                                                                    const MoeColArgs* __restrict__ ca = nullptr,
+                                                                    size_t xq_cs = 0, size_t hq_cs = 0,
+                                                                    size_t shq_cs = 0, size_t out_cs = 0) {
 #if !defined(STRATA_USE_HIP)
     constexpr int NW = GU_WARPS;
 #endif
     const int ei = blockIdx.y, chunk = blockIdx.x;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    // a window's columns in one grid (moe_gate_up_cols): column blockIdx.z's plan and buffers
+    const unsigned long long* plan_ptr = d.plan_ptr;
+    if (ca != nullptr) {
+        const int col = blockIdx.z;
+        plan_ptr = ca[col].plan_ptr;
+        xq = (const block_q8_1*) ((const uint8_t*) xq + (size_t) col * xq_cs);
+        hq = (block_q8_1*) ((uint8_t*) hq + (size_t) col * hq_cs);
+        if (sh_hq != nullptr) sh_hq = (const block_q8_1*) ((const uint8_t*) sh_hq + (size_t) col * shq_cs);
+        if (sh_out != nullptr) sh_out += (size_t) col * out_cs;
+    }
 #if defined(STRATA_USE_HIP)
     if constexpr (!SPLIT)
 #endif
@@ -3114,7 +3134,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
         }
         return;
     }
-    const unsigned long long ptr = d.plan_ptr[ei];
+    const unsigned long long ptr = plan_ptr[ei];
     if (ptr == 0ull) return;
     __shared__ float sg[GU_ROWS], su[GU_ROWS];
     __shared__ uint32_t s_tab[TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
@@ -3170,7 +3190,9 @@ template<int TD>
 #endif
 __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_embd, int n_ff, size_t down_off,
                                                        const block_q8_1* __restrict__ hq,
-                                                       const float* __restrict__ sh_out, float* __restrict__ out) {
+                                                       const float* __restrict__ sh_out, float* __restrict__ out,
+                                                       const MoeColArgs* __restrict__ ca = nullptr,
+                                                       size_t hq_cs = 0, size_t out_cs = 0) {
 #if !defined(STRATA_USE_HIP)
     constexpr int NR = DOWN_ROWS;
 #else
@@ -3188,9 +3210,24 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     if constexpr (!GLOBAL)
 #endif
     load_tab<TD>(s_tab);
+    // a window's columns in one grid (moe_down_cols): column blockIdx.z's plan, CPU-lane part and buffers
+    const unsigned long long* plan_ptr = d.plan_ptr;
+    const float* plan_w = d.plan_w;
+    const int* cpu_flag = d.cpu_flag;
+    const float* cpu_part = d.cpu_part;
+    if (ca != nullptr) {
+        const MoeColArgs& c = ca[blockIdx.z];
+        plan_ptr = c.plan_ptr;
+        plan_w = c.plan_w;
+        cpu_flag = c.cpu_flag;
+        cpu_part = c.cpu_part;
+        hq = (const block_q8_1*) ((const uint8_t*) hq + (size_t) blockIdx.z * hq_cs);
+        out += (size_t) blockIdx.z * out_cs;
+        if (sh_out != nullptr) sh_out += (size_t) blockIdx.z * out_cs;
+    }
     if (threadIdx.x < 8) {
-        s_ptr[threadIdx.x] = (int) threadIdx.x < k ? d.plan_ptr[threadIdx.x] : 0ull;
-        s_w[threadIdx.x] = (int) threadIdx.x < k ? d.plan_w[threadIdx.x] : 0.0f;
+        s_ptr[threadIdx.x] = (int) threadIdx.x < k ? plan_ptr[threadIdx.x] : 0ull;
+        s_w[threadIdx.x] = (int) threadIdx.x < k ? plan_w[threadIdx.x] : 0.0f;
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -3224,7 +3261,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
         const int j = threadIdx.x, r = r0 + j;
         float m = 0.0f;
         for (int i = 0; i < k; ++i) m += s_w[i] * s_part[i][j];
-        if (*d.cpu_flag) m += d.cpu_part[r];
+        if (*cpu_flag) m += cpu_part[r];
         out[r] = m + (sh_out != nullptr ? sh_out[r] : 0.0f);
     }
 }
@@ -4334,28 +4371,34 @@ __global__ void __launch_bounds__(256) rdna_shared_down_kernel(const uint8_t* we
 template<int T, int NW, bool GLOBAL = false, bool LUT = true, bool SPLIT = false,
          bool DIRECT = false, bool WIDE = false, int MINWAVES = 0>
 void launch_expert_gu(const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
-               const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
+               const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s,
+               const MoeCols& mc = MoeCols{}) {
     const bool shared = sh_down && sh_out;
-    const dim3 grid(n_ff / GU_ROWS, k + (shared && !SPLIT ? 1 : 0));
+    const dim3 grid(n_ff / GU_ROWS, k + (shared && !SPLIT ? 1 : 0), (unsigned) mc.nc);
     moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES><<<grid, NW * 32, 0, s>>>(d, shared ? k : k + 1, n_embd, n_ff,
         limit, (const block_q8_1*) xq, (block_q8_1*) hq, (const uint8_t*) sh_down, sh_type,
-        (const block_q8_1*) sh_hq, n_ff_sh, sh_out);
+        (const block_q8_1*) sh_hq, n_ff_sh, sh_out, mc.ca, mc.xq_cs, mc.hq_cs, mc.shq_cs, mc.out_cs);
     if constexpr (SPLIT) {
-        if (shared) rdna_shared_down_kernel<<<(n_embd + 7) / 8, 256, 0, s>>>(
-            (const uint8_t*) sh_down, sh_type, (const block_q8_1*) sh_hq, n_ff_sh, n_embd, sh_out);
+        for (int c = 0; shared && c < mc.nc; ++c)
+            rdna_shared_down_kernel<<<(n_embd + 7) / 8, 256, 0, s>>>(
+                (const uint8_t*) sh_down, sh_type, (const block_q8_1*) ((const uint8_t*) sh_hq + (size_t) c * mc.shq_cs),
+                n_ff_sh, n_embd, sh_out + (size_t) c * mc.out_cs);
     }
 }
 template<int T, int NR, bool GLOBAL = false, bool LUT = true, bool DIRECT = false, bool WIDE = false>
 void launch_expert_down(const MoeDev& d, int k, int n_embd, int n_ff, size_t off, const void* hq,
-               const float* sh, float* out, cudaStream_t s) {
-    moe_down_kernel<T, NR, LUT, GLOBAL, DIRECT, WIDE><<<grid_pad(n_embd / NR, 8), 256, 0, s>>>(d, k, n_embd, n_ff, off,
-        (const block_q8_1*) hq, sh, out);
+               const float* sh, float* out, cudaStream_t s, const MoeCols& mc = MoeCols{}) {
+    moe_down_kernel<T, NR, LUT, GLOBAL, DIRECT, WIDE><<<dim3((unsigned) grid_pad(n_embd / NR, 8), 1u, (unsigned) mc.nc),
+                                                       256, 0, s>>>(d, k, n_embd, n_ff, off, (const block_q8_1*) hq, sh,
+                                                                    out, mc.ca, mc.hq_cs, mc.out_cs);
 }
 } // namespace
 #endif
 
-void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
-                 const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
+namespace {
+void gate_up_impl(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
+                  const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s,
+                  const MoeCols& mc) {
 #if defined(STRATA_USE_HIP)
     // IQ2_XS (DeepSeek V4's gate/up) the same way, measured on gfx1151 (the Radeon 8060S lane) and gfx1201 (an AI PRO
     // R9700: 90.6 -> 75.6 us for 8 experts), bit-identical sums; gfx1100 not measured
@@ -4364,7 +4407,7 @@ void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, floa
     if (gu_type == 17 && n_embd == 4096 && n_ff == 2048 && (ra == RdnaArch::gfx1151 || ra == RdnaArch::gfx1201) &&
         !gu17_legacy) {
         launch_expert_gu<17, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
-            xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
         launch_check("moe_gate_up RDNA3.5");
         return;
     }
@@ -4375,13 +4418,13 @@ void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, floa
         rdna3_expert_device()) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
         launch_expert_gu<16, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
-            xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
         launch_check("moe_gate_up RDNA3");
         return;
     }
 #endif
     const bool sh = sh_down != nullptr && sh_out != nullptr;
-    const dim3 grid((unsigned) (n_ff / GU_ROWS), (unsigned) (k + (sh ? 1 : 0)));
+    const dim3 grid((unsigned) (n_ff / GU_ROWS), (unsigned) (k + (sh ? 1 : 0)), (unsigned) mc.nc);
     const auto* X = (const block_q8_1*) xq;
     auto* H = (block_q8_1*) hq;
     const auto* SD = (const uint8_t*) sh_down;
@@ -4390,13 +4433,33 @@ void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, floa
     switch (gu_type) {
 #define GLMF_GU(T) \
         case T: moe_gate_up_kernel<T><<<grid, GU_WARPS * 32, 0, s>>>(d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, \
-                                                                     n_ff_sh, sh_out); break;
+                                                                     n_ff_sh, sh_out, mc.ca, mc.xq_cs, mc.hq_cs,      \
+                                                                     mc.shq_cs, mc.out_cs); break;
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
         GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(39)
 #undef GLMF_GU
         default: std::fprintf(stderr, "glm_fast moe_gate_up: type %d unsupported\n", gu_type); return;
     }
     launch_check("moe_gate_up");
+}
+}  // namespace
+
+void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
+                 const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
+    gate_up_impl(gu_type, d, k, n_embd, n_ff, limit, xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, MoeCols{});
+}
+
+void moe_gate_up_cols(int gu_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, float limit,
+                      const void* xq, size_t xq_cs, void* hq, size_t hq_cs, const void* sh_down, int sh_type,
+                      const void* sh_hq, size_t sh_hq_cs, int n_ff_sh, float* sh_out, size_t out_cs, cudaStream_t s) {
+    MoeCols mc;
+    mc.ca = cols;
+    mc.nc = nc;
+    mc.xq_cs = xq_cs;
+    mc.hq_cs = hq_cs;
+    mc.shq_cs = sh_hq_cs;
+    mc.out_cs = out_cs;
+    gate_up_impl(gu_type, MoeDev{}, k, n_embd, n_ff, limit, xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
 }
 
 #if defined(STRATA_USE_HIP)
@@ -4480,30 +4543,49 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
     return true;
 }
 
-void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
-              const float* sh_out, float* out, cudaStream_t s) {
+namespace {
+void down_impl(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
+               const float* sh_out, float* out, cudaStream_t s, const MoeCols& mc) {
 #if defined(STRATA_USE_HIP)
     // IQ3_XXS down regresses on gfx1151; let it use the original dispatch below.
     if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
         // Two rows lower the register budget; IQ2_S prefers global grid reads,
         // while the smaller IQ3_XXS grid is faster in LDS on gfx1100.
-        if (d_type == 22) launch_expert_down<22, 2, true, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
-        else launch_expert_down<18, 2, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
+        if (d_type == 22) launch_expert_down<22, 2, true, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc);
+        else launch_expert_down<18, 2, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc);
         launch_check("moe_down RDNA3");
         return;
     }
 #endif
     const int blocks = n_embd / DOWN_ROWS;   // n_embd % DOWN_ROWS == 0 (4096)
     const auto* H = (const block_q8_1*) hq;
+    const dim3 grid((unsigned) grid_pad(blocks, 8), 1u, (unsigned) mc.nc);
     switch (d_type) {
 #define GLMF_DN(T) \
-        case T: moe_down_kernel<T><<<grid_pad(blocks, 8), 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out); break;
+        case T: moe_down_kernel<T><<<grid, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out, mc.ca, mc.hq_cs, \
+                                                         mc.out_cs); break;
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
         GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(39)
 #undef GLMF_DN
         default: std::fprintf(stderr, "glm_fast moe_down: type %d unsupported\n", d_type); return;
     }
     launch_check("moe_down");
+}
+}  // namespace
+
+void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
+              const float* sh_out, float* out, cudaStream_t s) {
+    down_impl(d_type, d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, MoeCols{});
+}
+
+void moe_down_cols(int d_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, size_t down_off,
+                   const void* hq, size_t hq_cs, const float* sh_out, float* out, size_t out_cs, cudaStream_t s) {
+    MoeCols mc;
+    mc.ca = cols;
+    mc.nc = nc;
+    mc.hq_cs = hq_cs;
+    mc.out_cs = out_cs;
+    down_impl(d_type, MoeDev{}, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc);
 }
 
 namespace {

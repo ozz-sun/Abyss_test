@@ -78,6 +78,9 @@ struct VerifyBuf {
     float* hop_h = nullptr;                   // a split: pinned [TM][hc * n_embd], the columns' residuals to the next part
     cudaEvent_t ev_hop = nullptr;
     std::vector<gf::MoeDev> md;               // a route plan per column (the shared tables, own plan arrays)
+    gf::MoeColArgs* cols_d = nullptr;         // ... their plan / CPU-lane fields on the device (the column-batched experts)
+    float* ffn_chk = nullptr;                 // STRATA_DS4_WIN_COLS_CHECK: the batched launch's FFN rows, then compared
+    uint64_t chk_calls = 0, chk_cols = 0, chk_diff = 0;
     // per column, for the pipelined window's concurrent tokens: the mHC partials, the routed experts' h, the
     // indexer's scores / selection, the fetched experts' scratch slots (column 0: the token path's)
     float* hpart = nullptr;
@@ -199,6 +202,15 @@ bool Glm5Model::verify_alloc(std::string& err) {
         m.pf_src = fast_->pf_buf[0];
         m.pf_dst = fast_->pf_buf[0] + 8;
         m.pf_n = fast_->pf_n_buf[0];
+    }
+    if (ok) {   // the columns' plans for the experts in one launch a group (moe_gate_up_cols / moe_down_cols)
+        std::vector<gf::MoeColArgs> ca((size_t) TM);
+        for (int t = 0; t < TM; ++t) {
+            const gf::MoeDev& m = V->md[(size_t) t];
+            ca[(size_t) t] = gf::MoeColArgs{m.plan_ptr, m.plan_w, m.cpu_flag, m.cpu_part};
+        }
+        ok = cudaMalloc((void**) &V->cols_d, ca.size() * sizeof(gf::MoeColArgs)) == cudaSuccess &&
+             cudaMemcpy(V->cols_d, ca.data(), ca.size() * sizeof(gf::MoeColArgs), cudaMemcpyHostToDevice) == cudaSuccess;
     }
     // the pipelined window's scratch slots (8 an extra column, an expert blob each): without them, the batched window
     size_t blob_max = 0;
@@ -438,6 +450,20 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         return v != nullptr && std::atoi(v) != 0;
 #endif
     }();
+    // STRATA_DS4_WIN_COLS (default 1): the columns' resident experts in one gate/up and one down launch (the same
+    // blocks as a launch a column: the same sums) - a column's ~4 resident experts a layer left the GPU half idle
+    static const bool win_cols = [] {
+        const char* v = getenv("STRATA_DS4_WIN_COLS");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on;
+    // STRATA_DS4_WIN_COLS_CHECK=1: every 16th group of columns also through a launch a column, compared bit by bit
+    static const bool cols_chk = getenv("STRATA_DS4_WIN_COLS_CHECK") != nullptr && std::atoi(getenv("STRATA_DS4_WIN_COLS_CHECK")) != 0;
+    const bool chk = cols && cols_chk && (V->chk_calls++ % 16) == 0;
+    if (chk && V->ffn_chk == nullptr && cudaMalloc((void**) &V->ffn_chk, (size_t) kVerifyMax * E * sizeof(float)) != cudaSuccess) {
+        err = "deepseek4 verify: the check buffer";
+        return false;
+    }
     for (int t = tb; t < tb + T; ++t) {
         const gf::MoeDev& md = V->md[(size_t) t];
         float* sh_out = V->sh_out + (size_t) t * E;
@@ -450,11 +476,44 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         }
         // the next route may find this one's promotions resident: it goes after their copies have landed
         if (done_ev != nullptr && t == tb + T - 1) cudaEventRecord(done_ev, s);
+        if (cols) continue;   // (the batched launches below; the check runs these after them)
         gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
                         hq, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
                         FFs, sh_out, s);
         gf::moe_down(Ly.d_type, md, k, E, g.n_ff_exp, Ly.down_off, hq, Ly.sh_down.q != nullptr ? sh_out : nullptr,
                      V->ffn + (size_t) t * E, s);
+    }
+    if (cols) {
+        const size_t shq = (size_t) (FFs / 32) * kQ8;
+        float* sh_out = V->sh_out + (size_t) tb * E;
+        void* hq = (uint8_t*) V->hq + (size_t) tb * V->hq_n;
+        gf::moe_gate_up_cols(Ly.gu_type, V->cols_d + tb, T, k, E, g.n_ff_exp, g.swiglu_exp,
+                             (const uint8_t*) V->xq + (size_t) tb * q8e, q8e, hq, V->hq_n, Ly.sh_down.q, Ly.sh_down.type,
+                             (const uint8_t*) V->sh_hq + (size_t) tb * shq, shq, FFs, sh_out, E, s);
+        gf::moe_down_cols(Ly.d_type, V->cols_d + tb, T, k, E, g.n_ff_exp, Ly.down_off, hq, V->hq_n,
+                          Ly.sh_down.q != nullptr ? sh_out : nullptr, chk ? V->ffn_chk : V->ffn + (size_t) tb * E, E, s);
+        if (chk) {   // the same inputs through a launch a column into V->ffn, then the rows compared
+            for (int t = tb; t < tb + T; ++t) {
+                const gf::MoeDev& md = V->md[(size_t) t];
+                float* sh_o = V->sh_out + (size_t) t * E;
+                void* hq1 = (uint8_t*) V->hq + (size_t) t * V->hq_n;
+                gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
+                                hq1, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * shq, FFs, sh_o, s);
+                gf::moe_down(Ly.d_type, md, k, E, g.n_ff_exp, Ly.down_off, hq1, Ly.sh_down.q != nullptr ? sh_o : nullptr,
+                             V->ffn + (size_t) t * E, s);
+            }
+            std::vector<float> a((size_t) T * E), b((size_t) T * E);
+            cudaMemcpyAsync(a.data(), V->ffn_chk, a.size() * sizeof(float), cudaMemcpyDeviceToHost, s);
+            cudaMemcpyAsync(b.data(), V->ffn + (size_t) tb * E, b.size() * sizeof(float), cudaMemcpyDeviceToHost, s);
+            cudaStreamSynchronize(s);
+            for (int t = 0; t < T; ++t) {
+                ++V->chk_cols;
+                if (std::memcmp(a.data() + (size_t) t * E, b.data() + (size_t) t * E, (size_t) E * sizeof(float)) != 0) ++V->chk_diff;
+            }
+            if ((V->chk_calls & 1023) == 1)
+                std::fprintf(stderr, "deepseek4 verify: column-batched experts checked - %llu columns, %llu differ\n",
+                             (unsigned long long) V->chk_cols, (unsigned long long) V->chk_diff);
+        }
     }
     // ... and the CPU lane's answers, in request order.  Deferred (F->defer, as fast_ffn): a column's part is
     // written into its streams after the next layer's attention (verify's hc_defer_add) with these write weights,

@@ -102,6 +102,7 @@ struct DSparkState {
     float* cpu_part = nullptr;
     int *ids_d = nullptr, *dtok = nullptr, *iota = nullptr;       // [3][kB][k] routes; [kB + 1] the chain; [2 kRing]
     std::vector<gf::MoeDev> md;
+    gf::MoeColArgs* cols_d = nullptr;                             // ... the rows' plans for the experts in one launch
     // pinned host: the token in (host-mapped), the results, the cache's staging and table values
     int *y_h = nullptr, *y_d = nullptr, *res_tok = nullptr, *res_ids = nullptr;
     float *res_conf = nullptr, *emb_h = nullptr;
@@ -342,12 +343,19 @@ bool Glm5Model::dspark_load(std::string& err) {
         cudaMemcpy(D->iota, io.data(), io.size() * sizeof(int), cudaMemcpyHostToDevice);
     }
     D->md.assign(kB, gf::MoeDev{});
-    for (int i = 0; i < kB; ++i) {
-        gf::MoeDev& m = D->md[(size_t) i];
-        m.plan_ptr = D->plan_ptr + i * 8;
-        m.plan_w = D->plan_w + i * 8;
-        m.cpu_flag = D->zero;
-        m.cpu_part = D->cpu_part;
+    {
+        gf::MoeColArgs ca[kB];
+        for (int i = 0; i < kB; ++i) {
+            gf::MoeDev& m = D->md[(size_t) i];
+            m.plan_ptr = D->plan_ptr + i * 8;
+            m.plan_w = D->plan_w + i * 8;
+            m.cpu_flag = D->zero;
+            m.cpu_part = D->cpu_part;
+            ca[i] = gf::MoeColArgs{m.plan_ptr, m.plan_w, m.cpu_flag, m.cpu_part};
+        }
+        D->cols_d = (gf::MoeColArgs*) dev(sizeof ca);
+        if (ok) ok = cudaMemcpy(D->cols_d, ca, sizeof ca, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (!ok) return refuse("the buffers did not allocate (VRAM?)");
     }
     // the routed experts: a VRAM slot cache a stage
     D->gu_rb = gf::row_bytes(kQ2K, E);
@@ -681,14 +689,10 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
             return false;
         }
         gf::sh_swiglu(D->sh_g, D->sh_u, kClamp, kB * FF, D->sh_hq, s);
-        for (int i = 0; i < kB; ++i) {
-            const gf::MoeDev& md = D->md[(size_t) i];
-            void* hq = (uint8_t*) D->hq + (size_t) i * D->hq_n;
-            float* sh_out = D->sh_out + (size_t) i * E;
-            gf::moe_gate_up(kQ2K, md, K, E, FF, kClamp, (const uint8_t*) D->xq + (size_t) i * q8e, hq, S.sh_down.q,
-                            S.sh_down.type, (const uint8_t*) D->sh_hq + (size_t) i * (FF / 32) * kQ8, FF, sh_out, s);
-            gf::moe_down(kQ2K, md, K, E, FF, D->down_off, hq, sh_out, D->ffn + (size_t) i * E, s);
-        }
+        // the block's rows in one gate/up and one down launch (moe_gate_up_cols: a row's plan each)
+        gf::moe_gate_up_cols(kQ2K, D->cols_d, kB, K, E, FF, kClamp, D->xq, q8e, D->hq, D->hq_n, S.sh_down.q,
+                             S.sh_down.type, D->sh_hq, (size_t) (FF / 32) * kQ8, FF, D->sh_out, E, s);
+        gf::moe_down_cols(kQ2K, D->cols_d, kB, K, E, FF, D->down_off, D->hq, D->hq_n, D->sh_out, D->ffn, E, s);
     }
     // ---- the head: the last write half, the hc head, the target's output rows, the Markov chain
     mark();
