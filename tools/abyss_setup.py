@@ -146,9 +146,15 @@ def build_engine(arch: str | None, gpus, nvcc_arg: str | None = None) -> Path:
     cmake = ROOT / ".venv" / "bin" / "cmake"
     ninja = ROOT / ".venv" / "bin" / "ninja"
     cc = cuda_archs(arch, gpus)
-    # (configured again when the GPUs need other architectures: a second card of another generation)
-    if not (ROOT / "build" / "build.ninja").exists() or configured_archs() not in (None, cc):
-        nvcc = nvcc_arg or shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    nvcc = nvcc_arg or shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    conf = [cmake, "-S", ROOT, "-B", ROOT / "build", "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}",
+            "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cc}",
+            "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_COMPILER={nvcc}",
+            f"-DSTRATA_GGML_DIR={ROOT / 'third_party' / 'llama.cpp'}"]
+    # (configured again when the GPUs need other architectures - a second card of another generation - or --nvcc names
+    # another toolkit than build/ was configured with; then from scratch, S.cmake_fresh)
+    if (not (ROOT / "build" / "build.ninja").exists() or configured_archs() not in (None, cc)
+            or nvcc_arg and S.cmake_cached(ROOT / "build", "CMAKE_CUDA_COMPILER") not in (None, nvcc_arg)):
         if not Path(nvcc).exists():
             S.fail("nvcc (the CUDA toolkit) was not found", "install the CUDA toolkit (12.8 or newer for RTX 50)")
         # V100 (sm_70): CUDA 13 compiles for Turing (sm_75) and newer only - the V100 needs a CUDA 12 toolkit
@@ -158,10 +164,7 @@ def build_engine(arch: str | None, gpus, nvcc_arg: str | None = None) -> Path:
                    "install a CUDA 12 toolkit (12.9) beside it and pass --nvcc /usr/local/cuda-12.9/bin/nvcc")
         names = " + ".join(g["name"] for g in gpus)
         S.say(f"  Configuring for {names} (CUDA arch {cc}) ...")
-        S.run([cmake, "-S", ROOT, "-B", ROOT / "build", "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}",
-               "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cc}",
-               "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_COMPILER={nvcc}",
-               f"-DSTRATA_GGML_DIR={ROOT / 'third_party' / 'llama.cpp'}"], quiet=True)
+        S.run(conf + S.cmake_fresh(ROOT / "build", conf), quiet=True)
     S.say("  Compiling the engine (a few minutes the first time, only what changed later) ...")
     S.run([cmake, "--build", ROOT / "build", "--target", "strata", "-j", str(max(2, (os.cpu_count() or 4)))], quiet=True)
     S.ok(f"engine: {exe}")
@@ -217,6 +220,14 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
     run = ROOT / f"run-abyss-{name}.sh"
     if cfg.exists() and not rewrite:
         S.ok(f"{cfg.name} kept (--rewrite-config writes it again)")
+        # ... with the libraries of the engine just checked or compiled: after a switch to another ROCm (setup again
+        # with ROCM_PATH) the old one's lib first in LD_LIBRARY_PATH would load its runtime into the new engine - ROCm 7
+        # and 10 share the sonames (libamdhip64.so.7, libhsa-runtime64.so.1) and the engine has no RUNPATH
+        kept = json.loads(cfg.read_text(encoding="utf-8"))
+        if (extra or {}).get("lib_dirs") and kept.get("lib_dirs") != extra["lib_dirs"]:
+            kept["lib_dirs"] = extra["lib_dirs"]
+            cfg.write_text(json.dumps(kept, indent=1) + "\n", encoding="utf-8")
+            S.ok(f"{cfg.name}: lib_dirs {', '.join(extra['lib_dirs'])} (the libraries the engine was compiled with)")
     else:
         cfg.write_text(json.dumps({
             "exe": str(ROOT / "build" / "strata"),

@@ -210,6 +210,22 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(env["ROCM_PATH"], str(self.rocm))
         self.assertEqual(meta["backend"], "hip")
 
+    def test_hip_build_for_another_rocm_starts_the_cache_over(self):
+        # issue #1: build-hip/ configured with a ROCm 7.0 pip SDK, setup again with ROCM_PATH at ROCm 10 - CMake alone
+        # would keep only the new compiler and drop STRATA_ENABLE_HIP=ON with the other -D (a build that does nothing)
+        pc = maya.check_pc(self.a)
+        maya.BUILD.mkdir()
+        clang = (self.rocm / "llvm/bin/clang++").as_posix()
+        for cached, fresh in (("/home/u/rocm_sdk/lib/llvm/bin/clang++", True), (clang, False)):
+            (maya.BUILD / "CMakeCache.txt").write_text(f"CMAKE_HIP_COMPILER:STRING={cached}\n", encoding="utf-8")
+            with patch.object(maya, "pick_cmake", return_value="cmake"), \
+                    patch.object(maya, "cmake_steps", return_value=None) as build:
+                maya.compile_engine_hip(pc, self.root / "llama", "source-sha")
+            conf = build.call_args.args[0]
+            self.assertEqual("--fresh" in conf, fresh, cached)
+            self.assertIn("-DSTRATA_ENABLE_HIP=ON", conf)
+            self.assertIn(f"-DCMAKE_HIP_COMPILER={clang}", conf)
+
     def test_hip_skips_vision_without_downloading(self):
         with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")):
             self.assertIsNone(maya.vision_step(self.a, {"backend": "hip"}, {}, self.root, self.root, "test"))

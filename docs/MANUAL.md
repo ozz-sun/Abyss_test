@@ -321,7 +321,9 @@ DeepSeek V4 also runs on AMD Radeon cards: the RX 7900 XT / XTX (gfx1100), the R
 the Ryzen AI Max's Radeon 8060S (gfx1151).
 
 - **Setup:** `./setup-deepseek.sh --backend hip` (chosen by itself when there is no NVIDIA GPU). On Linux it uses ROCm 7
-  or newer in `/opt/rocm` (ROCm 10: `/opt/rocm/core-10.0` too). The engine is built in `build-hip/strata`, and the config gets `"backend": "hip"`.
+  or newer in `/opt/rocm` (ROCm 10: `/opt/rocm/core-10.0` too; the R9700 has been checked with ROCm 10 only). The
+  engine is built in `build-hip/strata`, and the config gets `"backend": "hip"`. After switching to another ROCm, run
+  it again (with `ROCM_PATH`): it builds the engine from scratch for that ROCm (v1.3.44).
 - **Driver and ROCm:** [docs/amd/README.md](amd/README.md) has the install steps (amdgpu, ROCm 10's per-architecture
   packages - an R9700 needs `amdrocm10.0-gfx1201` - and why `HSA_OVERRIDE_GFX_VERSION` must not be set), a check
   list, and troubleshooting.

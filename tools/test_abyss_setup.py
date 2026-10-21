@@ -1,6 +1,8 @@
 """tools/abyss_setup.py's Abyss-tools folder: made from ops/abyss-tools with Abyss's path, the scripts follow the
 template (a changed one kept as .bak), the README is the user's once written.  The DSpark drafter's step: downloaded
-(here a local file), checked and named in the config's env, kept, taken out.  No GPU, no network.
+(here a local file), checked and named in the config's env, kept, taken out.  Another toolkit than build/ was
+configured with: configured from scratch (CMake drops every other -D otherwise, issue #1); a kept config takes the
+engine's lib_dirs.  No GPU, no network.
 
     python -m unittest tools.test_abyss_setup
 """
@@ -115,6 +117,78 @@ class DSparkStep(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.run_step(dspark=True)
         self.assertFalse(self.dst.with_name("drafter.gguf.sha256").exists())
+
+
+class ToolkitSwitch(unittest.TestCase):
+    """Setup again after a switch to another ROCm / CUDA toolkit (issue #1: ROCm 7.0 -> 10)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "build").mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def cache(self, **entries):
+        (self.root / "build" / "CMakeCache.txt").write_text(
+            "# This is the CMakeCache file.\n" + "".join(f"{k}:STRING={v}\n" for k, v in entries.items()),
+            encoding="utf-8")
+
+    def test_fresh_only_when_the_cache_names_another_compiler(self):
+        build = self.root / "build"
+
+        def fresh(clang):
+            return A.S.cmake_fresh(build, ["cmake", "-DSTRATA_ENABLE_HIP=ON", f"-DCMAKE_HIP_COMPILER={clang}"])
+        rocm10 = "/opt/rocm/core-10.0/llvm/bin/clang++"
+        self.assertEqual(fresh(rocm10), [])   # no cache yet
+        self.cache(CMAKE_HIP_COMPILER="/home/u/rocm_sdk/lib/llvm/bin/clang++")
+        self.assertEqual(fresh(rocm10), ["--fresh"])
+        self.assertEqual(A.S.cmake_fresh(build, ["cmake", "-DSTRATA_ENABLE_HIP=ON"]), [])   # no compiler given
+        self.cache(CMAKE_HIP_COMPILER=rocm10)
+        self.assertEqual(fresh(rocm10), [])
+        self.assertEqual(fresh("/opt/rocm/core-10.0//llvm/bin/./clang++"), [])   # the same path written otherwise
+        self.assertEqual(fresh("/opt/rocm/llvm/bin/clang++"), ["--fresh"])   # (a link: compared as written)
+        self.cache(CMAKE_CUDA_COMPILER="/usr/local/cuda-13.0/bin/nvcc", CMAKE_CUDA_HOST_COMPILER="/usr/bin/g++-14")
+        self.assertEqual(A.S.cmake_fresh(build, ["-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc",
+                                                 "-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13"]), ["--fresh"])
+
+    def build(self, nvcc_arg=None):
+        gpus = [{"arch": "120", "name": "RTX 5090"}]
+        with mock.patch.object(A, "ROOT", self.root), mock.patch.object(A.S, "run") as run:
+            A.build_engine(None, gpus, nvcc_arg)
+        return [[str(c) for c in call.args[0]] for call in run.call_args_list]
+
+    def test_another_nvcc_configures_build_from_scratch(self):
+        (self.root / "build" / "build.ninja").touch()
+        nvcc = self.root / "cuda-12.9" / "bin" / "nvcc"
+        nvcc.parent.mkdir(parents=True)
+        nvcc.touch()
+        self.cache(CMAKE_CUDA_COMPILER="/usr/local/cuda-13.0/bin/nvcc", CMAKE_CUDA_ARCHITECTURES="120a")
+        conf, build = self.build(str(nvcc))
+        self.assertIn("--fresh", conf)
+        for want in ("-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_COMPILER={nvcc}", "-DCMAKE_CUDA_ARCHITECTURES=120a"):
+            self.assertIn(want, conf)
+        self.assertIn("--build", build)
+        # the toolkit build/ has (by --nvcc, or none given): only the build
+        self.cache(CMAKE_CUDA_COMPILER=str(nvcc), CMAKE_CUDA_ARCHITECTURES="120a")
+        self.assertEqual(len(self.build(str(nvcc))), 1)
+        self.cache(CMAKE_CUDA_COMPILER="/usr/local/cuda-13.0/bin/nvcc", CMAKE_CUDA_ARCHITECTURES="120a")
+        self.assertEqual(len(self.build()), 1)
+
+    def test_a_kept_config_takes_the_engines_lib_dirs(self):
+        cfg = self.root / "abyss-dsv4-r9700.json"
+        mine = {"exe": "build-hip/strata", "backend": "hip", "lib_dirs": ["/home/u/rocm_sdk/lib"], "port": 8082,
+                "env": {"GPU_MAX_HW_QUEUES": "2", "STRATA_GLM_RAM_GB": "80"}}
+        cfg.write_text(json.dumps(mine), encoding="utf-8")
+        extra = {"exe": "build-hip/strata", "backend": "hip", "lib_dirs": ["/opt/rocm/core-10.0/lib"], "env": {}}
+        with mock.patch.object(A, "ROOT", self.root):
+            A.write_config("dsv4-r9700", self.root / "pack", 65536, 8080, False, None, extra)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(got, dict(mine, lib_dirs=["/opt/rocm/core-10.0/lib"]))   # the rest is the user's
+            # (an engine stamp without lib_dirs: what the config has stays)
+            A.write_config("dsv4-r9700", self.root / "pack", 65536, 8080, False, None, dict(extra, lib_dirs=[]))
+            self.assertEqual(json.loads(cfg.read_text(encoding="utf-8"))["lib_dirs"], ["/opt/rocm/core-10.0/lib"])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,31 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.44 - 2026-10-22
+
+**Setup after a switch to another ROCm or CUDA toolkit builds the engine for it (issue #1); docs/amd says which ROCm
+and driver an R9700 has been checked with.**
+- A build folder configured with another compiler (a ROCm 7.0 pip SDK, then setup again with `ROCM_PATH` at ROCm 10):
+  CMake deleted its cache by itself but configured again with the new compiler alone. `STRATA_ENABLE_HIP=ON` and the
+  other `-D` options were dropped, the build had no GPU target and did nothing, and setup wrote "engine compiled" over
+  the engine built for the old ROCm. Setup now configures from scratch (`cmake --fresh`) when the cache names another
+  `CMAKE_<LANG>_COMPILER` than the one it passes: the HIP engine (`build-hip/`), the CUDA engine (`build/`: a newly
+  installed toolkit, or `--nvcc`) and the vision encoder. Checked with the real CMakeLists on ROCm 10 under its two
+  paths (`/opt/rocm/llvm`, `/opt/rocm/core-10.0/llvm`): before, the second configure left `STRATA_ENABLE_HIP=OFF` and
+  `STRATA_PREFILL_MMQ=OFF`; now each switch configures from scratch and keeps them on.
+- `./setup-deepseek.sh --nvcc` naming another toolkit than `build/` was configured with now configures again (before,
+  the new toolkit was ignored unless the GPUs' architectures changed).
+- A config that setup keeps takes the engine's `lib_dirs`. ROCm 7 and 10 share the library names (`libamdhip64.so.7`,
+  `libhsa-runtime64.so.1`) and the engine has no RUNPATH, so the old ROCm's `lib` first in `LD_LIBRARY_PATH` would
+  have loaded the old runtime into the new engine.
+- docs/amd: on an R9700 only ROCm 10 has been checked. A user's ROCm 7.0 pip SDK failed every kernel launch after a
+  kernel update and a move to amdgpu-dkms 6.19.14, until the engine was built with ROCm 10. Before that move, Ubuntu's
+  kernel 7.0.0-38 with its own amdgpu could not pin the 80 GB RAM tier (`failed to pin userptr`), and amdgpu-dkms with
+  `iommu=pt` fixed that. New: "Switching to another ROCm", and a troubleshooting row for `kernel launch(es) failed` on
+  every request while `/health` answers. The README and the manual say the same in short.
+- The engine's source is unchanged from v1.3.43. Thanks to @potatopote-debug for running it down on their R9700 and
+  for the report.
+
 ## v1.3.43 - 2026-10-22
 
 **DeepSeek's DSpark drafter for DeepSeek V4 Flash 0731 (opt-in, `./setup-deepseek.sh --dspark`): up to 5 drafted

@@ -317,7 +317,9 @@ AMD の Radeon でも動く。対象は RX 7900 XT / XTX（gfx1100）、RX 9070 
 Radeon 8060S（gfx1151）。
 
 - **セットアップ:** `./setup-deepseek.sh --backend hip`（NVIDIA の GPU がなければ自動で HIP を選ぶ）。Linux では
-  `/opt/rocm` の ROCm 7 以降を使う（ROCm 10 は `/opt/rocm/core-10.0` も探す）。エンジンは `build-hip/strata` にビルドされ、設定に `"backend": "hip"` が入る。
+  `/opt/rocm` の ROCm 7 以降を使う（ROCm 10 は `/opt/rocm/core-10.0` も探す。R9700 で確かめたのは ROCm 10 だけ）。
+  エンジンは `build-hip/strata` にビルドされ、設定に `"backend": "hip"` が入る。別の ROCm に切り替えたら、
+  `ROCM_PATH` を付けてもう一度実行する。その ROCm でエンジンを最初からビルドし直す（v1.3.44）。
 - **ドライバと ROCm:** 入れ方は [docs/amd/README.ja.md](amd/README.ja.md) にまとめた（amdgpu、ROCm 10 の
   アーキテクチャ別のパッケージ、`HSA_OVERRIDE_GFX_VERSION` を設定してはいけない理由）。動作確認とトラブル対応も
   そこにある。R9700 では `amdrocm10.0-gfx1201` が要る。

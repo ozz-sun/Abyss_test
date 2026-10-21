@@ -30,7 +30,7 @@ iGPU が計算します（iGPU レーン）。
 | ドライバ | amdgpu-dkms 6.19.14（amdgpu-install 31.40） |
 | ROCm | 10.0.0（apt の `amdrocm` パッケージ、`/opt/rocm/core-10.0`） |
 
-ROCm 7 以降で動きます（セットアップが確かめます）。
+セットアップは ROCm 7 以降を受け付けます。R9700 で確かめたのは ROCm 10 だけです（「[ROCm 7](#rocm-7)」を参照）。
 
 ## 1. ドライバ（amdgpu）
 
@@ -38,8 +38,10 @@ ROCm はカーネルの amdgpu ドライバと、ドライバが作る `/dev/kfd
 
 1. **ドライバを入れる。** 上の PC では、AMD の `amdgpu-install`（Radeon Software for Linux）で
    `amdgpu-dkms` と `amdgpu-dkms-firmware` を入れています。DKMS 版は、カーネルを更新したときに作り直されます。
-   - 新しいカーネルに入っている amdgpu でも、`/dev/kfd` があり、下の `rocminfo` に GPU が出れば ROCm は動くはずです。
-     ただし、この組み合わせは確認していません。
+   - カーネルに入っている amdgpu は、ここでは確かめていません。ある PC では、Ubuntu のカーネルを 7.0.0-38 に
+     更新したあと、その amdgpu で RAM 層をピン留めできなくなり（`dmesg` に `failed to pin userptr`）、どの
+     リクエストも `kernel launch(es) failed` で失敗しました。amdgpu-dkms と `iommu=pt`、ROCm 10 で直っています
+     （[issue #1](https://github.com/zephel01/Abyss/issues/1)）。amdgpu-dkms を使ってください。
    - Secure Boot が有効な PC では、DKMS のモジュールに署名が要ります（インストール時に MOK の登録を求められます）。
 2. **ユーザーを `render` と `video` のグループに入れる。** 入れたあと、ログインし直します。
 
@@ -94,9 +96,30 @@ ROCm 10 のパッケージは GPU のアーキテクチャごとに分かれて�
 
 ### ROCm 7
 
-ROCm 7（`amdgpu-install` の `rocm`、または amdrocm 7.x）でも動きます。amdrocm 7.x もアーキテクチャごとに
-分かれているので、入れ方は上と同じです（`amdrocm7.14-gfx1201` など）。複数の版を入れると `/opt/rocm` が
-どちらを指すかがわかりにくくなるので、使わない版は消すか、`ROCM_PATH` で版を指定してください。
+セットアップは ROCm 7（`amdgpu-install` の `rocm`、amdrocm 7.x、AMD の pip の wheel）も受け付けますが、R9700 で
+ここで確かめたのは ROCm 10 だけです。ある R9700 の PC では、ROCm 7.0 の pip SDK で v1.3.37 まで動いていました。
+カーネルの更新と amdgpu-dkms 6.19.14 への切り替えのあとは、エンジンを ROCm 10 でビルドし直すまで、すべての
+カーネルの起動が失敗しました（[issue #1](https://github.com/zephel01/Abyss/issues/1)）。
+Linux では ROCm 10 を使ってください。
+
+amdrocm 7.x もアーキテクチャごとに分かれているので、入れ方は上と同じです（`amdrocm7.14-gfx1201` など）。複数の
+版を入れると `/opt/rocm` がどちらを指すかがわかりにくくなるので、使わない版は消すか、`ROCM_PATH` で版を指定して
+ください。
+
+### 別の ROCm に切り替えるとき
+
+セットアップをもう一度実行します。新しい ROCm をセットアップが自分で見つけられないときは、`ROCM_PATH` で
+指定します。
+
+```sh
+ROCM_PATH=/opt/rocm/core-10.0 ./setup-deepseek.sh --backend hip
+```
+
+その ROCm でエンジンを最初からビルドし直し、設定ファイルの `lib_dirs` をその ROCm のライブラリに向けます。
+ROCm 7 と 10 はライブラリの名前が同じ（`libamdhip64.so.7` など）なので、古い `lib_dirs` のままだと、新しい
+エンジンに古いランタイムが読み込まれます。v1.3.43 までのセットアップは、「ビルドした」と表示しながら古い
+エンジンを残していました（コンパイラが変わると、CMake がほかのビルドの指定を落とすため）。その版では、先に
+`build-hip/` を消してください。
 
 ### Windows
 
@@ -247,7 +270,8 @@ HIP の番号は、起動時にドライバが GPU を見つけた順（KFD の�
   多いので、帯域は速度に直接効きます。
 - 上の PC のカーネルのパラメータには `pci=realloc pcie_aspm=off pcie_port_pm=off iommu=pt pcie_ports=native` が
   入っています。どれも、以前 NVIDIA の eGPU を安定させるために入れたものです。Radeon でどれが必須かは
-  確かめていません。
+  確かめていません。[issue #1](https://github.com/zephel01/Abyss/issues/1) の PC では、カーネルの amdgpu が
+  RAM 層をピン留めできなくなったあと、amdgpu-dkms と `iommu=pt`（と ROCm 10）が必要でした。
 
 ## 7. 速度の目安
 
@@ -301,6 +325,7 @@ iGPU のない PC でも、R9700 と十分な RAM があれば、この 6 問を
 |---|---|---|
 | `rocminfo` が `HSA_STATUS_ERROR_OUT_OF_RESOURCES` で終わる | `HSA_OVERRIDE_GFX_VERSION` が残っている | 「3. 環境変数」の手順で消し、ログインし直す |
 | `rocminfo` が `/dev/kfd` を開けない（permission denied） | `render` グループに入っていない | `sudo usermod -aG render,video $USER` のあとログインし直す |
+| モデルは読み込めて `/health` も答えるのに、どのリクエストも `kernel launch(es) failed`（HTTP 400）ですぐ失敗する | ドライバが RAM 層をピン留めできない: `sudo dmesg \| grep -i userptr` に `failed to pin userptr` や `failed to validate BO` が出る（カーネルの amdgpu。issue #1）。または、エンジンの ROCm がドライバと合わない（issue #1: ROCm 7.0 の pip SDK と amdgpu-dkms 6.19.14） | amdgpu-dkms と `iommu=pt`（「1. ドライバ」）、ROCm 10 にして、セットアップをもう一度（「別の ROCm に切り替えるとき」） |
 | 生成はできるのに、最初の prompt で止まる。サーバーが 503 を返し、180 秒でエンジンが終了させられる | rocBLAS / hipBLASLt にその GPU のカーネルがない（例: gfx1151 の分しか入っていない） | `sudo apt install amdrocm10.0-<arch>`（R9700 なら gfx1201）。確かめ方は「4. 動作確認」 |
 | エンジンのログに `No compatible code objects found for: gfx1201` が出る。iGPU レーンで `invalid device function` になる | 古いビルドの `libabyss_igpu.so` に、エンジンの GPU 用のコードが入っていない。HIP は、見えている GPU のどれか 1 つでもコードがないライブラリだと、そのカーネルを全部の GPU で使えなくする | 今のソースでビルドし直す（`./setup-deepseek.sh --backend hip`） |
 | 単体カードがあるのに遅く、ログの GPU が iGPU（gfx1151）になっている | HIP の番号が入れ替わり、設定の `"gpu"` が iGPU を指している | 設定に `"gpu_pci"` を書く（「GPU の番号が変わる場合」）。`rocminfo` で順番を確かめる |

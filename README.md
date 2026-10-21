@@ -210,7 +210,7 @@ Every step is skipped when done, so it is safe to run again. Options: `--quant`,
 | GPU | NVIDIA: RTX 5090 32 GB and RTX 3090 measured; a V100 builds with CUDA 12 (not run yet). AMD Radeon through HIP, experimental: Radeon 8060S and AI PRO R9700 (with the 8060S as its lane) run; see [docs/amd](docs/amd/README.md) |
 | Memory | VRAM + RAM ≳ 100 GB to keep every expert in memory (less works, reading from the SSD) |
 | Disk | NVMe SSD with ~100 GB free (DeepSeek V4.1: ~370 GB, the faster the better) |
-| Toolchain | CUDA 13.x (`nvcc`; 12.9 for a V100), g++, Python 3.10+; ROCm 7 (`hipcc`) for the iGPU lane on an AMD APU or for an AMD build |
+| Toolchain | CUDA 13.x (`nvcc`; 12.9 for a V100), g++, Python 3.10+; ROCm 7 or newer (`hipcc`) for the iGPU lane on an AMD APU or for an AMD build (the R9700 was checked with ROCm 10: [docs/amd](docs/amd/README.md)) |
 
 ## 🧠 How it works
 

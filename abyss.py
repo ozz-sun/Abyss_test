@@ -1117,6 +1117,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     if cuda_archs == "native":
         say("  (CMakeLists.txt refuses an explicit sm_70 - Maya's own floor is sm_75 - so CMake is asked for this")
         say(f"  machine's GPUs instead: CMAKE_CUDA_ARCHITECTURES=native with CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
+    conf += S.cmake_fresh(BUILD, conf)   # (another toolkit than build/ was configured with: S.cmake_fresh)
     stopped = cmake_steps(conf, build, env, "build-maya.bat")
     if stopped:
         return stop(stopped)
@@ -1254,6 +1255,7 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | No
              f"-DCMAKE_HIP_ARCHITECTURES={';'.join(pc['archs'])}",
              f"-DCMAKE_HIP_COMPILER={clang.as_posix()}", f"-DCMAKE_PREFIX_PATH={root.as_posix()}",
              f"-DSTRATA_GGML_DIR={llama.as_posix()}"]
+    conf += S.cmake_fresh(BUILD, conf)   # (another ROCm than build-hip/ was configured with: S.cmake_fresh)
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
     say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)], env,
@@ -1671,6 +1673,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
              f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}"]
     if meta.get("host_compiler"):
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
+    conf += S.cmake_fresh(VBUILD, conf)
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's CUDA kernels: 10-20 minutes, once) ...")
     if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "strata-vision", "-j", str(jobs)], None,

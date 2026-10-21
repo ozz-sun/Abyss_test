@@ -124,6 +124,31 @@ def out(cmd):
         return ""
 
 
+def cmake_cached(build: Path, var: str) -> str | None:
+    """A variable of a build folder's CMake cache (its CMakeCache.txt), or None."""
+    cache = Path(build) / "CMakeCache.txt"
+    m = re.search(rf"^{re.escape(var)}:[A-Z]+=(.*)$", cache.read_text(errors="replace"), re.M) \
+        if cache.exists() else None
+    return m.group(1).strip() if m else None
+
+
+def cmake_fresh(build: Path, conf) -> list:
+    """["--fresh"] when the build folder was configured with another compiler than conf's -DCMAKE_<LANG>_COMPILER (or
+    host compiler) names, else [].  CMake deletes its cache by itself then, but configures again with that variable
+    alone - every other -D of the command is dropped: STRATA_ENABLE_HIP / _CUDA off, no GPU target, a build that does
+    nothing and the engine compiled for the old toolkit left in place (ROCm 7 -> 10, issue #1).  --fresh (CMake 3.24+)
+    starts the cache over with all of them.  The paths are compared as CMake does: as written, links not followed."""
+    def norm(p):   # (a bare name as CMake looks it up: on PATH)
+        return os.path.normpath(p if os.path.isabs(p) else shutil.which(p) or p).replace("\\", "/")
+    for c in conf:
+        m = re.match(r"-D(CMAKE_\w+_COMPILER)(?::\w+)?=(.+)$", str(c))
+        was = cmake_cached(build, m.group(1)) if m else None
+        if was and norm(was.split(";")[0]) != norm(m.group(2)):
+            say(f"  {Path(build).name}/ was configured with {m.group(1)}={was}: configuring it from scratch")
+            return ["--fresh"]
+    return []
+
+
 def read_text(path: Path) -> str:
     """A sysfs file's text, stripped ("" when it cannot be read)."""
     try:
