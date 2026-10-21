@@ -91,13 +91,19 @@ struct VerifyBuf {
     bool pipe_now = true;                     // this window pipelined (verify's choice, STRATA_DS4_SPEC_PIPE)
     int pipe_choice = -1;                     // (the first part's) the kind kept on this machine: -1 still timing both
     std::vector<double> ms_pipe, ms_batch;    // ... the timed windows' ms a token of each kind
-    cudaStream_t st[4] = {};                  // column t's stream (st[0]: the compute stream)
-    cudaEvent_t ev_attn[4] = {}, ev_route[4] = {}, ev_fin[4] = {}, ev_start = nullptr;
+    cudaStream_t st[Glm5Model::kVerifyMax] = {};   // column t's stream (st[0]: the compute stream)
+    cudaEvent_t ev_attn[Glm5Model::kVerifyMax] = {}, ev_route[Glm5Model::kVerifyMax] = {},
+                ev_fin[Glm5Model::kVerifyMax] = {}, ev_start = nullptr;
     cudaEvent_t done = nullptr;
     int T = 0;                                // the last window's size
     // column t's CPU-lane answer of the last layer, left to its next attention-side hc3 read (verify_moe, as fast_moe's
     // STRATA_GLM_HC_CPU) - and the paced promotion copies, which go out after that read
-    bool hc_cpu[4] = {}, bg_after[4] = {};
+    bool hc_cpu[Glm5Model::kVerifyMax] = {}, bg_after[Glm5Model::kVerifyMax] = {};
+    // the pipelined window's scratch slot sets (8 VRAM slots a set): set 0 the token path's, sets 1..n_scr the
+    // window's own - a group of columns runs on one stream, so its columns share their group's set
+    static constexpr int kScrSets = 3;
+    unsigned long long* scr_set[kScrSets + 1] = {};
+    int n_scr = 0;
 };
 }  // namespace
 
@@ -194,21 +200,26 @@ bool Glm5Model::verify_alloc(std::string& err) {
     size_t blob_max = 0;
     for (int il = l0_; il < l1_; ++il) blob_max = std::max(blob_max, fast_->L[(size_t) il].blob);
     const size_t sstride = (blob_max + 255u) & ~(size_t) 255u;
-    if (ok && sstride > 0 && cudaMalloc(&V->scr, (size_t) (TM - 1) * 8 * sstride) == cudaSuccess) {
-        for (int t = 1; t < TM && ok; ++t) {
+    // (sets for up to 4 groups: the 8-column window keeps 4 columns' worth, 192 MB a 8 MB blob)
+    const int NS = std::min(TM - 1, (int) VerifyBuf::kScrSets);
+    V->scr_set[0] = fast_->md.scratch;
+    if (ok && sstride > 0 && cudaMalloc(&V->scr, (size_t) NS * 8 * sstride) == cudaSuccess) {
+        for (int k = 1; k <= NS && ok; ++k) {
             unsigned long long sp[8];
             for (int i = 0; i < 8; ++i)
-                sp[i] = (unsigned long long) ((uint8_t*) V->scr + ((size_t) (t - 1) * 8 + i) * sstride);
+                sp[i] = (unsigned long long) ((uint8_t*) V->scr + ((size_t) (k - 1) * 8 + i) * sstride);
             unsigned long long* d = nullptr;
             ok = cudaMalloc((void**) &d, sizeof sp) == cudaSuccess &&
                  cudaMemcpy(d, sp, sizeof sp, cudaMemcpyHostToDevice) == cudaSuccess;
-            V->md[(size_t) t].scratch = d;
+            V->scr_set[k] = d;
         }
+        for (int t = 1; t < TM; ++t) V->md[(size_t) t].scratch = V->scr_set[std::min(t, NS)];
+        V->n_scr = NS;
         V->pipe = ok;
     } else {
         cudaGetLastError();
         std::fprintf(stderr, "deepseek4 verify: no VRAM for the pipelined window's scratch slots (%.0f MB) - batched\n",
-                     (double) (TM - 1) * 8 * sstride / 1048576.0);
+                     (double) NS * 8 * sstride / 1048576.0);
     }
     if (!ok) {
         cudaGetLastError();
@@ -405,7 +416,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                       (uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
                       s, nullptr, nullptr, 0, nullptr, nullptr, 0, fast_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min, pf_rank,
                       g.gating, Ly.tid2eid != nullptr ? Ly.tid2eid + (size_t) toks[(size_t) t] * k : nullptr,
-                      fast_skip_w(il));
+                      fast_skip_w(il), 0, nullptr, tb + T - 1 - t);   // (the columns after this one: the CPU lane
+                                                                      // answers a batched window's columns together)
         ++F->expected;
     }
     if (late) {
@@ -658,6 +670,17 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
     // the pipelined window (verify's choice, V->pipe_now; not with PROF - its marks are one stream's)
     static const bool pipe_env1 = getenv("STRATA_DS4_SPEC_PIPE") != nullptr && std::atoi(getenv("STRATA_DS4_SPEC_PIPE")) == 2;
     const bool pipe = V->pipe_now && V->pipe && T > 1 && !F->prof_on;
+    // STRATA_DS4_SPEC_GROUP=<n>: the pipelined window's columns a group; default two groups of ceil(T / 2) (the two
+    // hardware queues), so a 2-column window keeps a column a group
+    static const int grp_env = [] {
+        const char* v = getenv("STRATA_DS4_SPEC_GROUP");
+        return v != nullptr ? std::max(1, std::atoi(v)) : 0;
+    }();
+    int grp = !pipe ? T : grp_env > 0 ? std::min(grp_env, T) : (T + 1) / 2;
+    while ((T + grp - 1) / grp > 1 + V->n_scr) ++grp;   // (a scratch set a group)
+    const int n_grp = (T + grp - 1) / grp;
+    if (pipe)
+        for (int t = 0; t < T; ++t) V->md[(size_t) t].scratch = V->scr_set[t / grp];
     const bool prof = F->prof_on;
     const std::string vt = "v" + std::to_string(T) + "_";
     static std::vector<std::string> names;   // (mark keeps the pointer)
@@ -666,23 +689,27 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
             for (const char* ph : {"hc_attn", "attn", "hc_ffn", "moe"}) names.push_back("v" + std::to_string(n) + "_" + ph);
     const auto mark = [&](int ph) { if (prof) F->mark(names[(size_t) (T - 1) * 4 + ph].c_str()); };
     if (prof) F->mark("v_start");
-    for (int t = 0; t < 4; ++t) V->hc_cpu[t] = V->bg_after[t] = false;
+    for (int t = 0; t < kVerifyMax; ++t) V->hc_cpu[t] = V->bg_after[t] = false;
     if (pipe) {
-        // column t on stream t, after the embedding; per layer, its attention after column t - 1's (ring rows,
-        // compressor state) and its route after column t - 1's (column 0: after the last column's of the layer before)
+        // group g of the columns (gs a group, the last one the rest) on stream g, after the embedding; per layer, its
+        // attention after group g - 1's (ring rows, compressor state) and its routes after group g - 1's (group 0:
+        // after the last group's of the layer before).  Inside a group the columns go together, as the batched
+        // window's (the dense weights read once a group); across groups the host's experts of one group are computed
+        // while the device runs another's attention.  gs = 1: a column a stream (the window before groups)
         cudaEventRecord(V->ev_start, s);
-        for (int t = 1; t < T; ++t) cudaStreamWaitEvent(V->st[t], V->ev_start, 0);
+        for (int gi = 1; gi < n_grp; ++gi) cudaStreamWaitEvent(V->st[gi], V->ev_start, 0);
         for (int il = l0_; il < l1_; ++il)
-            for (int t = 0; t < T; ++t) {
-                cudaStream_t st = pipe_env1 ? s : V->st[t];
-                if (t > 0) cudaStreamWaitEvent(st, V->ev_attn[t - 1], 0);
-                hc_read(il, t, il == l0_ ? nullptr : V->ffn + (size_t) t * E, true, st);
-                if (!verify_attn(il, p0, t, 1, st, err)) return false;
-                cudaEventRecord(V->ev_attn[t], st);
-                defer_add(il, t, st);
-                hc_read(il, t, V->mixer + (size_t) t * E, false, st);
-                cudaEvent_t after = t > 0 ? V->ev_route[t - 1] : il > l0_ ? V->ev_route[T - 1] : nullptr;
-                if (!verify_moe(il, t, 1, toks, st, after, V->ev_route[t], err)) return false;
+            for (int gi = 0; gi < n_grp; ++gi) {
+                const int c0 = gi * grp, nc = std::min(grp, T - c0);
+                cudaStream_t st = pipe_env1 ? s : V->st[gi];
+                if (gi > 0) cudaStreamWaitEvent(st, V->ev_attn[gi - 1], 0);
+                for (int t = c0; t < c0 + nc; ++t) hc_read(il, t, il == l0_ ? nullptr : V->ffn + (size_t) t * E, true, st);
+                if (!verify_attn(il, p0, c0, nc, st, err)) return false;
+                cudaEventRecord(V->ev_attn[gi], st);
+                for (int t = c0; t < c0 + nc; ++t) defer_add(il, t, st);
+                for (int t = c0; t < c0 + nc; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false, st);
+                cudaEvent_t after = gi > 0 ? V->ev_route[gi - 1] : il > l0_ ? V->ev_route[n_grp - 1] : nullptr;
+                if (!verify_moe(il, c0, nc, toks, st, after, V->ev_route[gi], err)) return false;
             }
     } else {
         for (int il = l0_; il < l1_; ++il) {
@@ -699,7 +726,7 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
     }
     // (verify_moe leaves no answer to a read past the part's last layer; the check is for safety)
     for (int t = 0; t < T; ++t) {
-        cudaStream_t st = pipe && !pipe_env1 ? V->st[t] : s;
+        cudaStream_t st = pipe && !pipe_env1 ? V->st[t / grp] : s;
         if (V->hc_cpu[t]) {
             gf::moe_cpu_wait(V->md[(size_t) t], g.n_embd, V->ffn + (size_t) t * E, st);
             V->hc_cpu[t] = false;
@@ -715,12 +742,12 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
         Glm5Model* B = split_next_.get();
         auto* VB = (VerifyBuf*) B->vb_;
         for (int t = 0; t < T; ++t) {
-            cudaStream_t st = pipe && !pipe_env1 ? V->st[t] : s;
+            cudaStream_t st = pipe && !pipe_env1 ? V->st[t / grp] : s;
             gf::hc_post(V->ffn + (size_t) t * E, Rc[(size_t) t], V->post + (size_t) t * 8, V->comb + (size_t) t * 16,
                         g.n_embd, Ro[(size_t) t], st);
-            if (pipe && t > 0) {
-                cudaEventRecord(V->ev_fin[t], st);
-                cudaStreamWaitEvent(s, V->ev_fin[t], 0);
+            if (pipe && t / grp > 0) {
+                cudaEventRecord(V->ev_fin[t / grp], st);
+                cudaStreamWaitEvent(s, V->ev_fin[t / grp], 0);
             }
         }
         for (int t = 0; t < T; ++t)
@@ -743,14 +770,14 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
         return false;
     }
     for (int t = 0; t < T; ++t) {
-        cudaStream_t st = pipe && !pipe_env1 ? V->st[t] : s;
+        cudaStream_t st = pipe && !pipe_env1 ? V->st[t / grp] : s;
         gf::hc_post(V->ffn + (size_t) t * E, Rc[(size_t) t], V->post + (size_t) t * 8, V->comb + (size_t) t * 16,
                     g.n_embd, Ro[(size_t) t], st);
         ds::head_prep(Ro[(size_t) t], fn->second, sc->second, bs->second, g.hc_eps, nw->second, g.norm_eps, g.n_embd,
                       V->head_x + (size_t) t * E, (uint8_t*) V->head_xq + (size_t) t * (E / 32) * kQ8, st);
-        if (pipe && t > 0) {
-            cudaEventRecord(V->ev_fin[t], st);
-            cudaStreamWaitEvent(s, V->ev_fin[t], 0);
+        if (pipe && t / grp > 0) {
+            cudaEventRecord(V->ev_fin[t / grp], st);
+            cudaStreamWaitEvent(s, V->ev_fin[t / grp], 0);
         }
     }
     const WSlot& ow = ws_map_.at("output.weight");

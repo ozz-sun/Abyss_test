@@ -204,8 +204,9 @@ struct MoeDev {
 };
 /// The host's answers to routes - the CPU LANE's (CpuAnswer) and the disk misses' (MoeResponse, with its pinned
 /// staging): kCpuAnswers of each, the route `seq`'s at index seq % kCpuAnswers - a verify window has several routes
-/// of a layer in flight, and the host answers them in order before the device reads them.
-constexpr int kCpuAnswers = 4;
+/// of a layer in flight, and the host answers them in order before the device reads them.  16: a window of 8
+/// columns' answers of two layers at once (expert deferral reads layer l's answers after layer l + 1's routes).
+constexpr int kCpuAnswers = 16;
 /// The widest n_embd the host-mapped route / answer records hold (DeepSeek V4.1 Flash: 5120).
 constexpr int kMaxEmbd = 5120;
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
@@ -240,6 +241,8 @@ struct MoeRequest {
     unsigned int skip_mask;      // experts left out (not in VRAM at rank >= skip_from): neither computed nor waited for
     int xq_ok;                   // xq holds x's q8_1 (the device's own, written with x): the iGPU lane skips its quantize
     alignas(16) unsigned char xq[kMaxEmbd / 32 * 36];
+    int win_more;                // a batched verify window's column: this many more routes of the same layer follow
+                                 // at once (the CPU lane answers the columns together); 0 otherwise
 };
 /// The host's answer to a request with misses.
 struct MoeResponse {
@@ -265,7 +268,8 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                const float* pred_bias = nullptr, int max_prefetch = 0, const float* ahead_logits = nullptr,
                const float* const* ahead_bias = nullptr, int n_ahead = 0, int skip_from = 8,
                unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int gating = 0,
-               const int* hash_ids = nullptr, float skip_w = 0.0f, int skip_disk = 0, const void* xq = nullptr);
+               const int* hash_ids = nullptr, float skip_w = 0.0f, int skip_disk = 0, const void* xq = nullptr,
+               int win_more = 0);
 /// The shared expert's swiglu + q8_1 alone (what moe_route's extra blocks do when it is given sh_gate / sh_up): for
 /// the token path's late shared expert, whose gate/up GEMV runs after the route (STRATA_GLM_SH_LATE).
 void sh_swiglu(const float* sh_gate, const float* sh_up, float sh_limit, int n_ff_sh, void* sh_hq, cudaStream_t s);

@@ -1842,6 +1842,7 @@ static int glm_pack_generate(const Options& o) {
             if (vt >= 1 && !use_verify) std::fprintf(stderr, "maya generate: STRATA_GLM_SCORE_VERIFY: no verify path\n");
             std::vector<std::vector<float>> wl;   // the window's logits
             size_t w0 = 0, wn = 0;
+            const auto ts_tok = std::chrono::steady_clock::now();   // (after the prompt path's part, if any)
             for (size_t i = i0; i + 1 < o.tokens.size(); ++i) {
                 if (use_verify) {
                     if (i >= w0 + wn) {
@@ -1921,8 +1922,10 @@ static int glm_pack_generate(const Options& o) {
                 std::printf(" | vs ref: KL %.6f (max %.4f), same top token %.2f%%", kl / (double) nref, kl_max,
                             100.0 * (double) same / (double) nref);
             const auto stc = model.fast_stats();
-            std::printf(" | %.1f ms/token | cpu lane %llu experts, vram hit %.2f%%\n",
+            std::printf(" | %.1f ms/token (token path %.2f) | cpu lane %llu experts, vram hit %.2f%%\n",
                         1000.0 * sec / (double) std::max<size_t>(1, o.tokens.size() - 1),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts_tok).count() /
+                            (double) std::max<size_t>(1, o.tokens.size() - 1 - i0),
                         (unsigned long long) stc.cpu_experts,
                         100.0 * (double) stc.hits / (double) std::max<uint64_t>(1, stc.hits + stc.misses));
             return 0;

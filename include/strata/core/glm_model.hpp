@@ -420,6 +420,7 @@ public:
     // columns tb .. tb + n - 1 on stream s (the batched window: all of them on the compute stream; the pipelined one:
     // a token on its own stream; verify_moe's route waits for wait_ev and records done_ev when they are set)
     bool verify_attn(int il, int64_t p0, int tb, int n, cudaStream_t s, std::string& err);
+    void fast_dump_feat(int il, const float* R);   // STRATA_DS4_DUMP_FEAT (the DSpark probe)
     bool verify_moe(int il, int tb, int n, const std::vector<int32_t>& toks, cudaStream_t s, cudaEvent_t wait_ev,
                     cudaEvent_t done_ev, std::string& err);
     // one part's share of a window (verify): its layers on the columns' residuals in its own buffers, then, a part
@@ -473,6 +474,10 @@ public:
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
     void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
                           const void* xq = nullptr);
+    // a batched verify window's n columns of layer il at once on the CPU threads: column t's ne[t] experts at
+    // blob / w [8 t + i], its x[t], its sum to out[t] - an expert several columns route decoded once for them
+    void fast_cpu_experts_multi(int il, int n, const int* ne, const uint8_t* const* blob, const float* w,
+                                const float* const* x, float* const* out);
     void fast_igpu_setup();   // the iGPU lane (STRATA_GLM_IGPU, src/igpu)
     // ---- the NextN (MTP) draft block (the last half carries it; layer index n_layers)
     int mtp_il_ = -1;                                      // its layer index here, -1: not on this half
@@ -516,7 +521,7 @@ public:
     /// verify_sample(i): the sampler on those logits.  spec_rewind(pos): drop the window's tail (positions >= pos):
     /// only the position moves (kSpecSlack keeps the window ring's older keys).  A layer split runs the window part
     /// after part (each part's columns hop to the next through pinned host memory, as a token's residual does).
-    static constexpr int kVerifyMax = 4;
+    static constexpr int kVerifyMax = 8;
     bool verify_ready() const;
     bool verify(const std::vector<int32_t>& toks, std::string& err);
     int verify_argmax(int i) const;

@@ -2366,6 +2366,7 @@ struct RouteArgs {
     float affinity_ram;         // STRATA_GLM_ROUTE_AFFINITY_RAM: the same for an expert in the RAM tier (not on disk
                                 // only); a VRAM one gets the larger of the two.  LOSSY (0: off)
     int prof;                   // STRATA_GLM_ROUTE_PROF: per-phase cycle sums (diagnostics)
+    int win_more;               // MoeRequest::win_more (a batched verify window's column: more routes of the layer follow)
 };
 // the request's xq (x's q8_1 as the device computed it: 36-byte blocks, copied as words) and its flag; the system
 // fence before the request's seq covers it as it does x
@@ -2802,6 +2803,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             rq->cpu_src[i] = s_cs[i];
         }
         rq->pf_n = s_npf;
+        rq->win_more = a.win_more;
         for (int i = 0; i < s_npf; ++i) {
             rq->pf_ids[i] = s_pfid[i];
             rq->pf_ptr[i] = s_pfptr[i];
@@ -3731,7 +3733,31 @@ bool mvn_supported(int type) {
 
 bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
     if (nc == 1) return mv(jobs, n, s);
-    if (n <= 0 || n > kMaxMvJobs || nc < 1 || nc > 4) return false;
+    if (n <= 0 || n > kMaxMvJobs || nc < 1) return false;
+    if (nc > 4) {
+        // a wider window: runs of 2-4 columns (never 1: the one-column kernels sum in another order), each column's
+        // sum the same as in any run
+        for (int c0 = 0; c0 < nc;) {
+            const int rem = nc - c0, take = rem > 4 ? (rem == 5 ? 3 : 4) : rem;
+            MvJob sub[kMaxMvJobs];
+            for (int i = 0; i < n; ++i) {
+                const MvJob& J = jobs[i];
+                sub[i] = J;
+                const bool f = J.type == kTypeBF16 || J.type == kTypeF32;
+                const size_t xs = J.xs ? (size_t) J.xs : (size_t) (f ? J.n_in : J.n_in / 32);
+                if (f) {
+                    if (J.xf != nullptr) sub[i].xf = J.xf + (size_t) c0 * xs;
+                } else {
+                    if (J.xq != nullptr) sub[i].xq = (const uint8_t*) J.xq + (size_t) c0 * xs * sizeof(block_q8_1);
+                    if (J.xf != nullptr) sub[i].xf = J.xf + (size_t) c0 * J.n_in;
+                }
+                sub[i].y = J.y + (size_t) c0 * (J.ys ? (size_t) J.ys : (size_t) J.n_out);
+            }
+            if (!mvn(sub, n, take, s)) return false;
+            c0 += take;
+        }
+        return true;
+    }
     for (int i = 0; i < n; ++i)
         if (!mvn_supported(jobs[i].type)) {
             std::fprintf(stderr, "glm_fast mvn: type %d unsupported\n", jobs[i].type);
@@ -4125,7 +4151,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                int n_ff_sh, void* sh_hq, cudaStream_t s, const float* pred_logits, const float* pred_bias,
                int max_prefetch, const float* ahead_logits, const float* const* ahead_bias, int n_ahead,
                int skip_from, unsigned long long cpu_plan, int promote_min, int pf_rank, int gating,
-               const int* hash_ids, float skip_w, int skip_disk, const void* xq) {
+               const int* hash_ids, float skip_w, int skip_disk, const void* xq, int win_more) {
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
@@ -4142,6 +4168,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     a.affinity_ram = affinity_ram;
     static const int prof = [] { const char* v = getenv("STRATA_GLM_ROUTE_PROF"); return v != nullptr && std::atoi(v) != 0; }();
     a.prof = prof;
+    a.win_more = win_more;
     // STRATA_GLM_ROUTE_EARLY=1: x written at the route kernel's start (float4, beside the scores and the plan);
     // default 0: after the plan, as before - measured the same on an RTX 5090 + iGPU lane (the system fence, not the
     // store, is what the request waits for): 3 x 2 answers, 83.4 / 85.6 against 83.6 / 91.2 tok/s

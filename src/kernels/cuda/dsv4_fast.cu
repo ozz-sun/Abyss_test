@@ -1702,12 +1702,12 @@ void attend(const float* q, const uint16_t* raw, int ring, int n_raw, const uint
     int ck = (n * hb + 2 * nsm - 1) / (2 * nsm);
     ck = std::min(256, std::max(AS_TILE, (ck + AS_TILE - 1) / AS_TILE * AS_TILE));
     const int S = (n + ck - 1) / ck;
-    static float* parts[16][4] = {};
-    static size_t parts_n[16][4] = {};
+    static float* parts[16][8] = {};   // [device][lane]: a verify window's columns (8) - a column past them took the
+    static size_t parts_n[16][8] = {};  // one-block-a-head kernel, ~56 us instead of ~26
     int dev = 0;
     cudaGetDevice(&dev);
     const size_t need = (size_t) n_head * std::max(S, 64) * (head_dim + 2);
-    if (dev < 0 || dev >= 16 || lane < 0 || lane >= 4) { old(out); oq_separate(); return; }
+    if (dev < 0 || dev >= 16 || lane < 0 || lane >= 8) { old(out); oq_separate(); return; }
     float*& pt = parts[dev][lane];
     size_t& pn = parts_n[dev][lane];
     if (pn < need) {

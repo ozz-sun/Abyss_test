@@ -1959,6 +1959,115 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     }
 }
 
+// A batched verify window's columns of a layer on the CPU threads at once (the service thread queues them,
+// MoeRequest::win_more): the union of the columns' experts, each through the multi-token rows for the columns that
+// route it - its weights read from RAM once - then every column's weighted sum in its own order.  Each (expert,
+// column) product is the one-column call's bit for bit (the multi-token rows are ggml's dot per token, like the
+// one-token rows), and so is each sum.  An EXL3 layer or the iGPU lane: one call a column
+void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8_t* const* blob, const float* w,
+                                       const float* const* x, float* const* out) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    const auto& Ly = F->L[(size_t) il];
+    if (n <= 1 || Ly.exl3 || F->igpu_experts != nullptr) {
+        for (int t = 0; t < n; ++t) fast_cpu_experts(il, ne[t], blob + 8 * t, w + 8 * t, x[t], out[t]);
+        return;
+    }
+    namespace kc = strata::kernels::cpu;
+    const auto& nf = F->cpu_fmt[(size_t) il];
+    const int n_ff = g.n_ff_exp, n_embd = g.n_embd;
+    constexpr int kCols = kVerifyMax, kPairs = 8 * kVerifyMax;
+    // the union: expert u's blob, its columns, the (expert, column) pair each of them is; pair p's buffers at p
+    int nu = 0, np = 0;
+    const uint8_t* ub[kPairs];
+    int ucnt[kPairs], ucol[kPairs][kCols], upair[kPairs][kCols], pair_of[kCols][8];
+    for (int t = 0; t < n; ++t)
+        for (int i = 0; i < ne[t]; ++i) {
+            const uint8_t* b = blob[8 * t + i];
+            int u = 0;
+            while (u < nu && ub[u] != b) ++u;
+            if (u == nu) {
+                ub[nu] = b;
+                ucnt[nu++] = 0;
+            }
+            ucol[u][ucnt[u]] = t;
+            upair[u][ucnt[u]++] = np;
+            pair_of[t][i] = np++;
+        }
+    if (F->cpu_act_m.size() < (size_t) kCols * kc::kNativeActBytes) {
+        F->cpu_act_m.resize((size_t) kCols * kc::kNativeActBytes);
+        F->cpu_hq_m.resize((size_t) kPairs * kc::kNativeHBytes);
+        F->cpu_ff_m.resize((size_t) kPairs * n_ff);
+        F->cpu_dn_m.resize((size_t) kPairs * n_embd);
+    }
+    uint8_t* act = F->cpu_act_m.data();
+    for (int t = 0; t < n; ++t) kc::native_quant_act(nf, x[t], act + (size_t) t * kc::kNativeActBytes);
+    static const int kSplit = [] {
+        const char* v = getenv("STRATA_GLM_CPU_SPLIT");
+        return v ? std::max(1, std::min(64, std::atoi(v))) : 0;
+    }();
+    const int threads = F->cpu_pool->active();
+    const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
+    // gate/up: the union's rows end to end, a contiguous run a job (as fast_cpu_experts), every column of an expert
+    const int gu_tot = nu * n_ff;
+    F->cpu_pool->run(T, [&](int job) {
+        const int q1 = (int) ((int64_t) gu_tot * (job + 1) / T);
+        for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
+            const int u = q / n_ff, r0 = q % n_ff, r1 = std::min(n_ff, r0 + (q1 - q));
+            const void* a[kCols];
+            float* o[kCols];
+            for (int k = 0; k < ucnt[u]; ++k) {
+                a[k] = act + (size_t) ucol[u][k] * kc::kNativeActBytes;
+                o[k] = F->cpu_ff_m.data() + (size_t) upair[u][k] * n_ff;
+            }
+            kc::native_gu_rows_split(nf, ub[u], ub[u] + Ly.gu_bytes, a, ucnt[u], o, r0, r1, g.swiglu_exp);
+            q += r1 - r0;
+        }
+    });
+    for (int p = 0; p < np; ++p)
+        kc::native_quant_h(nf, F->cpu_ff_m.data() + (size_t) p * n_ff, F->cpu_hq_m.data() + (size_t) p * kc::kNativeHBytes);
+    const int dn_tot = nu * n_embd;
+    F->cpu_pool->run(T, [&](int job) {
+        const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
+        for (int q = (int) ((int64_t) dn_tot * job / T); q < q1;) {
+            const int u = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
+            const void* h[kCols];
+            float* o[kCols];
+            for (int k = 0; k < ucnt[u]; ++k) {
+                h[k] = F->cpu_hq_m.data() + (size_t) upair[u][k] * kc::kNativeHBytes;
+                o[k] = F->cpu_dn_m.data() + (size_t) upair[u][k] * n_embd;
+            }
+            kc::native_down_rows_split(nf, ub[u] + Ly.down_off, h, ucnt[u], o, r0, r1);
+            q += r1 - r0;
+        }
+    });
+    for (int t = 0; t < n; ++t)
+        for (int r = 0; r < n_embd; ++r) {
+            float m = 0.0f;
+            for (int i = 0; i < ne[t]; ++i) m += w[8 * t + i] * F->cpu_dn_m[(size_t) pair_of[t][i] * n_embd + r];
+            out[t][r] = m;
+        }
+    // STRATA_GLM_CPU_MULTI_CHECK=1 (debug, slow): every column through the one-column call too, compared bit for bit
+    static const bool check = getenv("STRATA_GLM_CPU_MULTI_CHECK") != nullptr;
+    if (check) {
+        static std::vector<float> ref;
+        ref.resize((size_t) n_embd);
+        static uint64_t cols = 0, bad = 0;
+        for (int t = 0; t < n; ++t) {
+            fast_cpu_experts(il, ne[t], blob + 8 * t, w + 8 * t, x[t], ref.data());
+            ++cols;
+            if (std::memcmp(ref.data(), out[t], (size_t) n_embd * sizeof(float)) != 0) ++bad;
+        }
+        if (cols % 512 < (uint64_t) n)
+            std::fprintf(stderr, "cpu multi check: %llu columns, %llu differ from the one-column call\n",
+                         (unsigned long long) cols, (unsigned long long) bad);
+    }
+    F->cpu_multi_calls.fetch_add(1, std::memory_order_relaxed);
+    F->cpu_multi_cols.fetch_add((uint64_t) n, std::memory_order_relaxed);
+    F->cpu_multi_uses.fetch_add((uint64_t) np, std::memory_order_relaxed);
+    F->cpu_multi_experts.fetch_add((uint64_t) nu, std::memory_order_relaxed);
+}
+
 // The CPU lane's pool a split's parts share (fast_cpu_lane_setup): made by the first part, found by the later ones -
 // one model a process; a reload, or another count, makes a new one.
 static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
@@ -2865,6 +2974,11 @@ void Glm5Model::fast_destroy() {
     prefill_destroy();
     F->quit.store(true);
     if (F->svc.joinable()) F->svc.join();
+    if (const uint64_t mc = F->cpu_multi_calls.load(); mc > 0)
+        std::fprintf(stderr, "glm fast CPU lane CUDA%d: %llu verify-window calls of %.2f columns each, %.2f experts read "
+                             "for %.2f uses\n", dev_, (unsigned long long) mc,
+                     (double) F->cpu_multi_cols.load() / (double) mc, (double) F->cpu_multi_experts.load() / (double) mc,
+                     (double) F->cpu_multi_uses.load() / (double) mc);
     {
         std::lock_guard<std::mutex> lk(F->ah_mu);
         F->ah_quit = true;
@@ -3167,6 +3281,51 @@ void Glm5Model::fast_service() {
     auto last_kick = last_route;
     unsigned int kick_polls = 0;
 #endif
+    // a batched verify window's columns of a layer (MoeRequest::win_more), queued until its last column's route and
+    // answered by one fast_cpu_experts_multi call (the CPU lane, not the iGPU lane); STRATA_GLM_CPU_MULTI=0: one call
+    // a column, as before
+    static const bool cpu_multi = [] {
+        const char* v = getenv("STRATA_GLM_CPU_MULTI");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    struct WinCol {
+        unsigned int seq;
+        int ne;
+        const uint8_t* blob[8];
+        float w[8];
+        const float* x;
+    };
+    WinCol wq[kVerifyMax];
+    int wq_n = 0, wq_layer = -1;
+    const auto lane_flush = [&] {
+        const auto t0 = std::chrono::steady_clock::now();
+        int ne[kVerifyMax];
+        const uint8_t* blob[8 * kVerifyMax];
+        float w[8 * kVerifyMax];
+        const float* x[kVerifyMax];
+        float* out[kVerifyMax];
+        uint64_t n_exp = 0;
+        for (int t = 0; t < wq_n; ++t) {
+            ne[t] = wq[t].ne;
+            n_exp += (uint64_t) wq[t].ne;
+            for (int i = 0; i < 8; ++i) {
+                blob[8 * t + i] = i < wq[t].ne ? wq[t].blob[i] : nullptr;
+                w[8 * t + i] = i < wq[t].ne ? wq[t].w[i] : 0.0f;
+            }
+            x[t] = wq[t].x;
+            out[t] = (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->part;
+        }
+        fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out);
+        const auto t1 = std::chrono::steady_clock::now();
+        std::atomic_thread_fence(std::memory_order_release);
+        for (int t = 0; t < wq_n; ++t) (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->seq = wq[t].seq;
+        F->cpu_experts.fetch_add(n_exp, std::memory_order_relaxed);
+        F->cpu_routes.fetch_add((uint64_t) wq_n, std::memory_order_relaxed);
+        F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+                            std::memory_order_relaxed);
+        wq_n = 0;
+        wq_layer = -1;
+    };
     while (!F->quit.load(std::memory_order_relaxed)) {
         gf::MoeRequest* rq = F->ring_h + (next % gf::kRingSize);
         bool lane_started = false;   // (EARLY LANE, below: this route's lane experts already on the iGPU)
@@ -3242,6 +3401,7 @@ void Glm5Model::fast_service() {
         if (F->igpu_poke != nullptr) igpu_route = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_acquire);
         if (rq->error != 0) {
+            if (wq_n > 0) lane_flush();
             F->processed.fetch_add(1, std::memory_order_release);
             ++next;
             continue;
@@ -3616,8 +3776,23 @@ void Glm5Model::fast_service() {
             }
         }
         // ---- the CPU LANE: this route's host experts from their RAM-tier blobs (they stay in RAM until the next
-        //      boundary: the device waits for this answer before its down combine, so the token cannot end first)
-        if (rq->cpu_mask != 0u && F->cpu_ans_h != nullptr) {
+        //      boundary: the device waits for this answer before its down combine, so the token cannot end first).
+        //      A batched verify window's column (win_more: that many more routes of the layer follow, the device
+        //      waiting for none of them yet) is queued, and the window's last column answers them all
+        if (wq_n > 0 && wq_layer != rq->layer) lane_flush();   // (a window cut short)
+        if (rq->cpu_mask != 0u && F->cpu_ans_h != nullptr && cpu_multi && F->igpu_experts == nullptr && !lane_started &&
+            (rq->win_more > 0 || wq_n > 0) && wq_n < kVerifyMax) {
+            WinCol& c = wq[wq_n++];
+            wq_layer = rq->layer;
+            c.seq = next;
+            c.ne = 0;
+            for (int i = 0; i < g.n_exp_used; ++i)
+                if ((rq->cpu_mask >> i) & 1u) {
+                    c.blob[c.ne] = (const uint8_t*) rq->cpu_src[i];
+                    c.w[c.ne++] = rq->w[i];
+                }
+            c.x = rq->x;
+        } else if (rq->cpu_mask != 0u && F->cpu_ans_h != nullptr) {
             const auto t0 = std::chrono::steady_clock::now();
             const unsigned int cm = rq->cpu_mask;
             int ne = 0;
@@ -3682,6 +3857,7 @@ void Glm5Model::fast_service() {
                 last_iter = t2;
             }
         }
+        if (wq_n > 0 && rq->win_more == 0) lane_flush();   // the window's last column: answer them all
         F->processed.fetch_add(1, std::memory_order_release);
         ++next;
     }
@@ -4783,6 +4959,36 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     return true;
 }
 
+// STRATA_DS4_DUMP_FEAT=<file> (debug, the DSpark probe): append the residual streams a layer of
+// STRATA_DS4_DUMP_FEAT_LAYERS (default 40,41,42: the drafter's target layers) leaves - hc x n_embd floats a layer, in
+// the list's order, every position the token path runs
+void Glm5Model::fast_dump_feat(int il, const float* R) {
+    static const char* feat_file = getenv("STRATA_DS4_DUMP_FEAT");
+    if (feat_file == nullptr || !feat_file[0] || !g_.dsv4()) return;
+    static const std::vector<int> feat_layers = [] {
+        std::vector<int> v;
+        const char* l = getenv("STRATA_DS4_DUMP_FEAT_LAYERS");
+        for (const char* q = l != nullptr ? l : "40,41,42"; *q;) {
+            char* e = nullptr;
+            const long x = std::strtol(q, &e, 10);
+            if (e == q) break;
+            v.push_back((int) x);
+            q = *e == ',' ? e + 1 : e;
+        }
+        return v;
+    }();
+    for (int fl : feat_layers)
+        if (fl == il) {
+            cudaStreamSynchronize(fast_->cs);
+            std::vector<float> fb((size_t) g_.hc * g_.n_embd);
+            cudaMemcpy(fb.data(), R, fb.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            if (FILE* f = std::fopen(feat_file, "ab")) {
+                std::fwrite(fb.data(), sizeof(float), fb.size(), f);
+                std::fclose(f);
+            }
+        }
+}
+
 bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     (void) hop_in;
     FastState* F = fast_;
@@ -4854,6 +5060,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         }
         if (F->prof_on) F->mark("hc_attn");
         if (wrote) std::swap(Rc, Ro);
+        if (il > l0_) fast_dump_feat(il - 1, Rc);   // (the layer before's output: the residual entering this one)
         if (dumps) {
             const std::string Ls = std::to_string(il);
             if (il != l0_) fast_dump(s, "l_out-" + std::to_string(il - 1), Rc, (int64_t) g.hc * g.n_embd);
@@ -4982,6 +5189,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     }
     gf::hc_post(F->ffn, Rc, F->post, F->comb, g.n_embd, Ro, s);
     if (F->prof_on) F->mark("hc_post_end");
+    fast_dump_feat(l1_ - 1, Ro);
     // keep the convention "the residual lives at state_" for the hop and the head: copy back
     if (Ro != state_)
         cudaMemcpyAsync(state_, Ro, (size_t) g.hc * g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, s);

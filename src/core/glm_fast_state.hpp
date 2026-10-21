@@ -538,6 +538,10 @@ struct Glm5Model::FastState {
     std::vector<strata::kernels::cpu::NativeFmt> cpu_fmt;   // per layer; n_ff == 0: the lane skips that layer
     std::vector<uint8_t> cpu_act, cpu_hq;                    // x's activation quant; 8 h quants
     std::vector<float> cpu_ff, cpu_dn;                       // 8 x n_ff; 8 x n_embd
+    // fast_cpu_experts_multi's: a window's columns' activations, and its (expert, column) pairs' h, h quants and downs
+    std::vector<uint8_t> cpu_act_m, cpu_hq_m;
+    std::vector<float> cpu_ff_m, cpu_dn_m;
+    std::atomic<uint64_t> cpu_multi_calls{0}, cpu_multi_cols{0}, cpu_multi_uses{0}, cpu_multi_experts{0};
     std::vector<float> cpu_x3;                               // EXL3: per expert gate / up inputs, h, down input, out
     std::atomic<uint64_t> cpu_experts{0}, cpu_routes{0}, cpu_us{0};
     std::atomic<uint64_t> dlane_experts{0}, dlane_us{0};   // the disk lane's experts and its time
