@@ -43,6 +43,24 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   GEMM took 15.7 ms a layer inside the engine (a third of an Ornith prompt: 575 tokens 233 -> 359 tok/s on an AI PRO
   R9700) against 0.2 ms for the same shape alone; CUDA keeps cuBLAS.
 
+**The RAM fill: with the disk tail skip, the most routed experts that sit on the SSD alone are read into the RAM tier
+in the background (issue #8).**
+- The disk tail skip (`STRATA_GLM_TAIL_SKIP_DISK=1`) never computes the experts it leaves out, so they were never read
+  and never left the SSD: an expert the routes keep placing at rank 4-6 stayed disk-only and was skipped at every
+  route - 16-25 skips a token through a whole session while the disk reads had long dropped to ~0.6 a token (#8,
+  @sh-Tx2Lym's reading of the code, which was right).
+- `STRATA_GLM_RAM_FILL` (default 2 with the disk tail skip, else 0): after each token up to that many of the most
+  routed disk-only experts are queued for the lookahead's reader threads, into a free RAM slot past the routes'
+  reserve, else over a colder RAM expert when the candidate's route count beats it by `STRATA_GLM_RAM_FILL_MARGIN`
+  (4). A fill reads in chunks, each waiting until no route read is in flight (the SSD serves one stream at full
+  speed; a first version that read whole experts beside the routes' reads made their waits 2.4x longer). The routes
+  see the expert on the disk until a later boundary makes it live.
+- DeepSeek V4.1 nazeshinjite Q2 on an AI PRO R9700 + 8060S lane with `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1`,
+  two held-out sequences each way, alternating: 44.4 / 40.8 ms a token against 46.0 / 41.2 without the fill, KL 0.328 /
+  0.227 against 0.333 / 0.232, 16% fewer skips, ~7% fewer disk reads (the fills: ~0.6 experts a token, nearly all over
+  a colder RAM expert).
+- The engine log sums the skips and the fills (`glm fast tail skip CUDA0: ... RAM fill: ...`).
+
 ## v1.3.45 - 2026-10-22
 
 **Setup needs HIP 7.14 or newer - ROCm 10 on Linux, AMD's ROCm SDK 7.14 on Windows - and stops on ROCm 7.0-7.2, which

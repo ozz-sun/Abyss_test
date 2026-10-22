@@ -248,6 +248,13 @@ struct Glm5Model::FastState {
     //      the layers in between compute, so their own route finds them on the host (a short wait or none)
     int n_ahead = 0;
     bool ahead_read = false;                   // STRATA_GLM_AHEAD_READ=0: predict and count only
+    // STRATA_GLM_RAM_FILL=<n> (default 2 with the disk tail skip, else 0): a boundary's background reads of the most
+    // routed disk-only experts into the RAM tier (issue #8: the tail skip never reads the experts it leaves out, so
+    // they never leave the disk); one is read over a colder RAM expert when its count beats that one's by
+    // STRATA_GLM_RAM_FILL_MARGIN (4)
+    int ram_fill = 0;
+    uint32_t ram_fill_margin = 4;
+    uint64_t fill_issued = 0, fill_evict = 0, fill_passed = 0;
     bool disk_lane = false;                    // STRATA_GLM_DISK_LANE=1: disk misses computed by the lane in RAM
     bool disk_adapt = false;                   // STRATA_GLM_DISK_ADAPT=1: ... evicting at the miss (arena-adapt)
     bool stream_fetch = true;                  // STRATA_GLM_STREAM_FETCH=0: the fetch after the whole read, as before
@@ -257,7 +264,9 @@ struct Glm5Model::FastState {
     struct AheadJob {
         int rclass, rslot, il, e;
         uint64_t tag;
+        bool fill = false;                     // a RAM fill: read in chunks, each waiting for the routes' reads to end
     };
+    std::atomic<int> disk_busy{0};             // a route's own disk reads in flight (the fills yield to them)
     std::mutex ah_mu;                          // the job queue (never held with mu)
     std::condition_variable ah_cv;
     std::vector<AheadJob> ah_q;

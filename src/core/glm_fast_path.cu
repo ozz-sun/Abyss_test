@@ -1454,7 +1454,17 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->rload.emplace_back(new std::atomic<uint64_t>[(size_t) R.n]);
             for (int s = 0; s < R.n; ++s) F->rload.back()[(size_t) s].store(0);
         }
-        if (F->ahead_read)
+        {   // the RAM fill (fast_boundary step 4b): on with the disk tail skip, which starves the experts it skips
+            const char* rf = getenv("STRATA_GLM_RAM_FILL");
+            F->ram_fill = rf != nullptr ? std::max(0, std::atoi(rf)) : F->tail_skip_disk ? 2 : 0;
+            const char* rm = getenv("STRATA_GLM_RAM_FILL_MARGIN");
+            F->ram_fill_margin = (uint32_t) (rm != nullptr ? std::max(0, std::atoi(rm)) : 4);
+            if (F->ram_resident) F->ram_fill = 0;
+            if (F->ram_fill > 0)
+                std::fprintf(stderr, "glm fast: CUDA%d RAM fill: up to %d of the most routed disk-only experts a token "
+                                     "read into the RAM tier (STRATA_GLM_RAM_FILL)\n", dev_, F->ram_fill);
+        }
+        if (F->ahead_read || F->ram_fill > 0)
             for (int i = 0; i < 2; ++i) F->ah_th.emplace_back([this] { fast_ahead_reader(); });
         const char* wv = getenv("STRATA_GLM_WARM");
         if ((wv == nullptr || std::atoi(wv) != 0) && !fast_warm(err)) return false;
@@ -3038,6 +3048,11 @@ void Glm5Model::fast_destroy() {
     if (F->timing && F->tokens > 0)
         std::fprintf(stderr, "glm fast timing: %llu tokens, %.2f ms/token\n", (unsigned long long) F->tokens,
                      F->ms / (double) F->tokens);
+    if (F->timing && (F->tail_skips.load() > 0 || F->fill_issued > 0))
+        std::fprintf(stderr, "glm fast tail skip CUDA%d: %llu experts left out | RAM fill: %llu read into the RAM tier "
+                             "(%llu over a colder one), %llu passed (no room)\n", dev_,
+                     (unsigned long long) F->tail_skips.load(), (unsigned long long) F->fill_issued,
+                     (unsigned long long) F->fill_evict, (unsigned long long) F->fill_passed);
     if (F->timing && F->hits.load() + F->misses.load() > 0)
         std::fprintf(stderr,
                      "glm fast tiers CUDA%d: vram hits %llu, ram fetches %llu, disk reads %llu (%.2f%% vram hit) | "
@@ -3719,6 +3734,7 @@ void Glm5Model::fast_service() {
                     Rp->seq = next;
                 }
                 if (nr > 0 && !dlane_now) lane_start();
+                F->disk_busy.store(1, std::memory_order_release);   // (the RAM fill's reads wait)
                 F->workers->run(nr * 3 * rch, [&](int job) {
                     const int m = rd[job / (3 * rch)], part = job % (3 * rch);
                     fast_read_part(il, ids[mi[m]], part / rch, dst[m], part % rch, rch);
@@ -3727,6 +3743,7 @@ void Glm5Model::fast_service() {
                         std::atomic_ref<unsigned int>(Rp->ready[mi[m]]).fetch_or(1u << part, std::memory_order_release);
                     }
                 });
+                F->disk_busy.store(0, std::memory_order_release);
                 for (int i = 0; i < ns; ++i) F->rload[(size_t) cls][(size_t) sl[i]].store(stv[i], std::memory_order_release);
                 if (nw > 0 && stream && ah_merge) {   // the lookahead's in-flight slots: all their chunks once landed
                     const auto tw = std::chrono::steady_clock::now();
@@ -4066,7 +4083,19 @@ void Glm5Model::fast_ahead_reader() {
         uint64_t want = j.tag << 2;
         if (ld.compare_exchange_strong(want, (j.tag << 2) | 1u, std::memory_order_acq_rel)) {
             uint8_t* blob = F->rc[(size_t) j.rclass].base + (size_t) j.rslot * F->rc[(size_t) j.rclass].stride;
-            for (int role = 0; role < 3; ++role) fast_read_part(j.il, j.e, role, blob);
+            if (j.fill) {
+                // a RAM fill reads behind the routes: a chunk at a time, each waiting until no route read is in flight
+                // (the SSD serves one stream at a time at full speed; the route's reads are on the token's path)
+                const int rch = F->read_chunks;
+                for (int role = 0; role < 3; ++role)
+                    for (int c = 0; c < rch; ++c) {
+                        while (F->disk_busy.load(std::memory_order_acquire) != 0)
+                            std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        fast_read_part(j.il, j.e, role, blob, c, rch);
+                    }
+            } else {
+                for (int role = 0; role < 3; ++role) fast_read_part(j.il, j.e, role, blob);
+            }
             ld.store((j.tag << 2) | 2u, std::memory_order_release);
         }
         F->ah_inflight.fetch_sub(1, std::memory_order_relaxed);
@@ -4405,6 +4434,85 @@ bool Glm5Model::fast_boundary(std::string& err) {
             R.st[(size_t) best] = FastState::kRFree;
             ++nfree;
         }
+    }
+    // (4b) the RAM FILL (STRATA_GLM_RAM_FILL, default 2 with the disk tail skip): the most routed disk-only experts
+    //      read into the RAM tier in the background, up to ram_fill a boundary.  With the disk tail skip an expert the
+    //      routes keep placing at rank 4-6 is counted but never read, so it never leaves the disk and is skipped at
+    //      every route (issue #8: 16-25 skips a token through a whole session, the disk reads long since down to
+    //      ~0.6).  A candidate takes a free slot past keep_free's reserve (the reserve is the routes'), else the class's
+    //      victim when the candidate's count beats the victim's by ram_fill_margin; the lookahead's reader threads
+    //      read it into the slot (kRLoad), and step (1) of a later boundary makes it live once it landed.  Nothing
+    //      waits: the routes see it on the disk until then
+    if (F->ram_fill > 0 && !F->bg_hold) {
+        struct FillCand {
+            uint32_t cnt;
+            int il, e;
+        };
+        std::vector<FillCand> fc;
+        const int NE = g.n_expert;
+        for (int il = l0_; il < lt_; ++il) {
+            if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0 || F->L[(size_t) il].tid2eid != nullptr) continue;
+            FillCand top[2] = {{0u, il, -1}, {0u, il, -1}};   // the layer's two most routed disk-only experts
+            for (int e = 0; e < NE; ++e) {
+                const size_t key = (size_t) il * NE + e;
+                if (F->slot_of[key] >= 0 || F->ram_of[key] >= 0) continue;
+                const uint32_t c = F->cnt[key];
+                if (c <= top[1].cnt) continue;
+                if (c > top[0].cnt) {
+                    top[1] = top[0];
+                    top[0] = FillCand{c, il, e};
+                } else {
+                    top[1] = FillCand{c, il, e};
+                }
+            }
+            for (const auto& t : top)
+                if (t.e >= 0 && t.cnt >= F->ram_fill_margin) fc.push_back(t);
+        }
+        std::sort(fc.begin(), fc.end(), [](const FillCand& a, const FillCand& b) { return a.cnt > b.cnt; });
+        int issued = 0;
+        bool queued = false;
+        for (const auto& c : fc) {
+            if (issued >= F->ram_fill || F->ah_inflight.load(std::memory_order_relaxed) >= 4) break;
+            const int cls = F->layer_rc[(size_t) c.il];
+            auto& R = F->rc[(size_t) cls];
+            int nfree = 0, rs = -1;
+            for (int s = 0; s < R.n; ++s)
+                if (R.st[(size_t) s] == FastState::kRFree) {
+                    if (rs < 0) rs = s;
+                    ++nfree;
+                }
+            if (nfree <= keep_free) {   // the reserve is the routes': a colder RAM expert's slot instead, or nothing
+                const int v = ram_victim(R);
+                if (v < 0 || F->cnt[(size_t) R.key[(size_t) v]] + F->ram_fill_margin > c.cnt) {
+                    ++F->fill_passed;
+                    continue;
+                }
+                upd(F->rtab_key(R.key[(size_t) v]), 0ull);
+                F->ram_of[(size_t) R.key[(size_t) v]] = -1;
+                F->left[(size_t) R.key[(size_t) v]] = 2;
+                ++F->diag_ram_evict;
+                ++F->fill_evict;
+                R.key[(size_t) v] = -1;
+                R.st[(size_t) v] = FastState::kRFree;
+                rs = v;
+            }
+            const int key = c.il * NE + c.e;
+            R.key[(size_t) rs] = key;
+            R.tick[(size_t) rs] = F->clock;
+            R.st[(size_t) rs] = FastState::kRLoad;
+            F->ram_of[(size_t) key] = rs;
+            const uint64_t tag = ++F->ah_tag;
+            F->rload[(size_t) cls][(size_t) rs].store(tag << 2, std::memory_order_release);
+            F->ah_inflight.fetch_add(1, std::memory_order_relaxed);
+            ++F->fill_issued;
+            ++issued;
+            {
+                std::lock_guard<std::mutex> lk(F->ah_mu);
+                F->ah_q.push_back(FastState::AheadJob{cls, rs, c.il, c.e, tag, true});
+            }
+            queued = true;
+        }
+        if (queued) F->ah_cv.notify_all();
     }
     // (5) background moves between the tiers, over the copy stream.  Where the CPU lane takes every RAM-tier expert
     //     (two sockets beside an x8 link: 0.18 ms an expert on the CPU, 2.1 over PCIe) no route fetches one into VRAM
