@@ -7,6 +7,24 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.45 - 2026-10-22
+
+**Setup needs HIP 7.14 or newer - ROCm 10 on Linux, AMD's ROCm SDK 7.14 on Windows - and stops on ROCm 7.0-7.2, which
+failed with current drivers on two PCs (issues #1 and #8).**
+- The two reports: a ROCm 7.0 pip SDK on an AI PRO R9700 ran up to v1.3.37, then failed every kernel launch after a
+  kernel update and a move to amdgpu-dkms 6.19.14 (#1); in a ROCm 7.2.1 container on an RX 9070 XT the RAM tier's
+  registration failed (`iGPU lane off (hipHostRegister: invalid argument)`, `glm_fast zero_copy: invalid argument`,
+  nothing in `dmesg`) and every request failed (#8). ROCm 10 fixed both with the same driver.
+- Setup checks `hipcc --version` (it checked for ROCm 7 before) and, below HIP 7.14, stops with the reason and how to
+  get ROCm 10 (Windows: the SDK setup installs, 7.14.1). `ABYSS_OLD_ROCM=1` builds with an older ROCm anyway, with a
+  warning. ROCm 10's packages are HIP 7.15; amdrocm 7.14 on Linux passes the check but has not been run here.
+- docs/amd (EN/JA): the requirement; "Older ROCm (7.0-7.2)" with both reports and the override; with ROCm 10 the
+  kernel's own amdgpu worked on an RX 9070 XT (Linux 7.2.11, NixOS, Docker, no `iommu=pt`, #8), amdgpu-dkms stays the
+  fix for `failed to pin userptr`; the troubleshooting row for `kernel launch(es) failed`. README and the manual: the
+  toolchain lines.
+- The engine's source is unchanged from v1.3.44. Thanks to @sh-Tx2Lym for the RX 9070 XT report and the
+  ROCm 7.2.1 / 10 comparison on the same host.
+
 ## v1.3.44 - 2026-10-22
 
 **Setup after a switch to another ROCm or CUDA toolkit builds the engine for it (issue #1); docs/amd says which ROCm
