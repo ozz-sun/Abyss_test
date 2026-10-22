@@ -2031,8 +2031,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     hgemm_q(Ly.beta_w, HV, E, x16, E, B.beta, HV, tn, 0.0f);
                     S->mark("q35_proj", s);
                     q35::conv_rows(B.qkv, tn, C, Ly.conv1d, g.d_conv, Ly.gdn_conv, B.conv, s);
-                    q35::gdn_prep_rows(B.conv, tn, C, HK, Sd, g.norm_eps, s);
-                    q35::gdn_gates_rows(B.alpha, B.beta, Ly.dt_bias, Ly.ssm_a, tn, HV, s);
+                    q35::gdn_prep_gates(B.conv, tn, C, HK, Sd, g.norm_eps, B.alpha, B.beta, Ly.dt_bias, Ly.ssm_a, HV, s);
                     q35::gdn_scan(Ly.gdn_state, B.conv, tn, C, B.alpha, B.beta, Sd, HK, HV, B.o, s);
                     strata::kernels::gdn_out_norm_silu(B.o, B.z, Ly.ssm_norm, B.y, (int64_t) tn * HV, Sd, g.norm_eps,
                                                        (void*) s);

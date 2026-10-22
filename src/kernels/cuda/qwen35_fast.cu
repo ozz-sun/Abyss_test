@@ -256,6 +256,48 @@ __global__ void gdn_gates_rows_kernel(float* __restrict__ alpha, float* __restri
     alpha[i] = softplus_f(alpha[i] + dt[h]) * A[h];   // (the gate, in place)
     beta[i] = sigmoid_f(beta[i]);
 }
+// gdn_prep_rows_kernel's blocks (y < 2 h_k) and, past them, the gates of row t (gdn_gates_rows over its h_v heads):
+// one launch for both; grid (T, 2 h_k + ceil(h_v / 128))
+__global__ void __launch_bounds__(128) gdn_prep_gates_kernel(float* __restrict__ h, int C, int h_k, int S, float eps,
+                                                             float qscale, float* __restrict__ alpha,
+                                                             float* __restrict__ beta, const float* __restrict__ dt,
+                                                             const float* __restrict__ A, int h_v) {
+    __shared__ double sh[4];
+    const int t = blockIdx.x, hh = blockIdx.y, i = threadIdx.x;
+    if (hh >= 2 * h_k) {
+        const int hv = (hh - 2 * h_k) * 128 + i;
+        if (hv < h_v) {
+            const size_t at = (size_t) t * h_v + hv;
+            alpha[at] = softplus_f(alpha[at] + dt[hv]) * A[hv];
+            beta[at] = sigmoid_f(beta[at]);
+        }
+        return;
+    }
+    float* p = h + (size_t) t * C + (size_t) hh * S;
+    const float v = i < S ? p[i] : 0.0f;
+    double acc = (double) v * (double) v;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if ((i & 31) == 0) sh[i >> 5] = acc;
+    __syncthreads();
+    const double sum = sh[0] + sh[1] + sh[2] + sh[3];
+    const float inv = (float) (1.0 / sqrt(sum + (double) eps)) * (hh < h_k ? qscale : 1.0f);
+    if (i < S) p[i] = v * inv;
+}
+// the decode conv (gdn_conv_kernel's state slide) with the SiLU in the same launch
+__global__ void conv_silu_step_kernel(float* __restrict__ cs, const float* __restrict__ x, const float* __restrict__ kW,
+                                      float* __restrict__ out, int C, int dc) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float* st = cs + (size_t) c * (dc - 1);
+    const float* w = kW + (size_t) c * dc;
+    float acc = 0.0f;
+    for (int i = 0; i < dc - 1; ++i) acc += st[i] * w[i];   // kernel[0] reads the OLDEST state row
+    acc += x[c] * w[dc - 1];                                // the new input lands in the LAST tap
+    out[c] = acc * sigmoid_f(acc);
+    for (int i = 0; i < dc - 2; ++i) st[i] = st[i + 1];     // slide: drop the oldest, append the newest
+    st[dc - 2] = x[c];
+}
 // the recurrence over T rows: a block a v head, a thread a state column j held in registers, the rows in order.  The
 // state (S, h_v, S) and the math are gdn_step's (gdn.cu): s *= dec, d = (v - s.k) beta, s += k d, o = s.q
 template <int S>
@@ -506,6 +548,23 @@ void gdn_prep_rows(float* h, int T, int C, int h_k, int S, float eps, cudaStream
     gdn_prep_rows_kernel<<<dim3((unsigned) T, (unsigned) (2 * h_k)), 128, 0, s>>>(h, C, h_k, S, eps,
                                                                                    1.0f / std::sqrt((float) S));
     check("gdn_prep_rows");
+}
+void gdn_prep_gates(float* h, int T, int C, int h_k, int S, float eps, float* alpha, float* beta, const float* dt_bias,
+                    const float* ssm_a, int h_v, cudaStream_t s) {
+    if (T <= 0 || h_k <= 0) return;
+    if (S <= 0 || S > 128) {
+        std::fprintf(stderr, "qwen35 gdn_prep_gates: S %d\n", S);
+        return;
+    }
+    const unsigned gb = (unsigned) ((h_v + 127) / 128);
+    gdn_prep_gates_kernel<<<dim3((unsigned) T, (unsigned) (2 * h_k) + gb), 128, 0, s>>>(
+        h, C, h_k, S, eps, 1.0f / std::sqrt((float) S), alpha, beta, dt_bias, ssm_a, h_v);
+    check("gdn_prep_gates");
+}
+void conv_silu_step(float* conv_state, const float* x, const float* kW, int C, int d_conv, float* out, cudaStream_t s) {
+    if (C <= 0 || d_conv < 2) return;
+    conv_silu_step_kernel<<<(C + 255) / 256, 256, 0, s>>>(conv_state, x, kW, out, C, d_conv);
+    check("conv_silu_step");
 }
 void gdn_gates_rows(float* alpha, float* beta, const float* dt_bias, const float* ssm_a, int T, int h_v, cudaStream_t s) {
     const int n = T * h_v;

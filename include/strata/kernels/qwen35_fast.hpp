@@ -52,6 +52,11 @@ void conv_rows(const float* x, int T, int C, const float* kW, int d_conv, float*
 void gdn_prep_rows(float* h, int T, int C, int h_k, int S, float eps, cudaStream_t s);
 /// gdn_gates over T rows: alpha[t][h] -> the gate softplus(alpha + dt_bias[h]) * ssm_a[h], beta[t][h] -> sigmoid.
 void gdn_gates_rows(float* alpha, float* beta, const float* dt_bias, const float* ssm_a, int T, int h_v, cudaStream_t s);
+/// gdn_prep_rows and gdn_gates_rows in one launch (the gates' blocks beside the heads').
+void gdn_prep_gates(float* h, int T, int C, int h_k, int S, float eps, float* alpha, float* beta, const float* dt_bias,
+                    const float* ssm_a, int h_v, cudaStream_t s);
+/// The token path's conv step (gdn_conv_step: one input row x, the state slid) with the SiLU in the same launch.
+void conv_silu_step(float* conv_state, const float* x, const float* kW, int C, int d_conv, float* out, cudaStream_t s);
 /// The recurrence over T rows in order (gdn_step's math, the state (S, h_v, S) updated in place): q / k / v from the
 /// conv rows (stride C), gate / beta [T][h_v]; o [T][h_v * S].  S == 128.
 void gdn_scan(float* state, const float* h, int T, int C, const float* gate, const float* beta, int S, int h_k, int h_v,
