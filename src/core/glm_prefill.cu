@@ -3231,8 +3231,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
         dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
     }
-    // the last layer's write half: R = post x ffn + comb . R
-    if (!tail_skip) {
+    // the last layer's write half: R = post x ffn + comb . R (qwen35moe's plain residual has none: the NextN rows below
+    // add the last FFN themselves - this update, run with the hyper-connections' unset post / comb, broke R and with it
+    // every prompt position's draft cache, so the drafter's confidences stayed under its threshold after a prompt)
+    if (!tail_skip && !g.qwen35()) {
         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
         if (dsp_ != nullptr) {   // DSpark: the chunk's last rows into its context

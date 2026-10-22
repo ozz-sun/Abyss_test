@@ -7,6 +7,19 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.49 - 2026-10-23
+
+**Ornith's NextN drafter works after a prompt again: 19K tokens in, 40 -> 51 tok/s.**
+
+- The batched prompt path ran the GLM / DeepSeek hyper-connections' last write (`hc_update`) on Ornith too, whose plain
+  residual has none, whenever the drafter was loaded. It broke the residual rows the NextN block's caches are built
+  from, so after any prompt of 32 tokens or more the drafter attended over garbage, none of its drafts reached the 0.5
+  threshold (`drafts kept 0..5: 7460 0 0 0 0 0` in long swe-bench answers) and every token paid its ~2.2 ms for
+  nothing. The update is now skipped for Ornith; the trunk's answers were never affected (it reads its own caches).
+- Measured (UD-Q4_K_XL, R9700 + 8060S lane, greedy): a 18,955-token prompt then 2,048 tokens 40.3 -> 51.0 tok/s, 1,459
+  drafts 78% accepted (v1.3.48: 199, all from n-gram repeats); without drafts 43.3. Short prompts (the token path)
+  unchanged: 512-token answers prose 51.7 / 53.1, code 61.7 / 59.3.
+
 ## v1.3.48 - 2026-10-23
 
 **Ornith's decode at long contexts: the verify window's attention split into chunks - 19K tokens in, 27 -> 40 tok/s
