@@ -25,7 +25,9 @@
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/exl3.hpp"
+#include "strata/kernels/gdn.hpp"
 #include "strata/kernels/glm_batch.hpp"
+#include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/prefill/gemm.hpp"
@@ -62,6 +64,7 @@ namespace strata::core {
 
 namespace gb = strata::kernels::glmb;
 namespace mmq = strata::prefill::mmq;
+namespace q35 = strata::kernels::q35;
 
 namespace {
 
@@ -123,6 +126,34 @@ KdaBufs carve_kda(Carve& c, size_t T, const Glm5Geometry& g) {
     return b;
 }
 
+// qwen35moe's mixers over a sub-batch of T rows: the delta-net layers' projections, conv rows, gates, recurrence
+// output and gated norm (then the ssm_out product's FP16 input); the attention layers' projections, q, output
+struct Q35Bufs {
+    float *qkv, *conv, *z, *alpha, *beta, *o, *y;
+    uint16_t* y16;
+    float *qf, *k, *v, *q, *ao;
+    uint16_t* ao16;
+};
+Q35Bufs carve_q35(Carve& c, size_t T, const Glm5Geometry& g) {
+    Q35Bufs b{};
+    const size_t C = (size_t) g.ssm_conv_dim(), V = (size_t) g.ssm_inner, HV = (size_t) g.ssm_v_heads;
+    const size_t HD = (size_t) g.n_head * g.head_dim, KV = (size_t) g.attn_head_kv * g.head_dim;
+    b.qkv = c.take<float>(T * C);
+    b.conv = c.take<float>(T * C);
+    b.z = c.take<float>(T * V);
+    b.alpha = c.take<float>(T * HV);
+    b.beta = c.take<float>(T * HV);
+    b.o = c.take<float>(T * V);
+    b.y = c.take<float>(T * V);
+    b.y16 = c.take<uint16_t>(T * V);
+    b.qf = c.take<float>(T * 2 * HD);
+    b.k = c.take<float>(T * KV);
+    b.v = c.take<float>(T * KV);
+    b.q = c.take<float>(T * HD);
+    b.ao = c.take<float>(T * HD);
+    b.ao16 = c.take<uint16_t>(T * HD);
+    return b;
+}
 // dst row r = src row tok[r] (n floats each): the host experts' x rows, gathered before they go down
 __global__ void gather_rows(const float* __restrict__ src, const int* __restrict__ tok, int rows, int n,
                             float* __restrict__ dst) {
@@ -314,6 +345,7 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
     for (int t2 = 2 * kSub; t2 <= 4096 && (size_t) t2 <= T; t2 *= 2) {
         size_t need = 0;
         if (kda) { Carve k; carve_kda(k, (size_t) t2, g); need = std::max(need, k.off); }
+        if (g.qwen35()) { Carve q; carve_q35(q, (size_t) t2, g); need = std::max(need, q.off); }
         if (dsa) { Carve d; g.dsv4() ? (void) carve_ds4(d, (size_t) t2, g, max_pools) : (void) carve_dsa(d, (size_t) t2, g, max_pools); need = std::max(need, d.off); }
         if (dense) { Carve d; carve_dense(d, (size_t) t2, g); need = std::max(need, d.off); }
         if (need > room) break;
@@ -589,7 +621,19 @@ bool Glm5Model::prefill_setup(std::string& err) {
     };
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
-        if (g.v41) {
+        if (g.qwen35()) {
+            if (Ly.recr) {
+                deq_ok(Ly.qkv, "attn_qkv", il);
+                deq_ok(Ly.zg, "attn_gate", il);
+                deq_ok(Ly.ssm_o, "ssm_out", il);
+                deq_ok(Ly.alpha_w, "ssm_alpha", il);
+                deq_ok(Ly.beta_w, "ssm_beta", il);
+            } else {
+                deq_ok(Ly.aq, "attn_q", il);
+                deq_ok(Ly.ak, "attn_k", il);
+                deq_ok(Ly.av, "attn_v", il);
+            }
+        } else if (g.v41) {
             // deepseek41: the attention runs the token path's kernels a token at a time (fast_dsv41_attn), the
             // rest batched - nothing of the attention to dequantize
         } else if (g.dsv4()) {
@@ -620,7 +664,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.q_b, "attn_q_b", il);
             deq_ok(Ly.kv_a, "attn_kv_a", il);
         }
-        if (!g.dsv4()) deq_ok(Ly.out, "attn_output", il);
+        if (!g.dsv4() && !(g.qwen35() && Ly.recr)) deq_ok(Ly.out, "attn_output", il);
         if (Ly.moe) {
             has_moe = true;
             deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
@@ -947,6 +991,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     size_t uni = 0;
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
+    if (g.qwen35()) { Carve q; carve_q35(q, ts, g); uni = std::max(uni, q.off); }
     if (has_dsa) { Carve d; g.dsv4() ? (void) carve_ds4(d, ts, g, max_pools) : (void) carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
@@ -1944,6 +1989,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
             hc_read(blk, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm,
                     il == l0_ ? S->onehot : S->pre2, S->pre);
+        } else if (g.qwen35()) {
+            // a plain residual (R's first stream): it takes the last FFN, x = rms(R) * attn_norm and its FP16
+            q35::add_rms_rows(S->R, 4 * E, il == l0_ ? nullptr : S->ffn, Ly.attn_norm, g.norm_eps, T, E, S->x, S->x16, s);
         } else {
             hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
             if (dsp_ != nullptr && il > l0_) dspark_capture_rows(il - 1, S->R, T, s);   // DSpark's features
@@ -1968,6 +2016,50 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
             } else if (g.dsv4()) {
                 if (!prefill_ds4_mixer(il, p0 + t0, tn, x16, xs, mixer, skip_output, (void*) S->uni, err)) return false;
+            } else if (g.qwen35()) {
+                // qwen35moe: the token path's layers over the sub-batch's rows (qwen35_fast_path.cu's order), the
+                // recurrence and the conv carrying their state across sub-batches, the caches' rows written in order
+                Carve c{S->uni};
+                Q35Bufs B = carve_q35(c, (size_t) tn, g);
+                const int64_t pt0 = p0 + t0;
+                const std::string Ls = std::to_string(il);
+                if (Ly.recr) {
+                    const int C = g.ssm_conv_dim(), V = g.ssm_inner, Sd = g.ssm_state, HK = g.ssm_k_heads, HV = g.ssm_v_heads;
+                    hgemm_q(Ly.qkv, C, E, x16, E, B.qkv, C, tn, 0.0f);
+                    hgemm_q(Ly.zg, V, E, x16, E, B.z, V, tn, 0.0f);
+                    hgemm_q(Ly.alpha_w, HV, E, x16, E, B.alpha, HV, tn, 0.0f);
+                    hgemm_q(Ly.beta_w, HV, E, x16, E, B.beta, HV, tn, 0.0f);
+                    S->mark("q35_proj", s);
+                    q35::conv_rows(B.qkv, tn, C, Ly.conv1d, g.d_conv, Ly.gdn_conv, B.conv, s);
+                    q35::gdn_prep_rows(B.conv, tn, C, HK, Sd, g.norm_eps, s);
+                    q35::gdn_gates_rows(B.alpha, B.beta, Ly.dt_bias, Ly.ssm_a, tn, HV, s);
+                    q35::gdn_scan(Ly.gdn_state, B.conv, tn, C, B.alpha, B.beta, Sd, HK, HV, B.o, s);
+                    strata::kernels::gdn_out_norm_silu(B.o, B.z, Ly.ssm_norm, B.y, (int64_t) tn * HV, Sd, g.norm_eps,
+                                                       (void*) s);
+                    S->mark("q35_gdn", s);
+                    if (t0 + tn == T) dump_row("final_output-" + Ls, B.y, V, tn - 1);
+                    if (!skip_output) {
+                        gb::f32_to_f16(B.y, B.y16, (int64_t) tn * V, s);
+                        hgemm_q(Ly.ssm_o, E, V, B.y16, V, mixer, E, tn, 0.0f);
+                    }
+                } else {
+                    const int D = g.head_dim, HDq = g.n_head * D, KV = g.attn_head_kv * D;
+                    hgemm_q(Ly.aq, 2 * HDq, E, x16, E, B.qf, 2 * HDq, tn, 0.0f);
+                    hgemm_q(Ly.ak, KV, E, x16, E, B.k, KV, tn, 0.0f);
+                    hgemm_q(Ly.av, KV, E, x16, E, B.v, KV, tn, 0.0f);
+                    S->mark("q35_proj", s);
+                    q35::attn_prep_rows(B.qf, B.k, B.v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
+                                        g.n_rot, g.rope_base, pt0, tn, Ly.kc, Ly.vc, B.q, s);
+                    q35::attn_prompt(B.q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, pt0, tn, 1.0f / std::sqrt((float) D),
+                                     B.ao, s);
+                    q35::attn_gate_rows(B.ao, B.qf, tn, g.n_head, D, s);
+                    S->mark("q35_attn", s);
+                    if (t0 + tn == T) dump_row("attn_gated-" + Ls, B.ao, HDq, tn - 1);
+                    if (!skip_output) {
+                        gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HDq, s);
+                        hgemm_q(Ly.out, E, HDq, B.ao16, HDq, mixer, E, tn, 0.0f);
+                    }
+                }
             } else if (Ly.recr) {
                 Carve c{S->uni};
                 KdaBufs B = carve_kda(c, (size_t) tn, g);
@@ -2131,6 +2223,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         dump_row("mixer-" + std::to_string(il), S->mixer, E);
         if (g.v41)
             hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm, S->pre, S->pre2);
+        else if (g.qwen35())
+            q35::add_rms_rows(S->R, 4 * E, S->mixer, Ly.post_norm, g.norm_eps, T, E, S->x, S->x16, s);
         else
             hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm);
         S->mark("hc", s);
@@ -2183,6 +2277,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 gb::swiglu_f16(M.sh_g, M.sh_u, M.sh16, (int64_t) tn * FF, g.swiglu_shexp, s);
                 hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
             }
+            if (g.qwen35() && Ly.sh_gate_w != nullptr)   // qwen35moe: the shared expert behind its sigmoid gate
+                q35::shexp_gate_rows(S->x, Ly.sh_gate_w, S->ffn, T, E, s);
             S->mark("shexp", s);
         };
         if (!sh_late) shared_expert();

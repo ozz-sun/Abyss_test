@@ -894,7 +894,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         // the batched prompt path: its sizes (it borrows the pool's tail, see below); qwen35moe has none yet (its
         // prompts go through the token path)
-        if (!g.qwen35() && !prefill_setup(err)) return false;
+        if (!prefill_setup(err)) return false;
         // DSpark (STRATA_DS4_DSPARK): the drafter's weights and expert cache before the pool takes what is left
         if (!dspark_load(err)) return false;
         size_t free_b = 0, total_b = 0;

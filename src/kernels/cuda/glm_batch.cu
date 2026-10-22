@@ -1641,8 +1641,9 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
     __syncthreads();
     for (int e = tid; e < E; e += blockDim.x) {
         const float x = logits[(size_t) t * E + e];
-        // gating 1 (deepseek4): sqrt(softplus) - ggml's softplus (x > 20: x), then sqrt
-        const float p = gating == 1 ? sqrtf(x > 20.0f ? x : logf(1.0f + expf(x))) : 1.0f / (1.0f + expf(-x));
+        // gating 1 (deepseek4): sqrt(softplus) - ggml's softplus (x > 20: x), then sqrt; 2 (qwen35moe): the logit,
+        // the chosen k take their softmax below
+        const float p = gating == 2 ? x : gating == 1 ? sqrtf(x > 20.0f ? x : logf(1.0f + expf(x))) : 1.0f / (1.0f + expf(-x));
         s_p[e] = p;
         s_sel[e] = bias ? p + bias[e] : p;
         if (!isfinite(logits[(size_t) t * E + e]) || !isfinite(s_sel[e])) atomicExch(&bad, 1);
@@ -1661,6 +1662,17 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
             for (int i = 0; i < k; ++i) {
                 ids[(size_t) t * k + i] = -1;
                 w[(size_t) t * k + i] = 0.0f;
+            }
+            return;
+        }
+        if (gating == 2) {   // softmax over the chosen k (= the full softmax renormalised over them)
+            float mx = -INFINITY;
+            for (int i = 0; i < k; ++i) mx = fmaxf(mx, s_p[s_ids[i]]);
+            double sum = 0.0;
+            for (int i = 0; i < k; ++i) sum += exp((double) s_p[s_ids[i]] - (double) mx);
+            for (int i = 0; i < k; ++i) {
+                ids[(size_t) t * k + i] = s_ids[i];
+                w[(size_t) t * k + i] = (float) (exp((double) s_p[s_ids[i]] - (double) mx) / sum * w_scale);
             }
             return;
         }

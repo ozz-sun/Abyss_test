@@ -177,6 +177,248 @@ __global__ void __launch_bounds__(kD) attn_merge_kernel(const float* __restrict_
     out[(size_t) h * kD + d] = o / L;
 }
 
+// ---------------------------------------------------------------- the prompt path (rows = a sub-batch's tokens)
+// R[t][i] (row stride ldr) += add[t][i], x[t][i] = rms(R[t]) * w[i], x16 its FP16; a block a row
+__global__ void __launch_bounds__(256) add_rms_rows_kernel(float* __restrict__ R, int ldr, const float* __restrict__ add,
+                                                           const float* __restrict__ w, float eps, int n,
+                                                           float* __restrict__ x, uint16_t* __restrict__ x16) {
+    __shared__ float sred[8];
+    const int t = blockIdx.x;
+    float* r = R + (size_t) t * ldr;
+    const float* a = add != nullptr ? add + (size_t) t * n : nullptr;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 256) {
+        float v = r[i];
+        if (a != nullptr) {
+            v += a[i];
+            r[i] = v;
+        }
+        ss += v * v;
+    }
+    ss = block_sum256(ss, sred);
+    const float inv = rsqrtf(ss / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += 256) {
+        const float y = r[i] * inv * w[i];
+        x[(size_t) t * n + i] = y;
+        x16[(size_t) t * n + i] = f2h(y);
+    }
+}
+// out[t][c] = silu(sum_i kW[c][i] * in(t - (dc - 1) + i, c)), the rows before the chunk from the state (cs[c][0] the
+// oldest - gdn_conv_kernel's layout); grid (C / 256, T)
+__global__ void __launch_bounds__(256) conv_rows_kernel(const float* __restrict__ x, int C, const float* __restrict__ kW,
+                                                        int dc, const float* __restrict__ cs, float* __restrict__ out) {
+    const int c = blockIdx.x * 256 + threadIdx.x, t = blockIdx.y;
+    if (c >= C) return;
+    const float* w = kW + (size_t) c * dc;
+    float acc = 0.0f;
+    for (int i = 0; i < dc; ++i) {
+        const int tau = t - (dc - 1) + i;
+        const float v = tau >= 0 ? x[(size_t) tau * C + c] : cs[(size_t) c * (dc - 1) + (tau + dc - 1)];
+        acc += v * w[i];
+    }
+    out[(size_t) t * C + c] = acc * sigmoid_f(acc);
+}
+// the state after T rows: the last dc - 1 inputs (the state's own rows when T < dc - 1); dc <= 9
+__global__ void __launch_bounds__(256) conv_state_rows_kernel(const float* __restrict__ x, int T, int C, int dc,
+                                                              float* __restrict__ cs) {
+    const int c = blockIdx.x * 256 + threadIdx.x;
+    if (c >= C) return;
+    float* st = cs + (size_t) c * (dc - 1);
+    float nv[8];
+    for (int i = 0; i < dc - 1; ++i) {
+        const int tau = T - (dc - 1) + i;
+        nv[i] = tau >= 0 ? x[(size_t) tau * C + c] : st[tau + dc - 1];
+    }
+    for (int i = 0; i < dc - 1; ++i) st[i] = nv[i];
+}
+// row t's q head hh (hh < h_k) or k head hh - h_k, in place: x / sqrt(sum x^2 + eps) (the sum in double, as
+// gdn_l2_kernel's), q also scaled; grid (T, 2 h_k), S threads
+__global__ void __launch_bounds__(128) gdn_prep_rows_kernel(float* __restrict__ h, int C, int h_k, int S, float eps,
+                                                            float qscale) {
+    __shared__ double sh[4];
+    const int t = blockIdx.x, hh = blockIdx.y, i = threadIdx.x;
+    float* p = h + (size_t) t * C + (size_t) hh * S;   // the q heads, then the k heads: head hh of [q | k]
+    const float v = i < S ? p[i] : 0.0f;
+    double acc = (double) v * (double) v;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if ((i & 31) == 0) sh[i >> 5] = acc;
+    __syncthreads();
+    const double sum = sh[0] + sh[1] + sh[2] + sh[3];
+    const float inv = (float) (1.0 / sqrt(sum + (double) eps)) * (hh < h_k ? qscale : 1.0f);
+    if (i < S) p[i] = v * inv;
+}
+__global__ void gdn_gates_rows_kernel(float* __restrict__ alpha, float* __restrict__ beta, const float* __restrict__ dt,
+                                      const float* __restrict__ A, int n, int h_v) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int h = i % h_v;
+    alpha[i] = softplus_f(alpha[i] + dt[h]) * A[h];   // (the gate, in place)
+    beta[i] = sigmoid_f(beta[i]);
+}
+// the recurrence over T rows: a block a v head, a thread a state column j held in registers, the rows in order.  The
+// state (S, h_v, S) and the math are gdn_step's (gdn.cu): s *= dec, d = (v - s.k) beta, s += k d, o = s.q
+template <int S>
+__global__ void __launch_bounds__(S) gdn_scan_kernel(float* __restrict__ state, const float* __restrict__ h, int T, int C,
+                                                     const float* __restrict__ gate, const float* __restrict__ beta,
+                                                     int h_k, int h_v, float* __restrict__ o) {
+    __shared__ float ks[S], qs[S];
+    const int hv = blockIdx.x, j = threadIdx.x, src = hv % h_k;   // (MODULO head pairing, as gdn_step)
+    const size_t stride = (size_t) h_v * S;
+    float* col = state + (size_t) hv * S + j;
+    float st[S];
+#pragma unroll
+    for (int i = 0; i < S; ++i) st[i] = col[(size_t) i * stride];
+    for (int t = 0; t < T; ++t) {
+        const float* row = h + (size_t) t * C;
+        __syncthreads();
+        qs[j] = row[src * S + j];
+        ks[j] = row[(h_k + src) * S + j];
+        __syncthreads();
+        const float dec = expf(gate[(size_t) t * h_v + hv]), b = beta[(size_t) t * h_v + hv];
+        const float v = row[(2 * h_k + hv) * S + j];
+        float sk = 0.0f;
+#pragma unroll
+        for (int i = 0; i < S; ++i) {
+            st[i] *= dec;
+            sk += st[i] * ks[i];
+        }
+        const float d = (v - sk) * b;
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < S; ++i) {
+            st[i] += ks[i] * d;
+            dot += st[i] * qs[i];
+        }
+        o[((size_t) t * h_v + hv) * S + j] = dot;
+    }
+#pragma unroll
+    for (int i = 0; i < S; ++i) col[(size_t) i * stride] = st[i];
+}
+// attn_prep_kernel over rows: grid (n_head + n_head_kv, T), row t at position p0 + t
+__global__ void __launch_bounds__(kD) attn_prep_rows_kernel(const float* __restrict__ qf, const float* __restrict__ k,
+                                                            const float* __restrict__ v, const float* __restrict__ q_norm,
+                                                            const float* __restrict__ k_norm, float eps, int n_head,
+                                                            int n_head_kv, int n_rot, float rope_base, int64_t p0,
+                                                            uint16_t* __restrict__ kc, uint16_t* __restrict__ vc,
+                                                            float* __restrict__ q) {
+    __shared__ float sv[kD];
+    __shared__ float sred[8];
+    const int b = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    const bool is_q = b < n_head;
+    const int g = is_q ? 0 : b - n_head;
+    const int64_t p = p0 + t;
+    const float* qrow = qf + (size_t) t * 2 * kD * n_head;
+    const float* krow = k + (size_t) t * kD * n_head_kv;
+    const float* vrow = v + (size_t) t * kD * n_head_kv;
+    const float x = is_q ? qrow[(size_t) b * 2 * kD + d] : krow[(size_t) g * kD + d];
+    const float ss = block_sum256(x * x, sred);
+    const float inv = rsqrtf(ss / (float) kD + eps);
+    const float xn = x * inv * (is_q ? q_norm[d] : k_norm[d]);
+    sv[d] = xn;
+    __syncthreads();
+    float y = xn;
+    if (d < n_rot) {
+        const int half = n_rot / 2;
+        const int i = d < half ? d : d - half;
+        const float theta = (float) p * powf(rope_base, -2.0f * (float) i / (float) n_rot);
+        const float c = cosf(theta), sn = sinf(theta);
+        const float x0 = sv[i], x1 = sv[i + half];
+        y = d < half ? x0 * c - x1 * sn : x0 * sn + x1 * c;
+    }
+    if (is_q) {
+        q[((size_t) t * n_head + b) * kD + d] = y;
+    } else {
+        const size_t row = ((size_t) p * n_head_kv + g) * kD;
+        kc[row + d] = f2h(y);
+        vc[row + d] = f2h(vrow[(size_t) g * kD + d]);
+    }
+}
+__device__ __forceinline__ void unpack8(const uint4& u, float* f) {
+    const __half2* h = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 x = __half22float2(h[i]);
+        f[2 * i] = x.x;
+        f[2 * i + 1] = x.y;
+    }
+}
+// the causal attention of 4 queries a block over one KV head's group: 8 warps x HW heads, a lane 8 dims; the keys
+// stream past once, each (query, head) pair an online softmax in registers.  grid (ceil(T / 4), n_head_kv)
+template <int HW>
+__global__ void __launch_bounds__(256) attn_prompt_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kc,
+                                                          const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
+                                                          int64_t p0, int T, float scale, float* __restrict__ out) {
+    constexpr int QB = 4;
+    const int g = blockIdx.y, t0 = blockIdx.x * QB, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int G = n_head / n_head_kv, h0 = g * G + warp * HW;
+    const int nq = min(QB, T - t0);
+    float qr[QB][HW][8], acc[QB][HW][8], m[QB][HW], l[QB][HW];
+#pragma unroll
+    for (int qi = 0; qi < QB; ++qi)
+#pragma unroll
+        for (int hi = 0; hi < HW; ++hi) {
+            const float* qp = q + ((size_t) (t0 + (qi < nq ? qi : 0)) * n_head + h0 + hi) * kD + lane * 8;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                qr[qi][hi][e] = qp[e] * scale;
+                acc[qi][hi][e] = 0.0f;
+            }
+            m[qi][hi] = -INFINITY;
+            l[qi][hi] = 0.0f;
+        }
+    const int64_t pend = p0 + t0 + nq;   // the keys: positions < pend, each query's own and before
+    for (int64_t kp = 0; kp < pend; ++kp) {
+        const size_t row = ((size_t) kp * n_head_kv + g) * kD + lane * 8;
+        float kf[8], vf[8];
+        unpack8(*reinterpret_cast<const uint4*>(kc + row), kf);
+        unpack8(*reinterpret_cast<const uint4*>(vc + row), vf);
+#pragma unroll
+        for (int hi = 0; hi < HW; ++hi)
+#pragma unroll
+            for (int qi = 0; qi < QB; ++qi) {
+                float sdot = 0.0f;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) sdot += qr[qi][hi][e] * kf[e];
+                sdot = warp_sum(sdot);
+                if (qi < nq && kp <= p0 + t0 + qi) {   // (warp-uniform)
+                    const float mn = fmaxf(m[qi][hi], sdot);
+                    const float corr = expf(m[qi][hi] - mn), pe = expf(sdot - mn);
+                    l[qi][hi] = l[qi][hi] * corr + pe;
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[qi][hi][e] = acc[qi][hi][e] * corr + pe * vf[e];
+                    m[qi][hi] = mn;
+                }
+            }
+    }
+#pragma unroll
+    for (int qi = 0; qi < QB; ++qi) {
+        if (qi >= nq) break;
+#pragma unroll
+        for (int hi = 0; hi < HW; ++hi) {
+            float* op = out + ((size_t) (t0 + qi) * n_head + h0 + hi) * kD + lane * 8;
+            const float inv = 1.0f / l[qi][hi];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) op[e] = acc[qi][hi][e] * inv;
+        }
+    }
+}
+__global__ void attn_gate_rows_kernel(float* __restrict__ o, const float* __restrict__ qf, int n_head) {
+    const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    o[((size_t) t * n_head + h) * kD + d] *= sigmoid_f(qf[((size_t) t * n_head + h) * 2 * kD + kD + d]);
+}
+// ffn[t] *= sigmoid(x[t] . w): a block a row
+__global__ void __launch_bounds__(256) shexp_gate_rows_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                              float* __restrict__ ffn, int n) {
+    __shared__ float sred[8];
+    const int t = blockIdx.x;
+    float dot = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 256) dot += x[(size_t) t * n + i] * w[i];
+    dot = block_sum256(dot, sred);
+    const float gs = sigmoid_f(dot);
+    for (int i = threadIdx.x; i < n; i += 256) ffn[(size_t) t * n + i] *= gs;
+}
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "qwen35 %s: %s\n", what, cudaGetErrorString(e));
@@ -235,6 +477,88 @@ void scale_sigmoid(float* x, int n, const float* g, cudaStream_t s) {
     if (n <= 0) return;
     scale_sigmoid_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n, g);
     check("scale_sigmoid");
+}
+
+// ---- the prompt path
+void add_rms_rows(float* R, int ldr, const float* add, const float* w, float eps, int T, int n, float* x, void* x16,
+                  cudaStream_t s) {
+    if (T <= 0) return;
+    add_rms_rows_kernel<<<T, 256, 0, s>>>(R, ldr, add, w, eps, n, x, (uint16_t*) x16);
+    check("add_rms_rows");
+}
+void conv_rows(const float* x, int T, int C, const float* kW, int d_conv, float* conv_state, float* out,
+               cudaStream_t s) {
+    if (T <= 0 || C <= 0) return;
+    if (d_conv < 2 || d_conv > 9) {
+        std::fprintf(stderr, "qwen35 conv_rows: d_conv %d\n", d_conv);
+        return;
+    }
+    conv_rows_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, s>>>(x, C, kW, d_conv, conv_state, out);
+    conv_state_rows_kernel<<<(C + 255) / 256, 256, 0, s>>>(x, T, C, d_conv, conv_state);
+    check("conv_rows");
+}
+void gdn_prep_rows(float* h, int T, int C, int h_k, int S, float eps, cudaStream_t s) {
+    if (T <= 0 || h_k <= 0) return;
+    if (S <= 0 || S > 128) {
+        std::fprintf(stderr, "qwen35 gdn_prep_rows: S %d\n", S);
+        return;
+    }
+    gdn_prep_rows_kernel<<<dim3((unsigned) T, (unsigned) (2 * h_k)), 128, 0, s>>>(h, C, h_k, S, eps,
+                                                                                   1.0f / std::sqrt((float) S));
+    check("gdn_prep_rows");
+}
+void gdn_gates_rows(float* alpha, float* beta, const float* dt_bias, const float* ssm_a, int T, int h_v, cudaStream_t s) {
+    const int n = T * h_v;
+    if (n <= 0) return;
+    gdn_gates_rows_kernel<<<(n + 255) / 256, 256, 0, s>>>(alpha, beta, dt_bias, ssm_a, n, h_v);
+    check("gdn_gates_rows");
+}
+void gdn_scan(float* state, const float* h, int T, int C, const float* gate, const float* beta, int S, int h_k, int h_v,
+              float* o, cudaStream_t s) {
+    if (T <= 0 || h_v <= 0) return;
+    if (S != 128 || h_k <= 0 || h_v % h_k != 0) {
+        std::fprintf(stderr, "qwen35 gdn_scan: S %d, heads %d / %d\n", S, h_k, h_v);
+        return;
+    }
+    gdn_scan_kernel<128><<<h_v, 128, 0, s>>>(state, h, T, C, gate, beta, h_k, h_v, o);
+    check("gdn_scan");
+}
+void attn_prep_rows(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
+                    float eps, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base, int64_t p0, int T,
+                    uint16_t* kc, uint16_t* vc, float* q, cudaStream_t s) {
+    if (T <= 0) return;
+    if (head_dim != kD) {
+        std::fprintf(stderr, "qwen35 attn_prep_rows: head_dim %d (the kernels take %d)\n", head_dim, kD);
+        return;
+    }
+    attn_prep_rows_kernel<<<dim3((unsigned) (n_head + n_head_kv), (unsigned) T), kD, 0, s>>>(
+        q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q);
+    check("attn_prep_rows");
+}
+void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
+                 int64_t p0, int T, float scale, float* out, cudaStream_t s) {
+    if (T <= 0) return;
+    const int G = n_head_kv > 0 ? n_head / n_head_kv : 0;
+    if (head_dim != kD || G * n_head_kv != n_head || (G != 8 && G != 16 && G != 32)) {
+        std::fprintf(stderr, "qwen35 attn_prompt: head_dim %d, heads %d / %d (a group of 8, 16 or 32)\n", head_dim,
+                     n_head, n_head_kv);
+        return;
+    }
+    const dim3 grid((unsigned) ((T + 3) / 4), (unsigned) n_head_kv);
+    if (G == 8) attn_prompt_kernel<1><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+    else if (G == 16) attn_prompt_kernel<2><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+    else attn_prompt_kernel<4><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+    check("attn_prompt");
+}
+void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_dim, cudaStream_t s) {
+    if (T <= 0 || head_dim != kD) return;
+    attn_gate_rows_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(o, q_full, n_head);
+    check("attn_gate_rows");
+}
+void shexp_gate_rows(const float* x, const float* w, float* ffn, int T, int n, cudaStream_t s) {
+    if (T <= 0) return;
+    shexp_gate_rows_kernel<<<T, 256, 0, s>>>(x, w, ffn, n);
+    check("shexp_gate_rows");
 }
 
 }  // namespace strata::kernels::q35

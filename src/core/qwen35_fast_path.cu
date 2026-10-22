@@ -143,6 +143,24 @@ void Glm5Model::qwen35_reset() {
     cudaStreamSynchronize(F->cs);
 }
 
+// GLM_CB_DIR seam dumps under llama.cpp's cb names (<name>-<layer>.f32; with GLM_CB_POS=1 <name>-<layer>@<pos>.f32,
+// else every position overwrites): synchronous, debug only - the diff script bisects the two engines by op
+static int64_t q35_dump_pos = 0;
+static void q35_dump(cudaStream_t s, const char* name, int il, const float* dev, int64_t n) {
+    static const char* dir = getenv("GLM_CB_DIR");
+    static const bool per_pos = getenv("GLM_CB_POS") != nullptr;
+    if (dir == nullptr || !dir[0]) return;
+    cudaStreamSynchronize(s);
+    std::vector<float> buf((size_t) n);
+    cudaMemcpy(buf.data(), dev, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost);
+    const std::string fn = std::string(dir) + "/" + name + "-" + std::to_string(il) +
+                           (per_pos ? "@" + std::to_string(q35_dump_pos) : "") + ".f32";
+    if (FILE* f = std::fopen(fn.c_str(), "wb")) {
+        std::fwrite(buf.data(), 4, (size_t) n, f);
+        std::fclose(f);
+    }
+}
+
 bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -157,26 +175,50 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
     j[3] = {Ly.beta_w.q, F->xq, F->x, F->q35_ab + HV, nullptr, 1.0f, Ly.beta_w.type, E, HV};
     if (!gf::mv(j, 4, s)) { err = "qwen35moe: the delta-net projections"; return false; }
     if (F->prof_on) F->mark("q35_gdn_mv");
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    if (dumps) {
+        q35_dump(s, "linear_attn_qkv_mixed", il, F->q35_qkv, C);
+        q35_dump(s, "z", il, F->q35_z, V);
+        q35_dump(s, "alpha", il, F->q35_ab, HV);
+        q35_dump(s, "beta", il, F->q35_ab + HV, HV);
+    }
     // 2. the conv over [state | x] (the state slides), SiLU on the whole output, q / k L2-normed, q scaled by 1/sqrt(S)
     strata::kernels::gdn_conv_step(Ly.gdn_conv, F->q35_qkv, Ly.conv1d, F->q35_h, C, g.d_conv, (void*) s);
     q35::silu(F->q35_h, C, s);
+    if (dumps) {   // (llama.cpp's q_conv / k_conv are the views before the L2 norm, *_predelta after it)
+        q35_dump(s, "conv_output_silu", il, F->q35_h, C);
+        q35_dump(s, "q_conv", il, F->q35_h, (int64_t) HK * S);
+        q35_dump(s, "k_conv", il, F->q35_h + (size_t) HK * S, (int64_t) HK * S);
+        q35_dump(s, "v_conv", il, F->q35_h + (size_t) 2 * HK * S, (int64_t) HV * S);
+    }
     strata::kernels::gdn_l2_norm(F->q35_h, HK, S, g.norm_eps, (void*) s);
     strata::kernels::gdn_l2_norm(F->q35_h + (size_t) HK * S, HK, S, g.norm_eps, (void*) s);
+    if (dumps) {
+        q35_dump(s, "q_conv_predelta", il, F->q35_h, (int64_t) HK * S);
+        q35_dump(s, "k_conv_predelta", il, F->q35_h + (size_t) HK * S, (int64_t) HK * S);
+    }
     q35::scale(F->q35_h, HK * S, 1.0f / std::sqrt((float) S), s);
     // 3. the gates, the recurrence (the state in place), the gated norm, the output projection
     q35::gdn_gates(F->q35_ab, Ly.dt_bias, Ly.ssm_a, F->q35_ab + HV, F->q35_gate, HV, s);
+    if (dumps) {
+        q35_dump(s, "gate", il, F->q35_gate, HV);
+        q35_dump(s, "beta_sigmoid", il, F->q35_ab + HV, HV);
+    }
     strata::kernels::GdnShapes sh;
     sh.S = S;
     sh.h_k = HK;
     sh.h_v = HV;
     strata::kernels::gdn_step(Ly.gdn_state, F->q35_h, F->q35_h + (size_t) HK * S, F->q35_h + (size_t) 2 * HK * S,
                               F->q35_gate, F->q35_ab + HV, F->q35_o, sh, (void*) s);
+    if (dumps) q35_dump(s, "gdn_o", il, F->q35_o, V);
     strata::kernels::gdn_out_norm_silu(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
     if (F->prof_on) F->mark("q35_gdn");
+    if (dumps) q35_dump(s, "final_output", il, F->q35_y, V);
     gf::quantize_q8_1(F->q35_y, F->q35_yq, V, s);
     gf::MvJob o = {Ly.ssm_o.q, F->q35_yq, F->q35_y, F->mixer, nullptr, 1.0f, Ly.ssm_o.type, V, E};
     if (!gf::mv(&o, 1, s)) { err = "qwen35moe: ssm_out"; return false; }
     if (F->prof_on) F->mark("q35_gdn_out");
+    if (dumps) q35_dump(s, "linear_attn_out", il, F->mixer, E);
     return true;
 }
 
@@ -192,16 +234,28 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
     j[2] = {Ly.av.q, F->xq, F->x, F->q35_v, nullptr, 1.0f, Ly.av.type, E, KV};
     if (!gf::mv(j, 3, s)) { err = "qwen35moe: the attention projections"; return false; }
     if (F->prof_on) F->mark("q35_attn_mv");
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    if (dumps) {
+        q35_dump(s, "Qcur_full", il, F->q35_qf, 2 * HD);
+        q35_dump(s, "Kcur_raw", il, F->q35_k, KV);
+        q35_dump(s, "Vcur", il, F->q35_v, KV);
+    }
     q35::attn_prep(F->q35_qf, F->q35_k, F->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D, g.n_rot,
                    g.rope_base, p, Ly.kc, Ly.vc, F->q35_q, s);
     q35::attn_decode(F->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p + 1, 1.0f / std::sqrt((float) D), F->q35_part,
                      F->q35_ao, s);
+    if (dumps) {
+        q35_dump(s, "Qcur", il, F->q35_q, HD);
+        q35_dump(s, "attn_pregate", il, F->q35_ao, HD);
+    }
     q35::attn_gate(F->q35_ao, F->q35_qf, g.n_head, D, s);
     if (F->prof_on) F->mark("q35_attend");
+    if (dumps) q35_dump(s, "attn_gated", il, F->q35_ao, HD);
     gf::quantize_q8_1(F->q35_ao, F->q35_aoq, HD, s);
     gf::MvJob o = {Ly.out.q, F->q35_aoq, F->q35_ao, F->mixer, nullptr, 1.0f, Ly.out.type, HD, E};
     if (!gf::mv(&o, 1, s)) { err = "qwen35moe: attn_output"; return false; }
     if (F->prof_on) F->mark("q35_attn_out");
+    if (dumps) q35_dump(s, "attn_output", il, F->mixer, E);
     return true;
 }
 
@@ -210,12 +264,19 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
     bool pf_pending = false;
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    q35_dump_pos = p;
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         // the residual R (state_) takes the last FFN's output, then x = rms(R) * attn_norm (and its q8_1)
         gf::rms_q8(state_, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
         if (F->prof_on) F->mark("q35_norm");
+        if (dumps) {
+            if (il > l0_) q35_dump(s, "l_out", il - 1, state_, g.n_embd);
+            else q35_dump(s, "inp_embd", il, state_, g.n_embd);
+            q35_dump(s, "attn_norm", il, F->x, g.n_embd);
+        }
         if (Ly.recr) {
             if (!fast_qwen35_gdn(il, err)) return false;
         } else {
@@ -223,14 +284,26 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
         }
         gf::rms_q8(state_, F->mixer, Ly.post_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
         if (F->prof_on) F->mark("q35_norm");
+        if (dumps) {
+            q35_dump(s, "attn_residual", il, state_, g.n_embd);
+            q35_dump(s, "attn_post_norm", il, F->x, g.n_embd);
+        }
         if (!Ly.moe) { err = "qwen35moe: a dense FFN layer (not supported)"; return false; }
         if (!fast_moe(il, pf_pending, err)) return false;
+        if (dumps) {
+            q35_dump(s, "ffn_shexp_gated", il, F->sh_out, g.n_embd);
+            q35_dump(s, "ffn_out", il, F->ffn, g.n_embd);
+        }
     }
     // the head: R += the last FFN, x = rms(R) * output_norm -> head_x / head_xq (fast_token runs the output rows)
     const auto nw = w_.find("output_norm.weight");
     if (nw == w_.end()) { err = "qwen35moe: output_norm.weight"; return false; }
     gf::rms_q8(state_, F->ffn, nw->second, g.norm_eps, g.n_embd, F->head_x, F->head_xq, s);
     if (F->prof_on) F->mark("q35_head");
+    if (dumps) {
+        q35_dump(s, "l_out", l1_ - 1, state_, g.n_embd);
+        q35_dump(s, "result_norm", l1_ - 1, F->head_x, g.n_embd);
+    }
     { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("qwen35moe: ") + cudaGetErrorString(e); return false; } }
     return true;
 }
