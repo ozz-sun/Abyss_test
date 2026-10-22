@@ -30,6 +30,11 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   through the columns, the attention over the caches, the MoE a column - and a rejected tail replayed out of the
   recurrent states. A copy task 23.5 -> 17.4 ms a token (57 tok/s), `STRATA_DS4_SPEC=3` 13.1 (76 tok/s, 97% of the
   drafts accepted); the greedy tokens match the token path's.
+- The GGUF's NextN block as the drafter: a position's cache row from its normed hidden and the next token (eh_proj and
+  k / v alone, for every prompt and answer position), up to 3 chained drafts with their probabilities, the decode's
+  window verifying them. unsloth's block keeps Q8_0 experts, which the expert kernels do not serve: `tools/nextn_pack.py`
+  repacks the block with Q4_K experts through ggml's quantizer, `STRATA_GLM_MTP_GGUF` loads it. Code 22.3 -> 16.9 ms
+  a token (59 tok/s, 92% accepted), prose 21.6 -> 21.0, the copy task 85 tok/s.
 - The decode recurrence through a register-column scan (the state read and written once; the GDN phase 3.0 -> 1.8 ms
   a token) and the conv / norms / gates in fewer launches.
 - Debug: `GLM_CB_DIR` seam dumps for the arch under llama.cpp's cb names (`GLM_CB_POS=1` a file a position).

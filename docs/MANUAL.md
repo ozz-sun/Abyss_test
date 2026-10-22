@@ -378,8 +378,8 @@ layer with 8 routed and a gated shared expert, a plain residual. It is set up by
   30 ms), a 575-token prompt at 233 tok/s through the batched path. KL 0.024 against llama.cpp over 559 positions - llama.cpp's own CPU and HIP backends differ by
   0.027-0.029 on this model.
 - **Speculative decoding.** The n-gram drafts run through the verify window (one draft a window by default,
-  `STRATA_DS4_SPEC=<k>` more): a copy task 57 tok/s with one, 76 with three. Drafts from the GGUF's NextN block: not
-  yet (the packer drops it).
+  `STRATA_DS4_SPEC=<k>` more): a copy task 57 tok/s with one, 76 with three. The GGUF's NextN block drafts too once
+  its experts are repacked (`tools/nextn_pack.py`, `STRATA_GLM_MTP_GGUF`): code 59 tok/s, prose 48, the copy task 85.
 - **Not yet:** conversation slots, a layer split, images; the CUDA build compiles and has not been run; the expert
   kernels are not yet tuned for its shapes.
 
