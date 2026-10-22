@@ -1,0 +1,106 @@
+# Ornith-1.5-122B on Abyss
+
+[Ornith-1.5-122B](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF) is a Qwen3.5-MoE model (llama.cpp's
+`qwen35moe`; MIT): 122B parameters, about 10B of them active a token. It is a different kind of model from
+DeepSeek V4 and GLM-5.3-Flash, and the engine runs it through its own layer path (v1.3.46):
+
+- **48 layers**: 36 **gated delta-net** layers (a linear-attention recurrence - 64 value heads of a 128 x 128 state
+  each, a 4-tap causal conv in front, a sigmoid-gated SiLU norm behind) and, every fourth layer, 12 **full
+  attention** layers (32 query heads of 256 over 2 KV heads, q / k RMS norms, RoPE on the first 64 dims with
+  base 1e7, a sigmoid output gate), with a plain residual (no hyper-connections).
+- **256 experts a layer, 8 routed** (softmax, renormalised) plus a **shared expert** behind its own sigmoid gate,
+  all 1024 wide; the expert pool, the RAM tier and the CPU / iGPU lane work as for the other models.
+- A NextN (MTP) block for speculative decoding is in the GGUF; the packer drops it - no speculative decoding yet.
+
+## Memory
+
+| | |
+| --- | ---: |
+| experts (256 x 48, the pool / the RAM tier / the SSD) | 70.4 GB |
+| dense weights, on the GPU (Q8_0: projections, the shared experts, the output head) | 5.4 GB |
+| states: delta-net 149 MB, conv, KV caches (FP16: 24 KB a position) | ~0.2 GB + 1.6 GB at 64K |
+
+A 32 GB card holds the dense weights and ~25 GB of experts (98 of 256 a layer); a 60 GB RAM tier
+(`STRATA_GLM_RAM_GB=60` on a 94 GB box) holds the rest, so decode reads nothing from the SSD. With 64 GB of RAM part
+of the experts stay on the SSD (`STRATA_GLM_TAIL_SKIP` applies as for DeepSeek V4).
+
+## The GGUF
+
+unsloth's `UD-Q4_K_XL` (79.7 GB, 3 shards; experts IQ4_XS / Q4_K / Q5_K / Q6_K by layer, everything dense Q8_0) is
+the one measured here. unsloth's other sizes of the same repository have the same layout and should load (untested).
+
+```sh
+hf download unsloth/Ornith-1.5-122B-GGUF --include "UD-Q4_K_XL/*" --local-dir <models>/unsloth/Ornith-1.5-122B-GGUF
+sha256sum <models>/unsloth/Ornith-1.5-122B-GGUF/UD-Q4_K_XL/*.gguf     # against the files' LFS checksums on the Hub
+```
+
+## The pack
+
+```sh
+.venv/bin/python tools/iq_pack.py \
+  --gguf <models>/unsloth/Ornith-1.5-122B-GGUF/UD-Q4_K_XL/Ornith-1.5-122B-UD-Q4_K_XL-00001-of-00003.gguf \
+  --out <models>/unsloth/Ornith-1.5-122B-GGUF/UD-Q4_K_XL/pack
+```
+
+The packer recognises `qwen35moe`, indexes the experts in place (nothing is copied), keeps every dense tensor as the
+GGUF stores it (the engine's quantized GEMV reads Q8_0 directly) and writes the tokenizer and the chat template; the
+NextN block (`blk.48`) is left out. The pack directory is ~160 MB.
+
+## Running it
+
+Build the engine (the manual's [Build](../MANUAL.md#build); `setup-deepseek.sh` installs DeepSeek V4 only) and write
+a config next to the others:
+
+```json
+{
+ "exe": "<Abyss>/build/strata",
+ "args": ["--glm-pack", "<dir>/UD-Q4_K_XL/pack", "--max-context", "65536", "--prefill", "auto"],
+ "cwd": "<Abyss>",
+ "tokenizer": "<dir>/UD-Q4_K_XL/pack/tokenizer",
+ "model_name": "ornith-1.5-122b",
+ "gpu": [0],
+ "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+ "port": 8083,
+ "log": "<Abyss>/abyss-ornith.log",
+ "env": {"STRATA_GLM_RAM_GB": "60", "STRATA_GLM_USAGE": "0"}
+}
+```
+
+(an AMD card: `"exe": "<Abyss>/build-hip/strata"`, `"backend": "hip"`, `"lib_dirs": ["/opt/rocm/lib"]` and the
+`GPU_MAX_HW_QUEUES` / `HIP_VISIBLE_DEVICES` entries of [docs/amd](../amd/README.md)). The sampling defaults are the
+model card's. Then:
+
+```sh
+systemd-run --user --scope -p MemoryMax=88G .venv/bin/python serve/server.py --engine strata \
+  --config abyss-ornith.json --port 8083
+```
+
+## Speed and quality (AI PRO R9700 + Radeon 8060S lane + 94 GB RAM, ROCm 10)
+
+| | |
+| --- | ---: |
+| decode (every expert in VRAM or the RAM tier, the 8060S computing the lane) | 23.0-24.6 ms a token (41-43 tok/s) |
+| a 575-token prompt through the batched path (chunks up to 32768, sub-batches of 1024) | 233 tok/s |
+| KL against llama.cpp (its CPU backend), 559 positions of a 576-token text | 0.024 |
+| ... the same text, the first half through the prompt path, the 287 positions after it | 0.026 |
+
+For scale: on this model llama.cpp's own CPU and HIP backends differ by KL 0.027-0.029 over the same positions (the
+quantisation noise of 48 layers), so both paths sit at that floor. Where a decode token goes (the R9700's stream,
+`STRATA_GLM_PROF=1`): the delta-net projections 5.0 ms, the recurrence and its norms 3.6 ms, the lane's answer 2.5,
+the pool's experts 3.4, `ssm_out` 2.0, the attention projections 1.4, the shared expert and router 1.8, the norms 1.0.
+
+NVIDIA: the CUDA build compiles; it has not been run yet.
+
+## Not yet
+
+- Speculative decoding with the NextN block; conversation slots (snapshots); a layer split; images.
+- The lane's expert kernels are tuned for DeepSeek's and GLM's shapes - Ornith's 3072 x 1024 experts take the
+  generic ones. The recurrence kernel runs far below the memory bound. Both are the next speed-ups.
+
+## Checking it
+
+`GLM_CB_DIR=<dir>` writes the token path's seams under llama.cpp's cb names (`attn_norm-<layer>.f32`,
+`conv_output_silu-<layer>`, `final_output-<layer>`, `attn_gated-<layer>`, `ffn_out-<layer>`, `l_out-<layer>`, ...;
+`GLM_CB_POS=1` keeps a file a position), `GLM_PF_CB_DIR` the prompt path's last row, and `STRATA_GLM_SCORE=<c>` with
+`STRATA_GLM_SCORE_PREFILL=1` scores a text after a prefilled prefix - the manual's
+[Checking the output against llama.cpp](../MANUAL.md#checking-the-output-against-llamacpp) has the reference side.

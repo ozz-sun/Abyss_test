@@ -7,6 +7,26 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+**Ornith-1.5-122B (Qwen3.5-MoE, llama.cpp's `qwen35moe`): a new model family on the engine, on HIP and CUDA
+([docs/ornith/README.md](docs/ornith/README.md)).**
+- The packer takes `qwen35moe` GGUFs (every dense tensor served as stored - Q8_0 through the quantized GEMV, F32 as
+  F32 - the experts indexed in place, the NextN block left out).
+- The token path: 36 gated delta-net layers (the `gdn.hpp` recurrence, a 4-tap conv, L2-normed q / k, per-head
+  gates, a SiLU-gated norm) and 12 full-attention layers (32 heads over 2 KV heads, q / k RMS norms, NEOX RoPE on 64
+  dims, FP16 caches, a sigmoid output gate), a plain residual through `rms_q8`, softmax top-8 routing and a shared
+  expert behind its sigmoid gate on the common MoE path (the pool, the RAM tier, the CPU / iGPU lane).
+- The batched prompt path: the same layers inside the prompt chunk loop - row kernels for the residual, the conv
+  with its carried state, the recurrence (a block a value head, the state column in registers), the attention (4
+  queries x one KV group a block, an online softmax a pair) - with the common MMQ expert path (`route_kernel` takes
+  the softmax gating).
+- Measured (unsloth UD-Q4_K_XL, AI PRO R9700 + 8060S lane, a 60 GB RAM tier): decode 23-25 ms a token (41-43 tok/s),
+  a 575-token prompt at 233 tok/s; KL against llama.cpp's CPU backend 0.024 over 559 positions (the prompt path
+  0.026 over 287) - llama.cpp's own CPU and HIP backends differ by 0.027-0.029 there. The CUDA build compiles
+  (not run). Not yet: speculative decoding with the NextN block, snapshots, a layer split, images.
+- Debug: `GLM_CB_DIR` seam dumps for the arch under llama.cpp's cb names (`GLM_CB_POS=1` a file a position).
+
 ## v1.3.45 - 2026-10-22
 
 **Setup needs HIP 7.14 or newer - ROCm 10 on Linux, AMD's ROCm SDK 7.14 on Windows - and stops on ROCm 7.0-7.2, which

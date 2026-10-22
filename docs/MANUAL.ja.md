@@ -15,6 +15,7 @@ Abyss は [Project Maya](https://github.com/mw00/project-maya)（MIT）をコピ
 - [設定と起動](#設定と起動)
 - [使い方](#使い方)
 - [DeepSeek V4.1 Flash](#deepseek-v41-flash)
+- [Ornith-1.5-122B](#ornith-15-122b)
 - [EXL3 量子化（GLM-5.3-Flash）](#exl3-量子化glm-53-flash)
 - [メモリと速度](#メモリと速度)
 - [DSpark のドラフトモデル（DeepSeek V4 Flash）](#dspark-のドラフトモデルdeepseek-v4-flash)
@@ -357,6 +358,22 @@ v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。準�
 - **メモリ上限つきのスコープで起動する**（`systemd-run --user --scope -p MemoryMax=88G ...`）。ページキャッシュと pinned の
   層が重なると、systemd-oomd がデスクトップのセッションを止めることがある。
 - **まだできないこと:** 投機デコード、層の分割、会話のディスク保存、画像。
+
+## Ornith-1.5-122B
+
+v1.3.46 から、同じエンジンが [Ornith-1.5-122B](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF)（Qwen3.5-MoE 系、
+llama.cpp の `qwen35moe`）も動かします。gated delta-net 層 36 + full attention 層 12、1 層 256 エキスパート（8 個を
+使用 + ゲート付きの共有エキスパート）、残差は普通の 1 本です。V4.1 と同じく手動でセットアップします。GGUF、pack の
+コマンド、設定例、測定は [docs/ornith/README.md](ornith/README.md)（英語）に。要点:
+
+- **メモリ。** unsloth の UD-Q4_K_XL は 79.7 GB: エキスパート 70.4 GB（256 × 48 層、3072 × 1024、IQ4_XS〜Q6_K）と、
+  GPU に置く Q8_0 の dense 5.4 GB。32 GB のカードにはエキスパート約 25 GB が載り、残りは RAM 層 60 GB に入るので、
+  94 GB の PC ではデコード中に SSD を読みません。
+- **速度。** AI PRO R9700 + 8060S レーン: デコード 1 トークン 23〜25 ms（41〜43 tok/s）、575 トークンのプロンプトは
+  バッチ経路で 233 tok/s。llama.cpp との KL は 559 位置で 0.024（このモデルでは llama.cpp 自身の CPU と HIP の差が
+  0.027〜0.029）。
+- **まだないもの:** 投機デコード（GGUF の NextN ブロックは pack で捨てる）、会話スロット、レイヤー分割、画像。
+  CUDA ビルドはコンパイルは通るが未実行。エキスパートカーネルはこの形状にまだ調整していない。
 
 ## EXL3 量子化（GLM-5.3-Flash）
 

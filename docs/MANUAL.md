@@ -15,6 +15,7 @@ installer) is kept under [docs/maya/](maya/README.md).
 - [Configure and start](#configure-and-start)
 - [Using it](#using-it)
 - [DeepSeek V4.1 Flash](#deepseek-v41-flash)
+- [Ornith-1.5-122B](#ornith-15-122b)
 - [EXL3 quants (GLM-5.3-Flash)](#exl3-quants-glm-53-flash)
 - [Memory and speed](#memory-and-speed)
 - [The DSpark drafter (DeepSeek V4 Flash)](#the-dspark-drafter-deepseek-v4-flash)
@@ -362,6 +363,22 @@ measurements, and [docs/deepseek41/SPEC.md](deepseek41/SPEC.md) what the model c
 - **Start it in a memory-capped scope** (`systemd-run --user --scope -p MemoryMax=88G ...`): the page cache and the
   pinned tier together can push systemd-oomd into killing the desktop session.
 - **Not yet:** speculative decoding, a layer split, conversation slots on disk, images.
+
+## Ornith-1.5-122B
+
+From v1.3.46 the engine also runs [Ornith-1.5-122B](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF), a
+Qwen3.5-MoE model (llama.cpp's `qwen35moe`): 36 gated delta-net layers and 12 full-attention layers, 256 experts a
+layer with 8 routed and a gated shared expert, a plain residual. It is set up by hand like V4.1;
+[docs/ornith/README.md](ornith/README.md) has the GGUF, the pack command, a config and the measurements. In short:
+
+- **Memory.** unsloth's UD-Q4_K_XL is 79.7 GB: 70.4 GB of experts (256 x 48, 3072 x 1024, IQ4_XS-Q6_K) and 5.4 GB of
+  Q8_0 dense weights that stay on the GPU. A 32 GB card holds ~25 GB of experts; a 60 GB RAM tier the rest, so on a
+  94 GB box decode reads nothing from the SSD.
+- **Speed.** AI PRO R9700 + 8060S lane: decode 23-25 ms a token (41-43 tok/s), a 575-token prompt at 233 tok/s through
+  the batched path. KL 0.024 against llama.cpp over 559 positions - llama.cpp's own CPU and HIP backends differ by
+  0.027-0.029 on this model.
+- **Not yet:** speculative decoding (the GGUF's NextN block is dropped by the packer), conversation slots, a layer
+  split, images; the CUDA build compiles and has not been run; the expert kernels are not yet tuned for its shapes.
 
 ## EXL3 quants (GLM-5.3-Flash)
 
