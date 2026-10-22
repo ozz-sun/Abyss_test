@@ -138,7 +138,17 @@ class ArchitectureCheck(unittest.TestCase):
         self.assertIn("glm5next", iq_pack.ARCHITECTURES)   # unsloth's spelling, same KV family
         self.assertIn("deepseek4", iq_pack.ARCHITECTURES)  # Abyss: DeepSeek V4
         self.assertIn("deepseek41", iq_pack.ARCHITECTURES)  # Abyss: DeepSeek V4.1 (v1.3.29)
-        self.assertEqual(len(iq_pack.ARCHITECTURES), 5)
+        self.assertIn("qwen35moe", iq_pack.ARCHITECTURES)   # Abyss: Qwen3.5-MoE / Ornith-1.5-122B (v1.3.46)
+        self.assertEqual(len(iq_pack.ARCHITECTURES), 6)
+
+    def test_qwen35moe_dense_as_stored(self):
+        # every dense tensor is served as stored (Q8_0 by the quantized GEMV, F32 as F32): nothing goes to BF16
+        self.assertFalse(iq_pack.needs_bf16("blk.0.attn_qkv.weight", "Q8_0", "qwen35moe"))
+        self.assertFalse(iq_pack.needs_bf16("blk.0.ffn_gate_inp.weight", "F32", "qwen35moe"))
+        self.assertFalse(iq_pack.needs_bf16("output.weight", "Q8_0", "qwen35moe"))
+        for n in ("attn_qkv", "attn_gate", "ssm_out", "ssm_alpha", "ssm_beta", "attn_q", "attn_k", "attn_v",
+                  "attn_output", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"):
+            self.assertIn(n + ".weight", iq_pack.QWEN35MOE_NATIVE_OK)
 
     def test_deepseek4_bf16_list(self):
         # the hc fn matrices (F32 in the GGUFs) take the BF16 path, the indexer's F32 projection does not
