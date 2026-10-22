@@ -80,6 +80,8 @@ systemd-run --user --scope -p MemoryMax=88G .venv/bin/python serve/server.py --e
 | | |
 | --- | ---: |
 | decode (every expert in VRAM or the RAM tier, the 8060S computing the lane) | 23.0-24.6 ms a token (41-43 tok/s) |
+| ... the CPU computing the lane instead (`STRATA_GLM_IGPU=0`: a PC without an iGPU) | 30.3 ms a token (33 tok/s) |
+| a copy task with the engine's n-gram drafts (the default, `STRATA_DS4_SPEC=1`; `=3`: three drafts) | 17.4 ms a token (57 tok/s); 13.1 (76 tok/s) |
 | a 575-token prompt through the batched path (chunks up to 32768, sub-batches of 1024) | 233 tok/s |
 | KL against llama.cpp (its CPU backend), 559 positions of a 576-token text | 0.024 |
 | ... the same text, the first half through the prompt path, the 287 positions after it | 0.026 |
@@ -88,12 +90,24 @@ For scale: on this model llama.cpp's own CPU and HIP backends differ by KL 0.027
 quantisation noise of 48 layers), so both paths sit at that floor. Where a decode token goes (the R9700's stream,
 `STRATA_GLM_PROF=1`): the delta-net projections 5.0 ms, the recurrence and its norms 3.6 ms, the lane's answer 2.5,
 the pool's experts 3.4, `ssm_out` 2.0, the attention projections 1.4, the shared expert and router 1.8, the norms 1.0.
+Without the iGPU the CPU lane (16 threads, 0.046 ms an expert, ~200 experts a token) is what the GPU waits for:
+7.2 ms a token.
+
+**Speculative decoding.** The engine's n-gram drafts (the latest earlier occurrence of the last tokens in the prompt
+and the answer proposes the next ones, [the manual](../MANUAL.md#memory-and-speed)) run on this model through its
+verify window: a token and its drafts go through every layer at once (the dense weights read once for the window's
+columns, the recurrence and the conv carried through the columns in order, the attention over the caches), each
+column's sample is compared with the proposal, and a rejected tail is dropped - the delta-net and conv states are
+replayed from the kept columns. The output is the token-at-a-time loop's (the same sampler on the same logits; the
+greedy tokens matched over 160-token answers of three texts). It pays on repeated text (copies, code with repeats:
+97% of 3 drafts accepted, 76 tok/s) and costs little elsewhere (one draft a window by default; on code with few
+repeats 45 tok/s against 43). A draft block (the GGUF's NextN layer) is not used yet.
 
 NVIDIA: the CUDA build compiles; it has not been run yet.
 
 ## Not yet
 
-- Speculative decoding with the NextN block; conversation slots (snapshots); a layer split; images.
+- Drafts from the NextN block (the n-gram drafts above run); conversation slots (snapshots); a layer split; images.
 - The lane's expert kernels are tuned for DeepSeek's and GLM's shapes - Ornith's 3072 x 1024 experts take the
   generic ones. The recurrence kernel runs far below the memory bound. Both are the next speed-ups.
 

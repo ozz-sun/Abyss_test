@@ -25,6 +25,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   a 575-token prompt at 233 tok/s; KL against llama.cpp's CPU backend 0.024 over 559 positions (the prompt path
   0.026 over 287) - llama.cpp's own CPU and HIP backends differ by 0.027-0.029 there. The CUDA build compiles
   (not run). Not yet: speculative decoding with the NextN block, snapshots, a layer split, images.
+- The verify window for the arch (the engine's n-gram speculative decode, one draft a window by default): the
+  token path's layers over the window's columns - the dense GEMVs read once, the recurrence and the conv carried
+  through the columns, the attention over the caches, the MoE a column - and a rejected tail replayed out of the
+  recurrent states. A copy task 23.5 -> 17.4 ms a token (57 tok/s), `STRATA_DS4_SPEC=3` 13.1 (76 tok/s, 97% of the
+  drafts accepted); the greedy tokens match the token path's.
+- The decode recurrence through a register-column scan (the state read and written once; the GDN phase 3.0 -> 1.8 ms
+  a token) and the conv / norms / gates in fewer launches.
 - Debug: `GLM_CB_DIR` seam dumps for the arch under llama.cpp's cb names (`GLM_CB_POS=1` a file a position).
 
 ## v1.3.45 - 2026-10-22
