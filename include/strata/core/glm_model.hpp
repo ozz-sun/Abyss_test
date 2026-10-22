@@ -466,6 +466,8 @@ public:
     // argmax; the last part records its buffers' done event
     bool verify_part(const std::vector<int32_t>& toks, int64_t p0, std::string& err);
     bool verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // deepseek41's (one part)
+    bool verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // qwen35moe's (one part)
+    void verify_rewind_q35(int64_t pos);   // qwen35moe: the recurrent states back to after the kept columns
     const Glm5Model* verify_tail() const;
     // the conversation snapshot's deepseek4 state: every layer's window ring and compressor rings (the compressed
     // caches are append-only by position - a row is written exactly when it becomes visible - so the position alone

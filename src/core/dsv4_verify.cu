@@ -32,7 +32,9 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/dsv41_fast.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
+#include "strata/kernels/gdn.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/qwen35_fast.hpp"
 
 #include <cuda_runtime.h>
 
@@ -51,6 +53,7 @@ namespace strata::core {
 namespace gf = strata::kernels::glmf;
 namespace ds = strata::kernels::dsv4;
 namespace d41 = strata::kernels::dsv41;
+namespace q35 = strata::kernels::q35;
 
 namespace {
 constexpr size_t kQ8 = 36;   // bytes of a q8_1 block (32 values)
@@ -126,6 +129,16 @@ struct VerifyBuf {
     int* v41_bsel = nullptr;
     unsigned char* v41_keep = nullptr;
     size_t v41_score_n = 0, v41_b_n = 0;
+    // qwen35moe: the window's rows a delta-net layer (its conv inputs, its prepped conv rows, its gates: the rewind
+    // replays the kept rows from them), the states before the window (every delta-net layer's state and conv state),
+    // the attention and recurrence scratch over the columns, the shared expert's gate logit a column
+    int q35_layers = 0;                       // delta-net layers in this part
+    int64_t q35_p0 = -1;                      // the last window's first position (-1: none)
+    float *q35_qkv = nullptr, *q35_rows = nullptr, *q35_alpha = nullptr, *q35_beta = nullptr;
+    float *q35_snap = nullptr, *q35_csnap = nullptr;
+    float *q35_z = nullptr, *q35_o = nullptr, *q35_y = nullptr, *q35_qf = nullptr, *q35_k = nullptr, *q35_v = nullptr,
+          *q35_q = nullptr, *q35_ao = nullptr, *q35_shg = nullptr;
+    void *q35_yq = nullptr, *q35_aoq = nullptr;
 };
 }  // namespace
 
@@ -134,8 +147,8 @@ bool Glm5Model::verify_ready() const {
     // MoE layers; the head's weights on the last
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const FastState* F = m->fast_;
-        if (F == nullptr || !m->g_.dsv4() || m->mtp_il_ >= 0 || F->max_pf > 0 || F->n_ahead > 0) return false;
-        if (m->g_.v41 && (F->defer || m->split_next_ != nullptr || m != this)) return false;   // (one part, no deferral)
+        if (F == nullptr || !(m->g_.dsv4() || m->g_.qwen35()) || m->mtp_il_ >= 0 || F->max_pf > 0 || F->n_ahead > 0) return false;
+        if ((m->g_.v41 || m->g_.qwen35()) && (F->defer || m->split_next_ != nullptr || m != this)) return false;   // (one part, no deferral)
         for (int il = m->l0_; il < m->l1_; ++il)
             if (!F->L[(size_t) il].moe) return false;
     }
@@ -190,6 +203,23 @@ bool Glm5Model::verify_alloc(std::string& err) {
     ok = ok && cudaMalloc((void**) &V->score, V->score_n * TM * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc((void**) &V->sel, (size_t) g.idx_top_k * TM * sizeof(int)) == cudaSuccess;
     if (ok) cudaMemset(V->hcnt, 0, (size_t) 64 * TM);
+    if (ok && g.qwen35()) {
+        const size_t C = (size_t) g.ssm_conv_dim(), Vd = (size_t) g.ssm_inner, Sd = (size_t) g.ssm_state,
+                     HV = (size_t) g.ssm_v_heads, KV = (size_t) g.attn_head_kv * D;
+        int nrec = 0;
+        for (int il = l0_; il < l1_; ++il) nrec += fast_->L[(size_t) il].recr ? 1 : 0;
+        V->q35_layers = nrec;
+        const size_t L = (size_t) std::max(nrec, 1);
+        ok = cudaMalloc((void**) &V->q35_qkv, L * TM * C * sizeof(float)) == cudaSuccess &&
+             cudaMalloc((void**) &V->q35_rows, L * TM * C * sizeof(float)) == cudaSuccess &&
+             cudaMalloc((void**) &V->q35_alpha, L * TM * HV * sizeof(float)) == cudaSuccess &&
+             cudaMalloc((void**) &V->q35_beta, L * TM * HV * sizeof(float)) == cudaSuccess &&
+             cudaMalloc((void**) &V->q35_snap, L * Sd * HV * Sd * sizeof(float)) == cudaSuccess &&
+             cudaMalloc((void**) &V->q35_csnap, L * C * (size_t) (g.d_conv - 1) * sizeof(float)) == cudaSuccess;
+        f(V->q35_z, Vd); f(V->q35_o, Vd); f(V->q35_y, Vd); b(V->q35_yq, Vd / 32 * kQ8);
+        f(V->q35_qf, 2 * HD); f(V->q35_k, KV); f(V->q35_v, KV); f(V->q35_q, HD); f(V->q35_ao, HD); b(V->q35_aoq, HD / 32 * kQ8);
+        f(V->q35_shg, 1);
+    }
     if (ok && g.v41) {
         const size_t ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
         V->v41_score_n = ctx + 1;
@@ -630,7 +660,11 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     }();
     // (deepseek41: a column's experts right after its own fetch - its SSD reads land in the token path's 8 scratch
     // slots, which every column of a batched window shares)
-    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && !g.v41;
+    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && !g.v41 && !g.qwen35();
+    if (g.qwen35() && Ly.sh_gate_w != nullptr) {   // the shared expert's gate logit a column (sigmoid below)
+        gf::MvJob jg = {Ly.sh_gate_w, nullptr, V->x + (size_t) tb * E, V->q35_shg + tb, nullptr, 1.0f, gf::kTypeF32, E, 1};
+        if (!gf::mvn(&jg, 1, T, s)) { err = "qwen35 verify: the shared expert's gate"; return false; }
+    }
     // STRATA_DS4_WIN_COLS_CHECK=1: every 16th group of columns also through a launch a column, compared bit by bit
     static const bool cols_chk = getenv("STRATA_DS4_WIN_COLS_CHECK") != nullptr && std::atoi(getenv("STRATA_DS4_WIN_COLS_CHECK")) != 0;
     const bool chk = cols && cols_chk && (V->chk_calls++ % 16) == 0;
@@ -658,6 +692,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
                         hq, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
                         FFs, sh_out, s);
+        if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // (as fast_moe)
+            q35::scale_sigmoid(sh_out, E, V->q35_shg + t, s);
         gf::moe_down(Ly.d_type, md, k, E, g.n_ff_exp, Ly.down_off, hq, Ly.sh_down.q != nullptr ? sh_out : nullptr,
                      V->ffn + (size_t) t * E, s);
         if (F->prof_on) F->mark("vm_experts");
@@ -759,8 +795,8 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         return 1;
 #endif
     }();
-    bool timed = pipe_env < 0 && V->pipe_choice[T] < 0 && T > 1 && !F->prof_on && !g.v41;
-    const bool use_pipe = g.v41 ? false   // (deepseek41: the batched window)
+    bool timed = pipe_env < 0 && V->pipe_choice[T] < 0 && T > 1 && !F->prof_on && !g.v41 && !g.qwen35();
+    const bool use_pipe = g.v41 || g.qwen35() ? false   // (deepseek41, qwen35moe: the batched window)
                         : pipe_env >= 0 ? pipe_env != 0
                         : V->pipe_choice[T] >= 0 ? V->pipe_choice[T] != 0
                         : V->ms_pipe[T].size() <= V->ms_batch[T].size();   // (timing: alternate a width, pipelined first)
@@ -813,7 +849,13 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
                          V->emb_h + (size_t) t * E, g.n_embd);
         cudaMemcpyAsync(V->emb, V->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, s);
     }
-    for (int t = 0; t < T; ++t) gf::embed_streams(V->emb + (size_t) t * E, V->R + (size_t) t * 2 * HCE, g.n_embd, s);
+    for (int t = 0; t < T; ++t) {
+        if (g.qwen35())   // a plain residual: column t's first stream (embed_streams writes four)
+            cudaMemcpyAsync(V->R + (size_t) t * 2 * HCE, V->emb + (size_t) t * E, E * sizeof(float),
+                            cudaMemcpyDeviceToDevice, s);
+        else
+            gf::embed_streams(V->emb + (size_t) t * E, V->R + (size_t) t * 2 * HCE, g.n_embd, s);
+    }
     if (g.v41) {   // every column's Engram rows (read while the embedding runs), layer 0's one-hot pre
         static const float onehot[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // (as fast_token: layer 0 collapses stream 0)
         for (int t = 0; t < T; ++t)
@@ -831,7 +873,8 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         cudaSetDevice(m->dev_);
         m->pos_ = pos_;
         ((VerifyBuf*) m->vb_)->T = T;
-        if (!(g.v41 ? m->verify_part_v41(toks, p0, err) : m->verify_part(toks, p0, err))) return false;
+        if (!(g.v41 ? m->verify_part_v41(toks, p0, err) : g.qwen35() ? m->verify_part_q35(toks, p0, err)
+                                                                       : m->verify_part(toks, p0, err))) return false;
     }
     wt_lap(wt_launch);
     cudaSetDevice(dev_);
@@ -1209,6 +1252,146 @@ bool Glm5Model::verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, st
     mark(4);
     cudaEventRecord(V->done, s);
     return true;
+}
+
+// qwen35moe's window (one part, batched): the token path's layers over the T columns - the dense GEMVs one mvn launch
+// over the columns, the plain residual's reads a column (rms_q8), the delta-net rows and the attention rows the prompt
+// path's row kernels (the recurrence and the conv carry their state through the window's rows in order), the MoE
+// verify_moe's.  The states before the window are kept, and every delta-net layer's conv inputs, prepped rows and
+// gates: spec_rewind replays the kept rows from them (verify_rewind_q35).
+bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, std::string& err) {
+    FastState* F = fast_;
+    auto* V = (VerifyBuf*) vb_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int T = V->T, TM = V->TM;
+    const size_t E = (size_t) g.n_embd, q8e = (E / 32) * kQ8;
+    const int C = g.ssm_conv_dim(), Vd = g.ssm_inner, Sd = g.ssm_state, HK = g.ssm_k_heads, HV = g.ssm_v_heads;
+    const int D = g.head_dim, HD = g.n_head * D, KV = g.attn_head_kv * D;
+    const size_t state_n = (size_t) Sd * HV * Sd, conv_n = (size_t) C * (g.d_conv - 1);
+    const auto Rt = [&](int t) { return V->R + (size_t) t * 2 * E; };   // (its pair's first half)
+    const bool prof = F->prof_on;
+    static std::vector<std::string> names;
+    if (prof && names.empty())
+        for (int n = 1; n <= kVerifyMax; ++n)
+            for (const char* ph : {"norm", "mixer", "norm2", "moe", "head"}) names.push_back("v" + std::to_string(n) + "_" + ph);
+    const auto mark = [&](int ph) { if (prof) F->mark(names[(size_t) (T - 1) * 5 + ph].c_str()); };
+    if (prof) F->mark("v_start");
+    V->q35_p0 = p0;
+    int li = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (!Ly.recr) continue;
+        cudaMemcpyAsync(V->q35_snap + (size_t) li * state_n, Ly.gdn_state, state_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(V->q35_csnap + (size_t) li * conv_n, Ly.gdn_conv, conv_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        ++li;
+    }
+    li = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        for (int t = 0; t < T; ++t)
+            gf::rms_q8(Rt(t), il == l0_ ? nullptr : V->ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps, (int) E,
+                       V->x + (size_t) t * E, (uint8_t*) V->xq + (size_t) t * q8e, s);
+        mark(0);
+        if (Ly.recr) {
+            float* qkv = V->q35_qkv + (size_t) li * TM * C;
+            float* rows = V->q35_rows + (size_t) li * TM * C;
+            float* alpha = V->q35_alpha + (size_t) li * TM * HV;
+            float* beta = V->q35_beta + (size_t) li * TM * HV;
+            gf::MvJob j[4];
+            j[0] = {Ly.qkv.q, V->xq, V->x, qkv, nullptr, 1.0f, Ly.qkv.type, (int) E, C};
+            j[1] = {Ly.zg.q, V->xq, V->x, V->q35_z, nullptr, 1.0f, Ly.zg.type, (int) E, Vd};
+            j[2] = {Ly.alpha_w.q, V->xq, V->x, alpha, nullptr, 1.0f, Ly.alpha_w.type, (int) E, HV};
+            j[3] = {Ly.beta_w.q, V->xq, V->x, beta, nullptr, 1.0f, Ly.beta_w.type, (int) E, HV};
+            if (!gf::mvn(j, 4, T, s)) { err = "qwen35 verify: the delta-net projections"; return false; }
+            q35::conv_rows(qkv, T, C, Ly.conv1d, g.d_conv, Ly.gdn_conv, rows, s);
+            q35::gdn_prep_gates(rows, T, C, HK, Sd, g.norm_eps, alpha, beta, Ly.dt_bias, Ly.ssm_a, HV, s);
+            q35::gdn_scan(Ly.gdn_state, rows, T, C, alpha, beta, Sd, HK, HV, V->q35_o, s);
+            strata::kernels::gdn_out_norm_silu(V->q35_o, V->q35_z, Ly.ssm_norm, V->q35_y, (int64_t) T * HV, Sd, g.norm_eps,
+                                               (void*) s);
+            gf::quantize_q8_1(V->q35_y, V->q35_yq, T * Vd, s);
+            gf::MvJob o = {Ly.ssm_o.q, V->q35_yq, V->q35_y, V->mixer, nullptr, 1.0f, Ly.ssm_o.type, Vd, (int) E};
+            if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: ssm_out"; return false; }
+            ++li;
+        } else {
+            gf::MvJob j[3];
+            j[0] = {Ly.aq.q, V->xq, V->x, V->q35_qf, nullptr, 1.0f, Ly.aq.type, (int) E, 2 * HD};
+            j[1] = {Ly.ak.q, V->xq, V->x, V->q35_k, nullptr, 1.0f, Ly.ak.type, (int) E, KV};
+            j[2] = {Ly.av.q, V->xq, V->x, V->q35_v, nullptr, 1.0f, Ly.av.type, (int) E, KV};
+            if (!gf::mvn(j, 3, T, s)) { err = "qwen35 verify: the attention projections"; return false; }
+            q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
+                                g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s);
+            q35::attn_prompt(V->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p0, T, 1.0f / std::sqrt((float) D),
+                             V->q35_ao, s);
+            q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s);
+            gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HD, s);
+            gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HD, (int) E};
+            if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: attn_output"; return false; }
+        }
+        mark(1);
+        for (int t = 0; t < T; ++t)
+            gf::rms_q8(Rt(t), V->mixer + (size_t) t * E, Ly.post_norm, g.norm_eps, (int) E, V->x + (size_t) t * E,
+                       (uint8_t*) V->xq + (size_t) t * q8e, s);
+        mark(2);
+        if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
+        mark(3);
+    }
+    const auto nw = w_.find("output_norm.weight");
+    if (nw == w_.end()) { err = "qwen35 verify: output_norm.weight"; return false; }
+    for (int t = 0; t < T; ++t)
+        gf::rms_q8(Rt(t), V->ffn + (size_t) t * E, nw->second, g.norm_eps, (int) E, V->head_x + (size_t) t * E,
+                   (uint8_t*) V->head_xq + (size_t) t * q8e, s);
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, (int) E, g.n_vocab};
+    if (gf::mvn_supported(ow.type)) {
+        if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: output head"; return false; }
+    } else {
+        for (int t = 0; t < T; ++t) {
+            gf::MvJob ot = o;
+            ot.xq = (const uint8_t*) V->head_xq + (size_t) t * q8e;
+            ot.xf = V->head_x + (size_t) t * E;
+            ot.y = V->logits + (size_t) t * g.n_vocab;
+            if (!gf::mv(&ot, 1, s)) { err = "qwen35 verify: output head (type " + std::to_string(ow.type) + ")"; return false; }
+        }
+    }
+    if (F->zero_copy) {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok_hd + t, s);
+    } else {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok + t, s);
+        cudaMemcpyAsync(V->tok_h, V->tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, s);
+    }
+    mark(4);
+    cudaEventRecord(V->done, s);
+    return true;
+}
+
+// the window's tail dropped (positions >= pos): every delta-net layer's state and conv state back to before the
+// window, then the kept rows replayed from the window's saved rows and gates (the attention caches need nothing: a
+// row past pos is rewritten before it is read)
+void Glm5Model::verify_rewind_q35(int64_t pos) {
+    auto* V = (VerifyBuf*) vb_;
+    FastState* F = fast_;
+    if (V == nullptr || F == nullptr || V->q35_p0 < 0) return;
+    const int kept = (int) (pos - V->q35_p0), T = V->T, TM = V->TM;
+    V->q35_p0 = -1;
+    if (kept >= T) return;   // (every column kept: the states are after the window already)
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int C = g.ssm_conv_dim(), Sd = g.ssm_state, HK = g.ssm_k_heads, HV = g.ssm_v_heads;
+    const size_t state_n = (size_t) Sd * HV * Sd, conv_n = (size_t) C * (g.d_conv - 1);
+    int li = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (!Ly.recr) continue;
+        cudaMemcpyAsync(Ly.gdn_state, V->q35_snap + (size_t) li * state_n, state_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(Ly.gdn_conv, V->q35_csnap + (size_t) li * conv_n, conv_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        if (kept > 0) {
+            q35::conv_state_rows(V->q35_qkv + (size_t) li * TM * C, kept, C, g.d_conv, Ly.gdn_conv, s);
+            q35::gdn_scan(Ly.gdn_state, V->q35_rows + (size_t) li * TM * C, kept, C, V->q35_alpha + (size_t) li * TM * HV,
+                          V->q35_beta + (size_t) li * TM * HV, Sd, HK, HV, V->q35_o, s);
+        }
+        ++li;
+    }
 }
 
 int Glm5Model::verify_argmax(int i) const {

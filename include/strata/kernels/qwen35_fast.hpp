@@ -55,6 +55,8 @@ void gdn_gates_rows(float* alpha, float* beta, const float* dt_bias, const float
 /// gdn_prep_rows and gdn_gates_rows in one launch (the gates' blocks beside the heads').
 void gdn_prep_gates(float* h, int T, int C, int h_k, int S, float eps, float* alpha, float* beta, const float* dt_bias,
                     const float* ssm_a, int h_v, cudaStream_t s);
+/// conv_rows' state update alone: the state after T rows of x (the rewind's replay over the kept rows).
+void conv_state_rows(const float* x, int T, int C, int d_conv, float* conv_state, cudaStream_t s);
 /// The token path's conv step (gdn_conv_step: one input row x, the state slid) with the SiLU in the same launch.
 void conv_silu_step(float* conv_state, const float* x, const float* kW, int C, int d_conv, float* out, cudaStream_t s);
 /// The recurrence over T rows in order (gdn_step's math, the state (S, h_v, S) updated in place): q / k / v from the

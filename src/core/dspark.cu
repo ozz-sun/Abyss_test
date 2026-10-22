@@ -532,6 +532,7 @@ void Glm5Model::dspark_window(int64_t p0, int T) {
 }
 
 void Glm5Model::spec_rewind(int64_t pos) {
+    if (g_.qwen35()) verify_rewind_q35(pos);   // (the delta-net and conv states: not rings - replayed)
     pos_ = pos;
     dspark_settle();
 }

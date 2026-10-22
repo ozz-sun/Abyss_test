@@ -561,6 +561,11 @@ void gdn_prep_gates(float* h, int T, int C, int h_k, int S, float eps, float* al
         h, C, h_k, S, eps, 1.0f / std::sqrt((float) S), alpha, beta, dt_bias, ssm_a, h_v);
     check("gdn_prep_gates");
 }
+void conv_state_rows(const float* x, int T, int C, int d_conv, float* conv_state, cudaStream_t s) {
+    if (T <= 0 || C <= 0 || d_conv < 2 || d_conv > 9) return;
+    conv_state_rows_kernel<<<(C + 255) / 256, 256, 0, s>>>(x, T, C, d_conv, conv_state);
+    check("conv_state_rows");
+}
 void conv_silu_step(float* conv_state, const float* x, const float* kW, int C, int d_conv, float* out, cudaStream_t s) {
     if (C <= 0 || d_conv < 2) return;
     conv_silu_step_kernel<<<(C + 255) / 256, 256, 0, s>>>(conv_state, x, kW, out, C, d_conv);
