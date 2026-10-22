@@ -1533,11 +1533,12 @@ __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const __grid_constant__
 // ---- hc, take three: hc2's arithmetic with the latency taken out - every block issues its 24 weight rows' loads
 // (8 bf16 per lane per stream segment, uint4) BEFORE it computes its R values, the partial sums are reduced by whole
 // warps (lane = block) instead of one thread walking 32 of them, and the second barrier's total likewise.
-// 32 blocks of 128 embedding values; n_embd == 4096 only.
+// 32 blocks of 128 embedding values (n_embd 4096); with HIP up to 64 (DeepSeek V4.1's 5120: 40 - a lane reduces two
+// partials there) and V4.1's lagged collapse (pre_use)
 __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__ HcArgs a) {
     const int hc = 4;
     const int n_embd = a.n_embd;
-    const unsigned int nb = gridDim.x;   // 32
+    const unsigned int nb = gridDim.x;   // 32 (up to 64)
     const int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int e0 = b * HC2_EB;
     unsigned long long* ctr = (unsigned long long*) a.counter;
@@ -1643,7 +1644,8 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__
     // the 25 (+ 10 Gram) totals: warp w reduces rows w, w + 8, ..., one partial per lane
     const int n_rows = a.gram ? HC_MIX + 11 : HC_MIX + 1;
     for (int m = warp; m < n_rows; m += 8) {
-        const float v = lane < (int) nb ? __ldcg(&part[(size_t) m * nb + lane]) : 0.0f;
+        float v = lane < (int) nb ? __ldcg(&part[(size_t) m * nb + lane]) : 0.0f;
+        if (nb > 32u && lane + 32 < (int) nb) v += __ldcg(&part[(size_t) m * nb + lane + 32]);
         const float t = warp_sum(v);
         if (lane == 0) smix[m] = t;
     }
@@ -1682,11 +1684,15 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__
         if (b == 0 && lane < 16) a.comb[d * hc + s] = c;
     }
     __syncthreads();
+    // the collapse weights: this sublayer's pre, or deepseek41's lagged one (the previous sublayer's)
+    float pw[4];
+#pragma unroll
+    for (int s = 0; s < hc; ++s) pw[s] = a.pre_use != nullptr ? a.pre_use[s] : s_pre[s];
     float ss2 = 0.0f;
     if (tid < HC2_EB) {
         float acc = 0.0f;
 #pragma unroll
-        for (int s = 0; s < hc; ++s) acc += s_pre[s] * sR[s][tid];
+        for (int s = 0; s < hc; ++s) acc += pw[s] * sR[s][tid];
         s_mixed[tid] = acc;
         ss2 = acc * acc;
     }
@@ -1696,13 +1702,15 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__
         tot = 0.0f;
 #pragma unroll
         for (int pr = 0; pr < 10; ++pr)
-            tot += (gs[pr] == gt[pr] ? 1.0f : 2.0f) * s_pre[gs[pr]] * s_pre[gt[pr]] * smix[HC_MIX + 1 + pr];
+            tot += (gs[pr] == gt[pr] ? 1.0f : 2.0f) * pw[gs[pr]] * pw[gt[pr]] * smix[HC_MIX + 1 + pr];
     } else {
         ss2 = block_sum(ss2, sred);
         float* part2 = a.part + (size_t) (HC_MIX + 1) * nb;
         if (tid == 0) part2[b] = ss2;
         grid_barrier(ctr, nb);
-        tot = warp_sum(lane < (int) nb ? __ldcg(&part2[lane]) : 0.0f);
+        float v = lane < (int) nb ? __ldcg(&part2[lane]) : 0.0f;
+        if (nb > 32u && lane + 32 < (int) nb) v += __ldcg(&part2[lane + 32]);
+        tot = warp_sum(v);
     }
     const float inv2 = rsqrtf(tot / (float) n_embd + a.norm_eps);
     if (tid < HC2_EB) {
@@ -3974,6 +3982,16 @@ void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s) {
 
 // the grid-barrier kernel needs every block resident at once; checked once per process (and per device count
 // of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).
+// hc3's widths: 4096 (32 blocks); with HIP DeepSeek V4.1's 5120 too (40 blocks, its lagged collapse; HC3V41-NUMBERS,
+// STRATA_GLM_HC3_V41=0: hc2 as before).  NVIDIA keeps hc2 for V4.1 (not measured there)
+static bool hc3_width(int n_embd) {
+#if defined(STRATA_USE_HIP)
+    static const bool v41 = [] { const char* v = getenv("STRATA_GLM_HC3_V41"); return v == nullptr || std::atoi(v) != 0; }();
+    if (v41 && n_embd == 5120) return true;
+#endif
+    return n_embd == 4096;
+}
+
 static int hc_mode(int n_embd) {
     static int mode = -1;
     if (mode < 0) {
@@ -3983,17 +4001,17 @@ static int hc_mode(int n_embd) {
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, hc2_kernel, HC_THREADS, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3, hc3_kernel, HC_THREADS, 0);
         mode = (getenv("STRATA_GLM_HC1") == nullptr && per * sms >= n_embd / HC2_EB) ? 2 : 1;
-        if (mode == 2 && getenv("STRATA_GLM_HC2") == nullptr && n_embd == 4096 && per3 * sms >= n_embd / HC2_EB)
+        if (mode == 2 && getenv("STRATA_GLM_HC2") == nullptr && hc3_width(n_embd) && per3 * sms >= n_embd / HC2_EB)
             mode = 3;
     }
     return mode;
 }
 
-bool hc_fuses_cpu(int n_embd) { return hc_mode(n_embd) == 3 && n_embd == 4096; }
+bool hc_fuses_cpu(int n_embd) { return hc_mode(n_embd) == 3 && hc3_width(n_embd); }
 
 void hc(const HcArgs& a, cudaStream_t s) {
     const int mode = hc_mode(a.n_embd);
-    if (a.cpu_seq != nullptr && a.block_out != nullptr && !(mode == 3 && a.pre_use == nullptr)) {
+    if (a.cpu_seq != nullptr && a.block_out != nullptr && mode != 3) {
         // (a caller that asked hc_fuses_cpu() never lands here: the CPU lane's answer in its own launch first)
         MoeDev d;
         d.cpu_seq = (unsigned int*) a.cpu_seq;
@@ -4004,7 +4022,7 @@ void hc(const HcArgs& a, cudaStream_t s) {
         hc(b, s);
         return;
     }
-    if (mode == 3 && a.pre_use == nullptr) {   // (hc3 has no lagged collapse: deepseek41 runs hc2)
+    if (mode == 3) {   // (deepseek41's lagged collapse: HIP only, hc3_width)
         HcArgs g3 = a;
         // (nsys on an RTX 5090: 8.5 -> 8.1 us a launch; the sums round differently, so off unless asked)
         static const bool gram = [] { const char* v = getenv("STRATA_GLM_HC_GRAM"); return v != nullptr && std::atoi(v) != 0; }();

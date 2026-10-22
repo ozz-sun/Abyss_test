@@ -4948,8 +4948,10 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
 #endif
     }();
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
-    const bool hc_cpu = lane && hc_cpu_env && g.dsv4() && !g.v41 && !F->defer && !Ly.mtp && !Ly.exl3 && !F->prof_on &&
-                        !dumps && il + 1 < l1_ && !(pf && pf_at == 2) && !F->kda_graph_on && gf::hc_fuses_cpu(g.n_embd);
+    // (deepseek41: not before an Engram layer - its separate hc_post writes the FFN's output before the next read)
+    const bool hc_cpu = lane && hc_cpu_env && g.dsv4() && !F->defer && !Ly.mtp && !Ly.exl3 && !F->prof_on &&
+                        !dumps && il + 1 < l1_ && !(g.v41 && F->L[(size_t) il + 1].eng >= 0) && !(pf && pf_at == 2) &&
+                        !F->kda_graph_on && gf::hc_fuses_cpu(g.n_embd);
     if (F->defer && !Ly.mtp) {
         if (il == l1_ - 1) {   // the trunk's (or this part's) last layer: nothing after it here to defer into
             gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
