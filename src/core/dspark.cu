@@ -565,6 +565,7 @@ void Glm5Model::dspark_upload() {
 }
 
 bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err) {
+    if (dsp_ == nullptr && q35_mtp_on()) return q35_mtp_draft(y, drafts, conf, err);   // (qwen35moe's NextN block)
     auto* D = (DSparkState*) dsp_;
     if (D == nullptr) { err = "dspark: not loaded"; return false; }
     FastState* F = fast_;

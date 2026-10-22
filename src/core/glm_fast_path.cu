@@ -5281,6 +5281,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         cudaEventRecord(F->ev_gs, F->cs);
         F->gap_emb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te0).count();
     }
+    if (q35_mtp_on() && !q35_mtp_pend_commit(token, err)) return false;   // (qwen35moe's drafter: the last row)
     if (!fast_layers(p, false, err)) return false;
     if (dsp_ != nullptr && !dspark_commit(p, 1, false, F->cs)) {
         err = "dspark: the context commit";
@@ -5306,7 +5307,8 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     FastState* FT = tail->fast_;
     cudaSetDevice(tail->dev_);
     if (g.qwen35()) {
-        // (fast_qwen35_layers left head_x / head_xq)
+        // (fast_qwen35_layers left head_x / head_xq); the drafter's row of p waits for the next token
+        if (q35_mtp_on()) q35_mtp_pend_set(p, FT->head_x);
     } else if (g.v41) {
         if (!tail->dsv41_head(err)) return false;
     } else if (g.dsv4()) {

@@ -37,6 +37,8 @@ void attn_decode(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
 void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s);
 /// x[i] *= sigmoid(g[0]), i < n (the shared expert's gate).
 void scale_sigmoid(float* x, int n, const float* g, cudaStream_t s);
+/// x[t][i] *= sigmoid(g[t]) over T rows of n (the window's columns).
+void scale_sigmoid_rows(float* x, int T, int n, const float* g, cudaStream_t s);
 
 // ---- the prompt path: the same layers over T rows (a chunk's sub-batch of tokens, row t = position p0 + t)
 /// R[t] (row stride ldr floats; its first n) += add[t] (add: null adds nothing), then x[t] = rms(R[t]) * w and x16 its
@@ -75,6 +77,12 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
                  int64_t p0, int T, float scale, float* out, cudaStream_t s);
 /// attn_gate over T rows.
 void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_dim, cudaStream_t s);
+/// attn_prep_rows' K / V half alone: k / v rows [T][n_head_kv][head_dim] (k_norm, RoPE) into the caches' rows p0 ..
+/// p0 + T - 1 (the drafter's cache rows, whose queries are never needed).
+void attn_kv_rows(const float* k, const float* v, const float* k_norm, float eps, int n_head_kv, int head_dim, int n_rot,
+                  float rope_base, int64_t p0, int T, uint16_t* kc, uint16_t* vc, cudaStream_t s);
+/// out[0] = softmax(logits)[tok[0]] over n logits (a draft's confidence).
+void top_prob(const float* logits, int n, const int* tok, float* out, cudaStream_t s);
 /// ffn[t] *= sigmoid(x[t] . w) over T rows of n (the shared expert's gate from its input rows).
 void shexp_gate_rows(const float* x, const float* w, float* ffn, int T, int n, cudaStream_t s);
 

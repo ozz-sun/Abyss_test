@@ -3242,7 +3242,41 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (mtp_il_ >= 0 && next_ids != nullptr) {
         int Tv = 0;   // rows whose next token is known (all but possibly the prompt's last)
         while (Tv < T && next_ids[Tv] >= 0) ++Tv;
-        if (Tv > 0) {
+        if (g.qwen35() && Tv > 0) {
+            // qwen35moe: the block's K / V rows alone - eh_proj of [enorm(the next token's embedding) | hnorm(the trunk's
+            // normed hidden)], the attention norm, k / v (k_norm, RoPE) into its caches at the rows' positions
+            const auto& Ly = F->L[(size_t) mtp_il_];
+            const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+            if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
+                err = "glm prefill: no embedding dequantizer for the draft block";
+                return false;
+            }
+            const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
+            if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt mtp embedding", err)) return false;
+            for (int t = 0; t < Tv; ++t)
+                tt->to_float(pack_emb_src_ + (size_t) next_ids[t] * row_b, S->emb_h + (size_t) t * E, E);
+            const int KVq = g.attn_head_kv * g.head_dim;
+            Carve c{S->uni};
+            float* h = c.take<float>((size_t) Tv * E);
+            uint16_t* h16 = c.take<uint16_t>((size_t) Tv * E);
+            float* emb = c.take<float>((size_t) Tv * E);
+            uint16_t* cat16 = c.take<uint16_t>((size_t) Tv * 2 * E);
+            float* hid = c.take<float>((size_t) Tv * E);
+            float* kq = c.take<float>((size_t) Tv * KVq);
+            float* vq = c.take<float>((size_t) Tv * KVq);
+            cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
+            // h = output_norm(R + the last layer's FFN) a row (the tail skip is off with a draft block)
+            q35::add_rms_rows(S->R, 4 * E, S->ffn, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, h16, s);
+            gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
+            hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
+            gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
+            hgemm_q(Ly.ak, KVq, E, S->x16, E, kq, KVq, Tv, 0.0f);
+            hgemm_q(Ly.av, KVq, E, S->x16, E, vq, KVq, Tv, 0.0f);
+            q35::attn_kv_rows(kq, vq, Ly.k_norm, g.norm_eps, g.attn_head_kv, g.head_dim, g.n_rot, g.rope_base, p0, Tv,
+                              Ly.kc, Ly.vc, s);
+            q35_row_done_ = std::max(q35_row_done_, p0 + Tv - 1);
+            S->mark("mtp_rows", s);
+        } else if (Tv > 0) {
             const auto& Ly = F->L[(size_t) mtp_il_];
             const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
             if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {

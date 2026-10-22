@@ -134,6 +134,7 @@ struct VerifyBuf {
     // the attention and recurrence scratch over the columns, the shared expert's gate logit a column
     int q35_layers = 0;                       // delta-net layers in this part
     int64_t q35_p0 = -1;                      // the last window's first position (-1: none)
+    int32_t q35_toks[Glm5Model::kVerifyMax] = {};   // ... its tokens (the drafter's rows take the next ones)
     float *q35_qkv = nullptr, *q35_rows = nullptr, *q35_alpha = nullptr, *q35_beta = nullptr;
     float *q35_snap = nullptr, *q35_csnap = nullptr;
     float *q35_z = nullptr, *q35_o = nullptr, *q35_y = nullptr, *q35_qf = nullptr, *q35_k = nullptr, *q35_v = nullptr,
@@ -147,7 +148,8 @@ bool Glm5Model::verify_ready() const {
     // MoE layers; the head's weights on the last
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const FastState* F = m->fast_;
-        if (F == nullptr || !(m->g_.dsv4() || m->g_.qwen35()) || m->mtp_il_ >= 0 || F->max_pf > 0 || F->n_ahead > 0) return false;
+        if (F == nullptr || !(m->g_.dsv4() || m->g_.qwen35()) || (m->mtp_il_ >= 0 && !m->g_.qwen35()) || F->max_pf > 0 ||
+            F->n_ahead > 0) return false;
         if ((m->g_.v41 || m->g_.qwen35()) && (F->defer || m->split_next_ != nullptr || m != this)) return false;   // (one part, no deferral)
         for (int il = m->l0_; il < m->l1_; ++il)
             if (!F->L[(size_t) il].moe) return false;
@@ -660,7 +662,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     }();
     // (deepseek41: a column's experts right after its own fetch - its SSD reads land in the token path's 8 scratch
     // slots, which every column of a batched window shares)
-    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && !g.v41 && !g.qwen35();
+    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && !g.v41;
     if (g.qwen35() && Ly.sh_gate_w != nullptr) {   // the shared expert's gate logit a column (sigmoid below)
         gf::MvJob jg = {Ly.sh_gate_w, nullptr, V->x + (size_t) tb * E, V->q35_shg + tb, nullptr, 1.0f, gf::kTypeF32, E, 1};
         if (!gf::mvn(&jg, 1, T, s)) { err = "qwen35 verify: the shared expert's gate"; return false; }
@@ -705,6 +707,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         gf::moe_gate_up_cols(Ly.gu_type, V->cols_d + tb, T, k, E, g.n_ff_exp, g.swiglu_exp,
                              (const uint8_t*) V->xq + (size_t) tb * q8e, q8e, hq, V->hq_n, Ly.sh_down.q, Ly.sh_down.type,
                              (const uint8_t*) V->sh_hq + (size_t) tb * shq, shq, FFs, sh_out, E, s);
+        if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // (the shared expert's gate a column)
+            q35::scale_sigmoid_rows(sh_out, T, E, V->q35_shg + tb, s);
         gf::moe_down_cols(Ly.d_type, V->cols_d + tb, T, k, E, g.n_ff_exp, Ly.down_off, hq, V->hq_n,
                           Ly.sh_down.q != nullptr ? sh_out : nullptr, chk ? V->ffn_chk : V->ffn + (size_t) tb * E, E, s);
         if (chk) {   // the same inputs through a launch a column into V->ffn, then the rows compared
@@ -714,6 +718,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                 void* hq1 = (uint8_t*) V->hq + (size_t) t * V->hq_n;
                 gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
                                 hq1, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * shq, FFs, sh_o, s);
+                if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)
+                    q35::scale_sigmoid(sh_o, E, V->q35_shg + t, s);
                 gf::moe_down(Ly.d_type, md, k, E, g.n_ff_exp, Ly.down_off, hq1, Ly.sh_down.q != nullptr ? sh_o : nullptr,
                              V->ffn + (size_t) t * E, s);
             }
@@ -1278,6 +1284,8 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
     const auto mark = [&](int ph) { if (prof) F->mark(names[(size_t) (T - 1) * 5 + ph].c_str()); };
     if (prof) F->mark("v_start");
     V->q35_p0 = p0;
+    for (int t = 0; t < T; ++t) V->q35_toks[t] = toks[(size_t) t];
+    if (q35_mtp_on() && !q35_mtp_pend_commit(toks[0], err)) return false;   // (the drafter: the last position's row)
     int li = 0;
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -1372,11 +1380,21 @@ void Glm5Model::verify_rewind_q35(int64_t pos) {
     auto* V = (VerifyBuf*) vb_;
     FastState* F = fast_;
     if (V == nullptr || F == nullptr || V->q35_p0 < 0) return;
-    const int kept = (int) (pos - V->q35_p0), T = V->T, TM = V->TM;
+    const int64_t p0 = V->q35_p0;
+    const int kept = (int) (pos - p0), T = V->T, TM = V->TM;
     V->q35_p0 = -1;
-    if (kept >= T) return;   // (every column kept: the states are after the window already)
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
+    // the drafter's cache rows of the kept columns whose next token is known (the window's own); the last kept
+    // column's waits for the token after it
+    if (q35_mtp_on() && kept >= 1) {
+        const size_t E = (size_t) g.n_embd;
+        std::string err;
+        if (kept >= 2 && !q35_mtp_rows(p0, kept - 1, V->head_x, E, V->q35_toks + 1, err))
+            std::fprintf(stderr, "qwen35 mtp: the window's rows: %s\n", err.c_str());
+        q35_mtp_pend_set(p0 + kept - 1, V->head_x + (size_t) (kept - 1) * E);
+    }
+    if (kept >= T) return;   // (every column kept: the states are after the window already)
     const int C = g.ssm_conv_dim(), Sd = g.ssm_state, HK = g.ssm_k_heads, HV = g.ssm_v_heads;
     const size_t state_n = (size_t) Sd * HV * Sd, conv_n = (size_t) C * (g.d_conv - 1);
     int li = 0;

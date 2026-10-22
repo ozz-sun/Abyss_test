@@ -54,6 +54,10 @@ __global__ void scale_sigmoid_kernel(float* __restrict__ x, int n, const float* 
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= sigmoid_f(g[0]);
 }
+__global__ void scale_sigmoid_rows_kernel(float* __restrict__ x, int n, const float* __restrict__ g) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (i < n) x[(size_t) t * n + i] *= sigmoid_f(g[t]);
+}
 __global__ void attn_gate_kernel(float* __restrict__ o, const float* __restrict__ qf, int n_head) {
     const int h = blockIdx.x, d = threadIdx.x;
     if (h < n_head) o[h * kD + d] *= sigmoid_f(qf[(size_t) h * 2 * kD + kD + d]);
@@ -449,6 +453,25 @@ __global__ void attn_gate_rows_kernel(float* __restrict__ o, const float* __rest
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     o[((size_t) t * n_head + h) * kD + d] *= sigmoid_f(qf[((size_t) t * n_head + h) * 2 * kD + kD + d]);
 }
+// out[0] = exp(l[tok] - max) / sum exp(l - max): one block of 256
+__global__ void __launch_bounds__(256) top_prob_kernel(const float* __restrict__ l, int n, const int* __restrict__ tok,
+                                                       float* __restrict__ out) {
+    __shared__ float sred[8];
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += 256) m = fmaxf(m, l[i]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) sred[threadIdx.x >> 5] = m;
+    __syncthreads();
+    m = sred[0];
+#pragma unroll
+    for (int w = 1; w < 8; ++w) m = fmaxf(m, sred[w]);
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 256) sum += expf(l[i] - m);
+    sum = block_sum256(sum, sred);
+    if (threadIdx.x == 0) out[0] = expf(l[tok[0]] - m) / sum;
+}
 // ffn[t] *= sigmoid(x[t] . w): a block a row
 __global__ void __launch_bounds__(256) shexp_gate_rows_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                                               float* __restrict__ ffn, int n) {
@@ -519,6 +542,11 @@ void scale_sigmoid(float* x, int n, const float* g, cudaStream_t s) {
     if (n <= 0) return;
     scale_sigmoid_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n, g);
     check("scale_sigmoid");
+}
+void scale_sigmoid_rows(float* x, int T, int n, const float* g, cudaStream_t s) {
+    if (n <= 0 || T <= 0) return;
+    scale_sigmoid_rows_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(x, n, g);
+    check("scale_sigmoid_rows");
 }
 
 // ---- the prompt path
@@ -618,6 +646,20 @@ void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_d
     if (T <= 0 || head_dim != kD) return;
     attn_gate_rows_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(o, q_full, n_head);
     check("attn_gate_rows");
+}
+void attn_kv_rows(const float* k, const float* v, const float* k_norm, float eps, int n_head_kv, int head_dim, int n_rot,
+                  float rope_base, int64_t p0, int T, uint16_t* kc, uint16_t* vc, cudaStream_t s) {
+    if (T <= 0 || head_dim != kD) return;
+    // n_head 0: every block a KV head (the q blocks come first in attn_prep_rows_kernel's numbering)
+    attn_prep_rows_kernel<<<dim3((unsigned) n_head_kv, (unsigned) T), kD, 0, s>>>(k, k, v, k_norm, k_norm, eps, 0,
+                                                                                n_head_kv, n_rot, rope_base, p0, kc, vc,
+                                                                                nullptr);
+    check("attn_kv_rows");
+}
+void top_prob(const float* logits, int n, const int* tok, float* out, cudaStream_t s) {
+    if (n <= 0) return;
+    top_prob_kernel<<<1, 256, 0, s>>>(logits, n, tok, out);
+    check("top_prob");
 }
 void shexp_gate_rows(const float* x, const float* w, float* ffn, int T, int n, cudaStream_t s) {
     if (T <= 0) return;

@@ -609,6 +609,13 @@ struct Glm5Model::FastState {
     int ram_slack = 0;           // extra RAM-tier slots per MoE layer (STRATA_GLM_RAM_SLACK; default 16 resident)
     // ---- STRATA_GLM_PROF=1: a cudaEvent after every launch, the gaps summed per kernel name (debug only)
     bool prof_on = false;
+    // qwen35moe's NextN drafter: the pending position's normed hidden, the row kernels' scratch (<= kVerifyMax rows),
+    // the chain's tokens and confidences
+    float *q35_pend_h = nullptr, *q35_mt_emb = nullptr, *q35_mt_hid = nullptr, *q35_mt_x = nullptr, *q35_mt_k = nullptr,
+          *q35_mt_v = nullptr, *q35_mt_conf = nullptr;
+    void *q35_mt_cat = nullptr, *q35_mt_xq = nullptr;
+    int* q35_mt_tok = nullptr;
+    float *q35_mt_conf_h = nullptr, *q35_mt_conf_d = nullptr;   // ... a step's confidence, host-mapped (the chain stops early)
     bool kda_graph_on = false;   // experimental, single-device ordinary decode only
     // the CPU lane's answer of the last MoE, left to the next layer's attention-side hc3 read (fast_moe, HIP:
     // STRATA_GLM_HC_CPU) - with the paced promotion copies, which go out after that read as they did after the wait

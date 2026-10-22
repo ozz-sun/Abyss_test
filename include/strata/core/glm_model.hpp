@@ -468,6 +468,15 @@ public:
     bool verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // deepseek41's (one part)
     bool verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // qwen35moe's (one part)
     void verify_rewind_q35(int64_t pos);   // qwen35moe: the recurrent states back to after the kept columns
+    // qwen35moe's NextN block as the drafter (behind the dspark_* hooks; qwen35_fast_path.cu): a position's cache row
+    // needs its normed hidden and the NEXT token, so a position waits in q35_pend_pos_ until that token is known
+    bool q35_mtp_on() const;
+    bool q35_mtp_pend_commit(int32_t next, std::string& err);
+    void q35_mtp_pend_set(int64_t p, const float* h);
+    bool q35_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_stride, const int32_t* next, std::string& err);
+    bool q35_mtp_step(int64_t p, const int* tok_dev, const float* h, float* conf_out, int* tok_out, std::string& err);
+    bool q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
+    int64_t q35_pend_pos_ = -1, q35_row_done_ = -1;
     const Glm5Model* verify_tail() const;
     // the conversation snapshot's deepseek4 state: every layer's window ring and compressor rings (the compressed
     // caches are append-only by position - a row is written exactly when it becomes visible - so the position alone
@@ -573,7 +582,7 @@ public:
     /// token, window (the kept columns) and prompt chunk by itself.  dspark_draft(y): the block at position() with y,
     /// the pending token -> 5 drafts and their confidences (host; waits for the device).  dspark_upload: the expert
     /// cache's copies the last draft planned - after the window is queued, so they run under it.
-    bool dspark_ready() const { return dsp_ != nullptr; }
+    bool dspark_ready() const { return dsp_ != nullptr || q35_mtp_on(); }
     bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     void dspark_upload();
     void dspark_report() const;

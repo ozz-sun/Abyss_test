@@ -13,6 +13,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -69,6 +70,11 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         Ly.k_norm = f32("attn_k_norm.weight");
     }
     if (Ly.moe && g.n_shared > 0) Ly.sh_gate_w = f32("ffn_gate_inp_shexp.weight");
+    if (Ly.mtp) {   // the NextN block: eh_proj in (2 n_embd -> n_embd) and its two norms; the head's norm the trunk's
+        Ly.eh = q("nextn.eh_proj.weight", 2 * E, E);
+        Ly.enorm = f32("nextn.enorm.weight");
+        Ly.hnorm = f32("nextn.hnorm.weight");
+    }
 }
 
 bool Glm5Model::qwen35_alloc(std::string& err) {
@@ -79,11 +85,16 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     const size_t ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
     const size_t state_b = al(S * HV * S * 4), conv_b = al(C * (size_t) (g.d_conv - 1) * 4), cache_b = al(ctx * KV * 2);
     int n_rec = 0, n_attn = 0;
-    for (int il = l0_; il < l1_; ++il) (F->L[(size_t) il].recr ? n_rec : n_attn) += 1;
+    for (int il = l0_; il < lt_; ++il) (F->L[(size_t) il].recr ? n_rec : n_attn) += 1;   // (lt_: the NextN block too)
     const size_t part = q35::attn_part_floats(g.n_head, g.head_dim, (int) ctx);
     size_t bytes = (size_t) n_rec * (state_b + conv_b) + (size_t) n_attn * 2 * cache_b;
     bytes += al(C * 4) + al(V * 4) + al(C * 4) + al(2 * HV * 4) + al(HV * 4) + al(V * 4) + al(V * 4) + al(V / 32 * 36) +
              al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
+    const size_t E = (size_t) g.n_embd, TM = (size_t) kVerifyMax;
+    const bool mtp = mtp_il_ >= 0;
+    if (mtp)   // the drafter: the pending hidden, <= kVerifyMax rows of scratch, the chain's tokens and confidences
+        bytes += al(E * 4) + al(TM * E * 4) * 3 + al(TM * (E / 32) * 36) + al(TM * (2 * E / 32) * 36) + al(TM * KV * 4) * 2 +
+                 al(TM * 4) * 2;
     if (cudaMalloc(&qwen35_state_, bytes) != cudaSuccess) {
         cudaGetLastError();
         err = "qwen35moe: the states and caches (" + std::to_string(bytes >> 20) + " MB for " + std::to_string(ctx) +
@@ -97,7 +108,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
         at += al(b);
         return p;
     };
-    for (int il = l0_; il < l1_; ++il) {
+    for (int il = l0_; il < lt_; ++il) {
         auto& Ly = F->L[(size_t) il];
         if (Ly.recr) {
             Ly.gdn_state = (float*) take(S * HV * S * 4);
@@ -123,6 +134,23 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     F->q35_aoq = take(HD / 32 * 36);
     F->q35_part = (float*) take(part * 4);
     F->q35_shg = (float*) take(256);
+    if (mtp) {
+        F->q35_pend_h = (float*) take(E * 4);
+        F->q35_mt_emb = (float*) take(TM * E * 4);
+        F->q35_mt_hid = (float*) take(TM * E * 4);
+        F->q35_mt_x = (float*) take(TM * E * 4);
+        F->q35_mt_xq = take(TM * (E / 32) * 36);
+        F->q35_mt_cat = take(TM * (2 * E / 32) * 36);
+        F->q35_mt_k = (float*) take(TM * KV * 4);
+        F->q35_mt_v = (float*) take(TM * KV * 4);
+        F->q35_mt_conf = (float*) take(TM * 4);
+        F->q35_mt_tok = (int*) take(TM * 4);
+        if (cudaHostAlloc((void**) &F->q35_mt_conf_h, 256, cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &F->q35_mt_conf_d, F->q35_mt_conf_h, 0) != cudaSuccess) {
+            err = "qwen35moe: the drafter's host-mapped word did not allocate";
+            return false;
+        }
+    }
     std::fprintf(stderr, "qwen35moe: CUDA%d %d delta-net layers (states %.0f MB), %d attention layers (KV caches %.2f GB "
                          "for %lld tokens)\n", dev_, n_rec, (double) n_rec * (state_b + conv_b) / 1048576.0, n_attn,
                  (double) n_attn * 2 * cache_b / 1073741824.0, (long long) ctx);
@@ -140,7 +168,138 @@ void Glm5Model::qwen35_reset() {
         cudaMemsetAsync(Ly.gdn_state, 0, S * HV * S * 4, F->cs);
         cudaMemsetAsync(Ly.gdn_conv, 0, C * (size_t) (g.d_conv - 1) * 4, F->cs);
     }
+    q35_pend_pos_ = q35_row_done_ = -1;
     cudaStreamSynchronize(F->cs);
+}
+
+// ---------------------------------------------------------------- the NextN block as the drafter
+// The block (llama.cpp's graph_mtp): h = the trunk's output_norm'd hidden at a position, e = the NEXT token's
+// embedding -> eh_proj([enorm(e) | hnorm(h)]) -> an attention layer (its own KV cache, a row a position) -> the MoE ->
+// output_norm -> the trunk's head: the logits of the token after the next.  A cache row needs only the position's
+// (h, next token) through eh_proj and k / v, so a position waits (q35_pend_pos_) until its next token arrives
+// (fast_token, a window's first token, or a draft), then its row is written; a draft step at the pending position
+// writes the row itself.  Chained drafts feed the block its own normed output as h and its argmax as the token.
+bool Glm5Model::q35_mtp_on() const {
+    return g_.qwen35() && mtp_il_ >= 0 && fast_ != nullptr && fast_->emb_tab_d != nullptr && fast_->q35_pend_h != nullptr;
+}
+
+void Glm5Model::q35_mtp_pend_set(int64_t p, const float* h) {
+    FastState* F = fast_;
+    cudaMemcpyAsync(F->q35_pend_h, h, (size_t) g_.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+    q35_pend_pos_ = p;
+}
+
+bool Glm5Model::q35_mtp_pend_commit(int32_t next, std::string& err) {
+    if (q35_pend_pos_ < 0 || q35_pend_pos_ <= q35_row_done_) {   // (none, or a draft step wrote it)
+        q35_pend_pos_ = -1;
+        return true;
+    }
+    const int64_t p = q35_pend_pos_;
+    q35_pend_pos_ = -1;
+    return q35_mtp_rows(p, 1, fast_->q35_pend_h, 0, &next, err);
+}
+
+// the cache rows of positions p0 .. p0 + n - 1 (n <= kVerifyMax) from their normed hiddens (h_stride floats apart) and
+// their next tokens: eh_proj over the rows in one mvn launch, the attention norm a row, k / v in one launch
+bool Glm5Model::q35_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_stride, const int32_t* next, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    if (n <= 0) return true;
+    if (n > kVerifyMax) { err = "qwen35 mtp: " + std::to_string(n) + " rows (at most " + std::to_string(kVerifyMax) + ")"; return false; }
+    const int il = mtp_il_, E = g.n_embd, D = g.head_dim, KV = g.attn_head_kv * D;
+    const size_t q8e = (size_t) (E / 32) * 36, cat_b = (size_t) (2 * E / 32) * 36;
+    const auto& Ly = F->L[(size_t) il];
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "qwen35 mtp rows", err)) return false;   // (tok_in_h may feed an earlier copy)
+    for (int t = 0; t < n; ++t) F->tok_in_h[t] = next[t];
+    if (!gf::embed_rows_q(pack_emb_type_, F->emb_tab_d, F->tok_in_d, n, E, F->q35_mt_emb, s)) { err = "qwen35 mtp: the embedding rows"; return false; }
+    for (int t = 0; t < n; ++t)
+        gf::mtp_in(F->q35_mt_emb + (size_t) t * E, h_rows + (size_t) t * h_stride, Ly.enorm, Ly.hnorm, g.norm_eps, E,
+                   (uint8_t*) F->q35_mt_cat + (size_t) t * cat_b, s);
+    gf::MvJob eh = {Ly.eh.q, F->q35_mt_cat, nullptr, F->q35_mt_hid, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
+    if (!gf::mvn(&eh, 1, n, s)) { err = "qwen35 mtp: eh_proj rows"; return false; }
+    for (int t = 0; t < n; ++t)
+        gf::rms_q8(F->q35_mt_hid + (size_t) t * E, nullptr, Ly.attn_norm, g.norm_eps, E, F->q35_mt_x + (size_t) t * E,
+                   (uint8_t*) F->q35_mt_xq + (size_t) t * q8e, s);
+    gf::MvJob j[2];
+    j[0] = {Ly.ak.q, F->q35_mt_xq, F->q35_mt_x, F->q35_mt_k, nullptr, 1.0f, Ly.ak.type, E, KV};
+    j[1] = {Ly.av.q, F->q35_mt_xq, F->q35_mt_x, F->q35_mt_v, nullptr, 1.0f, Ly.av.type, E, KV};
+    if (!gf::mvn(j, 2, n, s)) { err = "qwen35 mtp: k / v rows"; return false; }
+    q35::attn_kv_rows(F->q35_mt_k, F->q35_mt_v, Ly.k_norm, g.norm_eps, g.attn_head_kv, D, g.n_rot, g.rope_base, p0, n,
+                      Ly.kc, Ly.vc, s);
+    q35_row_done_ = std::max(q35_row_done_, p0 + n - 1);
+    return true;
+}
+
+// one draft step at position p: the block whole (its row written on the way), the head, the argmax (tok_out, on the
+// device) and its probability (conf_out); F->head_x holds the block's normed output for a chained step
+bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, float* conf_out, int* tok_out, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int il = mtp_il_, E = g.n_embd;
+    const auto& Ly = F->L[(size_t) il];
+    if (!gf::embed_rows_q(pack_emb_type_, F->emb_tab_d, tok_dev, 1, E, F->emb, s)) { err = "qwen35 mtp: the embedding"; return false; }
+    gf::mtp_in(F->emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
+    gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
+    if (!gf::mv(&eh, 1, s)) { err = "qwen35 mtp: eh_proj"; return false; }
+    gf::rms_q8(F->mtp_h, nullptr, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
+    if (!fast_qwen35_attn(il, p, err)) return false;
+    gf::rms_q8(F->mtp_h, F->mixer, Ly.post_norm, g.norm_eps, E, F->x, F->xq, s);
+    bool pf_pending = false;
+    if (!fast_moe(il, pf_pending, err)) return false;
+    gf::rms_q8(F->mtp_h, F->ffn, w_.at("output_norm.weight"), g.norm_eps, E, F->head_x, F->head_xq, s);
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
+    if (ow.type == 0) o.w = ow.f32;
+    if (!gf::mv(&o, 1, s)) { err = "qwen35 mtp: the head"; return false; }
+    gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
+    q35::top_prob(F->mtp_logits, g.n_vocab, F->mtp_tok, conf_out, s);
+    cudaMemcpyAsync(tok_out, F->mtp_tok, sizeof(int), cudaMemcpyDeviceToDevice, s);
+    return true;
+}
+
+// the drafts after y (the token at position(), pending): up to STRATA_Q35_MTP_K (1..5, default 3) chained steps from
+// the pending position, each the block over the previous step's argmax and normed output; a draft's confidence is
+// its softmax probability, read after every step (host-mapped) - the chain stops at the first below
+// STRATA_Q35_MTP_MIN (default STRATA_DS4_DSPARK_THR's 0.6: the decode would drop the rest anyway)
+bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::string& err) {
+    FastState* F = fast_;
+    for (int k = 0; k < 5; ++k) {
+        drafts[k] = -1;
+        conf[k] = 0.0f;
+    }
+    if (q35_pend_pos_ < 0) return true;   // (no position to draft from)
+    static const int kmax = [] {
+        const char* v = getenv("STRATA_Q35_MTP_K");
+        return v != nullptr ? std::max(1, std::min(5, std::atoi(v))) : 3;
+    }();
+    static const float stop_below = [] {
+        const char* v = getenv("STRATA_Q35_MTP_MIN");
+        if (v == nullptr) v = getenv("STRATA_DS4_DSPARK_THR");
+        return v != nullptr ? (float) std::atof(v) : 0.6f;
+    }();
+    cudaStream_t s = F->cs;
+    const int64_t p = q35_pend_pos_;
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "qwen35 mtp draft", err)) return false;   // (tok_in_h)
+    F->tok_in_h[0] = y;
+    int n = 0;
+    for (int k = 0; k < kmax; ++k) {
+        if (!q35_mtp_step(p + k, k == 0 ? F->tok_in_d : F->mtp_tok, k == 0 ? F->q35_pend_h : F->head_x,
+                          F->q35_mt_conf_d, F->q35_mt_tok + k, err))
+            return false;
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "qwen35 mtp draft step", err)) return false;
+        conf[k] = F->q35_mt_conf_h[0];
+        n = k + 1;
+        if (conf[k] < stop_below) break;
+    }
+    int toks[5];
+    cudaMemcpy(toks, F->q35_mt_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost);
+    if (!F->route_ok(err)) return false;
+    for (int k = 0; k < n; ++k) drafts[k] = toks[k];
+    q35_row_done_ = std::max(q35_row_done_, p);   // (the step at p wrote its row from the real h and y)
+    q35_pend_pos_ = -1;
+    return true;
 }
 
 // GLM_CB_DIR seam dumps under llama.cpp's cb names (<name>-<layer>.f32; with GLM_CB_POS=1 <name>-<layer>@<pos>.f32,

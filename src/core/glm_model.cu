@@ -235,24 +235,37 @@ static const char* const kMtpF32[] = {"attn_norm.weight", "ffn_norm.weight", "at
                                       "attn_kv_a_norm.weight", "indexer.k_norm.weight", "indexer.k_norm.bias",
                                       "indexer_compressor_ape.weight", "exp_probs_b.bias", "nextn.enorm.weight",
                                       "nextn.hnorm.weight", "nextn.shared_head_norm.weight"};
+// qwen35moe's NextN block: a full-attention layer and its MoE behind eh_proj (natively served Q8_0), the router, the
+// gates and the norms F32; no BF16 projections, no shared head norm (the trunk's output_norm and head)
+static const char* const kMtpRawQ35[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+                                         "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                                         "nextn.eh_proj.weight"};
+static const char* const kMtpF32Q35[] = {"attn_norm.weight", "post_attention_norm.weight", "attn_q_norm.weight",
+                                         "attn_k_norm.weight", "ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight",
+                                         "nextn.enorm.weight", "nextn.hnorm.weight"};
 
 // ... and the VRAM they take
 static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const std::string&)>& find, int il,
-                           uint64_t& bytes, std::string& err) {
+                           bool q35, uint64_t& bytes, std::string& err) {
     const std::string P = "blk." + std::to_string(il) + ".";
     bytes = 0;
-    for (const char* n : kMtpRaw) {
+    const std::vector<const char*> raw(q35 ? std::begin(kMtpRawQ35) : std::begin(kMtpRaw),
+                                       q35 ? std::end(kMtpRawQ35) : std::end(kMtpRaw));
+    const std::vector<const char*> b16(q35 ? std::end(kMtpB16) : std::begin(kMtpB16), std::end(kMtpB16));
+    const std::vector<const char*> f32(q35 ? std::begin(kMtpF32Q35) : std::begin(kMtpF32),
+                                       q35 ? std::end(kMtpF32Q35) : std::end(kMtpF32));
+    for (const char* n : raw) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
                  ~(uint64_t) 255u;
     }
-    for (const char* n : kMtpB16) {
+    for (const char* n : b16) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
     }
-    for (const char* n : kMtpF32) {
+    for (const char* n : f32) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
@@ -1451,7 +1464,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         const strata::TensorInfo* tu = findm(P + "ffn_up_exps.weight");
         const strata::TensorInfo* td = findm(P + "ffn_down_exps.weight");
         if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
-            mtp_dense_vram(findm, L, b, e2)) {
+            mtp_dense_vram(findm, L, g.qwen35(), b, e2)) {
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
             mtp_dense = (double) b;
@@ -3124,7 +3137,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded)
     if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
-        (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr)) {   // any split: the speculative decode runs on 2+ parts
+        (l0_ > 0 || g_.qwen35() || getenv("STRATA_GLM_MTP") != nullptr)) {   // any split: the speculative decode runs on 2+ parts; qwen35moe: its drafter
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
     }
@@ -3421,9 +3434,12 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return true;   // a GGUF without the draft block
     }
     const auto x3 = [&](const std::string& n) { return exl3_ && xt.mats.count(n) != 0; };
-    const auto& raw_names = kMtpRaw;
-    const auto& b16_names = kMtpB16;
-    const auto& f32_names = kMtpF32;
+    const bool q35 = g_.qwen35();
+    const std::vector<const char*> raw_names(q35 ? std::begin(kMtpRawQ35) : std::begin(kMtpRaw),
+                                             q35 ? std::end(kMtpRawQ35) : std::end(kMtpRaw));
+    const std::vector<const char*> b16_names(q35 ? std::end(kMtpB16) : std::begin(kMtpB16), std::end(kMtpB16));
+    const std::vector<const char*> f32_names(q35 ? std::begin(kMtpF32Q35) : std::begin(kMtpF32),
+                                             q35 ? std::end(kMtpF32Q35) : std::end(kMtpF32));
     uint64_t bytes = 0;
     if (exl3_) {
         for (const char* n : raw_names) {
@@ -3441,7 +3457,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
             bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
         }
-    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err)) {
+    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, q35, bytes, err)) {
         return false;
     }
     if (cudaMalloc(&mtp_arena_, bytes) != cudaSuccess) {
@@ -3582,6 +3598,16 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     if (tg == nullptr || tu == nullptr || td == nullptr || tg->type != tu->type) {
         err = "mtp: the draft block's routed experts are missing or mixed";
         return false;
+    }
+    if (!strata::kernels::glmf::moe_supported((int) tg->type) || !strata::kernels::glmf::moe_supported((int) td->type)) {
+        // (unsloth's Ornith-1.5-122B: Q8_0 experts in the block, which the decode's expert kernels do not take)
+        std::fprintf(stderr, "glm mtp: CUDA%d the NextN block's experts are %s / %s, which the expert kernels do not serve - "
+                             "no drafts from it (tools/nextn_pack.py repacks the block with Q4_K experts; "
+                             "STRATA_GLM_MTP_GGUF=<that file> loads it)\n", dev_, ggml_type_name((ggml_type) tg->type),
+                     ggml_type_name((ggml_type) td->type));
+        cudaFree(mtp_arena_);
+        mtp_arena_ = nullptr;
+        return true;
     }
     if (!strata::kernels::cpu::native_fmt((int) tg->type, (int) td->type, g_.n_embd, g_.n_ff_exp, nl.fmt, err)) return false;
     nl.gate_shard = sg;
