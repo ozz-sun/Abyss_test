@@ -65,6 +65,22 @@ was made from).
 Its experts are 30% smaller, so fewer of them come from the SSD. The quality loss is clear (every one of the 8 texts,
 KL up to 0.51), so it is the pick when speed matters more than accuracy.
 
+**The four files on an AI PRO R9700 + Radeon 8060S lane** (2026-10-22, v1.3.46's build, 60 GB RAM tier, the same SSD;
+8 held-out texts, a token in ms / KL against the unquantized model, the disk tail skip `STRATA_GLM_TAIL_SKIP=3
+STRATA_GLM_TAIL_SKIP_DISK=1` on and off):
+
+| | size | exact routing | with the tail skip |
+| --- | ---: | :---: | :---: |
+| unsloth UD-IQ2_XXS | 300 GB | **57.8 / 0.186** | **41.1 / 0.209** |
+| nazeshinjite Q2 | 366 GB | - | 50.7 / 0.243 |
+| unsloth UD-IQ1_M | 266 GB | 48.7 / 0.270 | 37.7 / 0.281 |
+| unsloth UD-IQ1_S | 233 GB | 36.7 / 0.354 | 31.3 / 0.359 |
+
+unsloth's UD-IQ2_XXS is the pick from v1.3.46: nazeshinjite Q2's speed with 66 GB less on the SSD and a clearly lower
+KL (0.186 against 0.228). The AMD build now carries V4.1's RDNA expert kernels, the CPU lane's IQ1_S rows and the verify
+windows (the n-gram drafts: a copy task 36 -> 28 ms a token with one draft, 25 with three); against v1.3.45's build
+UD-IQ1_S went 43.9 -> 36.9 ms a token with the lane (52.0 -> 44.0 without), UD-IQ2_XXS 62.7 -> 60.8 (69.6 -> 66.6).
+
 The `deepseek41` GGUFs from kyuz0 / antirez named "v4.1" without `1017` are the September checkpoint
 (`general.source.revision` `df42c109`); check the revision before trusting a repo name. Lucebox's ROCMFP files use
 their own expert types (107 / 104), which Abyss does not read; their dense tensors and Engram tables do (a hybrid,

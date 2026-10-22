@@ -7,7 +7,12 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased
+## v1.3.46 - 2026-10-22
+
+**Ornith-1.5-122B (Qwen3.5-MoE) runs on the engine, on HIP and CUDA - a prompt path, a verify window and the GGUF's
+NextN block as the drafter; DeepSeek V4.1 gets the AMD speed-ups V4 had (RDNA expert kernels, the CPU lane's IQ1_S
+rows, hc3, the verify windows) and unsloth's UD-IQ2_XXS as the recommended file; the prompt router on HIP; the RAM
+fill for the disk tail skip (issue #8).**
 
 **Ornith-1.5-122B (Qwen3.5-MoE, llama.cpp's `qwen35moe`): a new model family on the engine, on HIP and CUDA
 ([docs/ornith/README.md](docs/ornith/README.md)).**
@@ -42,6 +47,23 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - The prompt path's F32 router (DeepSeek V4.1, Ornith) on HIP through the engine's own tile GEMM: rocBLAS's F32
   GEMM took 15.7 ms a layer inside the engine (a third of an Ornith prompt: 575 tokens 233 -> 359 tok/s on an AI PRO
   R9700) against 0.2 ms for the same shape alone; CUDA keeps cuBLAS.
+
+**DeepSeek V4.1 on AMD: the speed-ups V4 had, at V4.1's shapes
+([docs/deepseek41/README.md](docs/deepseek41/README.md)).**
+- RDNA expert kernels at V4.1's 5120 / 2304 (gfx1201, gfx1151): IQ2_XS / IQ2_S gate/up, IQ2_XXS / IQ2_XS / IQ3_XXS /
+  IQ2_S down - an AI PRO R9700 101 / 106 us a gate/up call of 8 experts (125 / 131 before), the down 46-56 us (67-81);
+  the Radeon 8060S lane 249 / 273 (261 / 301). Bit-identical sums.
+- The CPU lane: IQ1_S multi-token rows in AVX-512 VBMI; IQ2_S one-token rows back to ggml's dot (faster there).
+- hc3 at V4.1's width (5120: 40 blocks, its lagged collapse) with the CPU lane's answer added inside the next layer's
+  read, as V4's.
+- The verify windows (the batched kind) run on V4.1: the n-gram drafts - a copy task 35.9-36.3 -> 27.7-28.2 ms a token
+  with one draft, 24.7-24.8 with three (the greedy tokens identical across 0 / 1 / 3 / 5 drafts).
+- Measured, 8 held-out sequences, R9700 + 8060S lane, the tail skip (3, disk) on: unsloth UD-IQ2_XXS 41.1 ms a token at
+  KL 0.209 (57.8 / 0.186 without the skip), UD-IQ1_M 37.7 / 0.281, UD-IQ1_S 31.3 / 0.359, nazeshinjite Q2 50.7 / 0.243.
+  Against the build before: UD-IQ1_S 43.9 -> 36.9 ms with the lane, 52.0 -> 44.0 without; UD-IQ2_XXS 62.7 -> 60.8 /
+  69.6 -> 66.6. The docs now recommend unsloth's UD-IQ2_XXS (300 GB) over nazeshinjite's Q2 (366 GB): the same speed
+  at KL 0.186 against 0.228.
+- `STRATA_DS4_WIN_TIMING=1` (the window's host phases) and profile marks for the window (`v<T>_*`, `vm_*`).
 
 **The RAM fill: with the disk tail skip, the most routed experts that sit on the SSD alone are read into the RAM tier
 in the background (issue #8).**

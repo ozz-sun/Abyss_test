@@ -76,8 +76,9 @@ the APU's iGPU as a lane).
 | | huihui-ai's abliterated Q2, antirez's deepseek-v4-gguf (`--compat-bf16`) | ~83 GB | runs (KL 0.0075 against llama.cpp) |
 | | unsloth's other quants with these expert types: IQ1_S-IQ4_XS, Q2_K-Q6_K, MXFP4 | | should run, untested |
 | | DeepSeek's DSpark drafter for it, bleysg's [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF) (`--dspark`, v1.3.43) | 6.9 GB | measured on an AI PRO R9700 (swe-bench +28%); NVIDIA: builds, not measured |
-| DeepSeek V4.1 Flash 1017 | nazeshinjite [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) (the default) | 366 GB | measured, swe-bench 34 of the first 35 |
-| | unsloth [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (v1.3.38) | 233 GB | measured: 32% faster, lower quality |
+| DeepSeek V4.1 Flash 1017 | unsloth [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (the pick from v1.3.46) | 300 GB | measured: nazeshinjite Q2's speed at KL 0.186 against 0.228 |
+| | nazeshinjite [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | measured, swe-bench 34 of the first 35 |
+| | unsloth [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (v1.3.38), UD-IQ1_M | 233 / 266 GB | measured: faster, lower quality (KL 0.36 / 0.27) |
 | | mrfakename Q2_K; Lucebox dense + Engram with mrfakename's experts (a hybrid) | 247 / 201 GB | runs: low quality alone / the most accurate, slow |
 | | unsloth's other quants, Project Maya's Maya-S | 178-508 GB | same layout as UD-IQ1_S, untested |
 | Ornith-1.5-122B (Qwen3.5-MoE, [docs/ornith](docs/ornith/README.md)) | unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF) (v1.3.46) | 79.7 GB | measured on an AI PRO R9700: 42 tok/s, KL 0.024 against llama.cpp; NVIDIA: builds, not measured |
