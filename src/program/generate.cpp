@@ -1626,9 +1626,11 @@ static int glm_pack_generate(const Options& o) {
             // below STRATA_DS4_DSPARK_NGRAM_P (default 0.75): the drafter takes over (new code: 22% of 5 accepted,
             // which cost DSpark's steps their windows); else the repeat's drafts while the product of the shares
             // stays >= STRATA_DS4_DSPARK_NGRAM_CHAIN (default 0.5: swe-bench t025's 5 drafts were 53% accepted)
-            static const float d_thr = [] {
+            // (qwen35moe's NextN drafter: 0.5 - its drafts are cheaper than DSpark's and the window's columns dearer
+            // than a token; prose 21.0 -> 20.0 ms a token against 0.6, 0.4 worse)
+            const float d_thr = [&] {
                 const char* v = std::getenv("STRATA_DS4_DSPARK_THR");
-                return v != nullptr ? (float) std::atof(v) : 0.6f;
+                return v != nullptr ? (float) std::atof(v) : model.q35_mtp_on() ? 0.5f : 0.6f;
             }();
             static const int d_max = [] {   // STRATA_DS4_DSPARK_K: drafts a window at most (1..5)
                 const char* v = std::getenv("STRATA_DS4_DSPARK_K");

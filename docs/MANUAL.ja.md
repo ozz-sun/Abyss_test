@@ -374,7 +374,8 @@ llama.cpp の `qwen35moe`）も動かします。gated delta-net 層 36 + full a
   0.027〜0.029）。
 - **投機デコード。** n-gram ドラフトが検証窓を通って動きます（既定は 1 窓 1 ドラフト、`STRATA_DS4_SPEC=<k>` で増やす）:
   コピー課題で 1 ドラフト 57 tok/s、3 ドラフト 76 tok/s。GGUF の NextN ブロックもドラフターになります（エキスパートを
-  `tools/nextn_pack.py` で詰め直して `STRATA_GLM_MTP_GGUF` で読む）: コード 59 tok/s、散文 48、コピー課題 85。
+  `tools/nextn_pack.py` で詰め直して `STRATA_GLM_MTP_GGUF` で読む）: コード 59 tok/s、散文 50、コピー課題 85
+  （iGPU なしでは コード 36 → 42、散文 33 → 39）。
 - **まだないもの:** 会話スロット、レイヤー分割、画像。CUDA ビルドはコンパイルは通るが未実行。エキスパートカーネルは
   この形状にまだ調整していない。
 

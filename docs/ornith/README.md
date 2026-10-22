@@ -84,7 +84,8 @@ systemd-run --user --scope -p MemoryMax=88G .venv/bin/python serve/server.py --e
 | decode (every expert in VRAM or the RAM tier, the 8060S computing the lane) | 23.0-24.6 ms a token (41-43 tok/s) |
 | ... the CPU computing the lane instead (`STRATA_GLM_IGPU=0`: a PC without an iGPU) | 30.3 ms a token (33 tok/s) |
 | a copy task with the engine's n-gram drafts (the default, `STRATA_DS4_SPEC=1`; `=3`: three drafts) | 17.4 ms a token (57 tok/s); 13.1 (76 tok/s) |
-| with the NextN block's drafts (`STRATA_GLM_MTP_GGUF`, below): code / prose / the copy task | 16.9 (59 tok/s) / 21.0 (48) / 11.8 (85) |
+| with the NextN block's drafts (`STRATA_GLM_MTP_GGUF`, below): code / prose / the copy task | 16.9 (59 tok/s) / 20.0 (50) / 11.8 (85) |
+| ... the CPU computing the lane (no iGPU): code / prose | 24.0 (42 tok/s) / 25.5 (39), from 28.0 / 30.3 |
 | a 575-token prompt through the batched path (chunks up to 32768, sub-batches of 1024) | 233 tok/s |
 | KL against llama.cpp (its CPU backend), 559 positions of a 576-token text | 0.024 |
 | ... the same text, the first half through the prompt path, the 287 positions after it | 0.026 |
@@ -109,7 +110,7 @@ repeats 45 tok/s against 43).
 **The NextN block's drafts.** The GGUF's draft block (`blk.48`: an attention layer and a MoE behind `eh_proj`, fed a
 position's normed hidden state and the next token's embedding) proposes the tokens after the one just sampled, up
 to 3 chained (`STRATA_Q35_MTP_K`), each with its softmax probability; the decode keeps the drafts above
-`STRATA_DS4_DSPARK_THR` (0.6) and verifies them in one window. unsloth's block keeps its experts at Q8_0, which
+`STRATA_DS4_DSPARK_THR` (0.5 for this drafter) and verifies them in one window. unsloth's block keeps its experts at Q8_0, which
 the decode's expert kernels do not serve, so the engine says so and drafts nothing - repack the block once:
 
 ```sh
@@ -121,8 +122,9 @@ the decode's expert kernels do not serve, so the engine says so and drafts nothi
 put `"STRATA_GLM_MTP_GGUF": "<dir>/UD-Q4_K_XL/Ornith-1.5-122B-nextn-q4k.gguf"` in the config's `env`. The block's
 experts take their share of the expert pool and the RAM tier like a 49th layer (its cache rows are written for every
 position, prompt and answer: eh_proj and k / v alone). Measured, greedy, 160-token answers: code 92% of the drafts
-accepted, 22.3 -> 16.9 ms a token (59 tok/s); prose 74% accepted but more than half of the drafts below the
-threshold, 21.6 -> 21.0 (48 tok/s); the copy task 85 tok/s. `STRATA_GLM_NO_MTP=1` leaves the block out.
+accepted, 22.3 -> 16.9 ms a token (59 tok/s); prose 68-74% accepted, 21.6 -> 20.0-20.8 (48-50 tok/s); the copy task 85 tok/s.
+Without the iGPU the gain is larger (the lane's latency is paid once a window): code 35.7 -> 41.7 tok/s, prose
+33 -> 39. `STRATA_GLM_NO_MTP=1` leaves the block out.
 
 NVIDIA: the CUDA build compiles; it has not been run yet.
 

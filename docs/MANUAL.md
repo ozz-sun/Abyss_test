@@ -379,7 +379,8 @@ layer with 8 routed and a gated shared expert, a plain residual. It is set up by
   0.027-0.029 on this model.
 - **Speculative decoding.** The n-gram drafts run through the verify window (one draft a window by default,
   `STRATA_DS4_SPEC=<k>` more): a copy task 57 tok/s with one, 76 with three. The GGUF's NextN block drafts too once
-  its experts are repacked (`tools/nextn_pack.py`, `STRATA_GLM_MTP_GGUF`): code 59 tok/s, prose 48, the copy task 85.
+  its experts are repacked (`tools/nextn_pack.py`, `STRATA_GLM_MTP_GGUF`): code 59 tok/s, prose 50, the copy task 85
+  (without the iGPU: code 36 -> 42, prose 33 -> 39).
 - **Not yet:** conversation slots, a layer split, images; the CUDA build compiles and has not been run; the expert
   kernels are not yet tuned for its shapes.
 

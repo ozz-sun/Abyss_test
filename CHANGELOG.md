@@ -34,7 +34,8 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   k / v alone, for every prompt and answer position), up to 3 chained drafts with their probabilities, the decode's
   window verifying them. unsloth's block keeps Q8_0 experts, which the expert kernels do not serve: `tools/nextn_pack.py`
   repacks the block with Q4_K experts through ggml's quantizer, `STRATA_GLM_MTP_GGUF` loads it. Code 22.3 -> 16.9 ms
-  a token (59 tok/s, 92% accepted), prose 21.6 -> 21.0, the copy task 85 tok/s.
+  a token (59 tok/s, 92% accepted), prose 21.6 -> 20.0 (the drafter's threshold 0.5), the copy task 85 tok/s; without
+  the iGPU code 35.7 -> 41.7 tok/s, prose 33 -> 39.
 - The decode recurrence through a register-column scan (the state read and written once; the GDN phase 3.0 -> 1.8 ms
   a token) and the conv / norms / gates in fewer launches.
 - Debug: `GLM_CB_DIR` seam dumps for the arch under llama.cpp's cb names (`GLM_CB_POS=1` a file a position).

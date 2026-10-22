@@ -262,7 +262,7 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
 // the drafts after y (the token at position(), pending): up to STRATA_Q35_MTP_K (1..5, default 3) chained steps from
 // the pending position, each the block over the previous step's argmax and normed output; a draft's confidence is
 // its softmax probability, read after every step (host-mapped) - the chain stops at the first below
-// STRATA_Q35_MTP_MIN (default STRATA_DS4_DSPARK_THR's 0.6: the decode would drop the rest anyway)
+// STRATA_Q35_MTP_MIN (default STRATA_DS4_DSPARK_THR, else the decode's 0.5 for this drafter: it drops the rest anyway)
 bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::string& err) {
     FastState* F = fast_;
     for (int k = 0; k < 5; ++k) {
@@ -277,7 +277,7 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
     static const float stop_below = [] {
         const char* v = getenv("STRATA_Q35_MTP_MIN");
         if (v == nullptr) v = getenv("STRATA_DS4_DSPARK_THR");
-        return v != nullptr ? (float) std::atof(v) : 0.6f;
+        return v != nullptr ? (float) std::atof(v) : 0.5f;
     }();
     cudaStream_t s = F->cs;
     const int64_t p = q35_pend_pos_;
