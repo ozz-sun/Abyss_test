@@ -4411,6 +4411,20 @@ void gate_up_impl(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, flo
         launch_check("moe_gate_up RDNA3.5");
         return;
     }
+    // DeepSeek V4.1's 5120 / 2304 (unsloth's UD quants): IQ2_XS / IQ2_S gate/up the same LDS-grid kernel - 8 experts
+    // (hip_expert_kernel_bench --sweep --shape 5120x2304), an AI PRO R9700 (gfx1201) 125 / 131 -> 101 / 106 us, the
+    // Radeon 8060S (gfx1151, the iGPU lane) 261 / 301 -> 249 / 273; bit-identical.  gfx1100 not measured
+    if ((gu_type == 17 || gu_type == 22) && n_embd == 5120 && n_ff == 2304 &&
+        (ra == RdnaArch::gfx1201 || ra == RdnaArch::gfx1151)) {
+        if (gu_type == 17)
+            launch_expert_gu<17, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
+                xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
+        else
+            launch_expert_gu<22, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
+                xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
+        launch_check("moe_gate_up RDNA V4.1");
+        return;
+    }
     // (any shape of whole super-blocks: DeepSeek V4.1's 5120 / 2304 too - the kernel takes the shape at run time;
     // ABYSS_IGPU_GU16_4096=1: GLM-5.3-Flash's 4096 / 2048 only, as before)
     static const bool gu16_any = std::getenv("ABYSS_IGPU_GU16_4096") == nullptr;
@@ -4505,7 +4519,7 @@ void down(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, siz
     else if (v == Variant::rows8) launch_expert_down<T, 8>(d,k,n_embd,n_ff,off,hq,sh,out,s); \
     else if (v == Variant::global_grid) launch_expert_down<T, 4, true>(d,k,n_embd,n_ff,off,hq,sh,out,s); \
     else launch_expert_down<T, 4>(d,k,n_embd,n_ff,off,hq,sh,out,s); break;
-    switch (type) { BENCH_DN(16) BENCH_DN(18) BENCH_DN(22)
+    switch (type) { BENCH_DN(16) BENCH_DN(17) BENCH_DN(18) BENCH_DN(22)
         default: std::fprintf(stderr, "expert bench: unsupported type %d\n", type); std::abort(); }
 #undef BENCH_DN
     launch_check("expert bench down");
@@ -4547,6 +4561,22 @@ namespace {
 void down_impl(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
                const float* sh_out, float* out, cudaStream_t s, const MoeCols& mc) {
 #if defined(STRATA_USE_HIP)
+    // DeepSeek V4.1's 5120 / 2304: four rows a warp with the grid in LDS - 8 experts (hip_expert_kernel_bench --sweep
+    // --shape 5120x2304), IQ2_XXS / IQ2_S / IQ3_XXS / IQ2_XS down: an AI PRO R9700 (gfx1201) 66.6 / 81.0 / 76.7 / 71.1
+    // -> 45.9 / 52.1 / 55.9 / 50.3 us, the Radeon 8060S (gfx1151, the iGPU lane) 151.7 / 189.8 / 183.9 / 164.8 ->
+    // 117.7 / 155.6 / 177.3 / 137.1; bit-identical.  gfx1100 not measured
+    const RdnaArch ra = rdna_expert_arch();
+    if ((d_type == 16 || d_type == 22 || d_type == 18 || d_type == 17) && n_embd == 5120 && n_ff == 2304 &&
+        (ra == RdnaArch::gfx1201 || ra == RdnaArch::gfx1151)) {
+        switch (d_type) {
+            case 16: launch_expert_down<16, 4, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc); break;
+            case 17: launch_expert_down<17, 4, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc); break;
+            case 18: launch_expert_down<18, 4, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc); break;
+            default: launch_expert_down<22, 4, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc); break;
+        }
+        launch_check("moe_down RDNA V4.1");
+        return;
+    }
     // IQ3_XXS down regresses on gfx1151; let it use the original dispatch below.
     if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
         // Two rows lower the register budget; IQ2_S prefers global grid reads,

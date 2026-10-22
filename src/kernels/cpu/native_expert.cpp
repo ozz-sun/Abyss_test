@@ -78,6 +78,16 @@ bool rows_match_ggml(RowsFn fn, int type, std::initializer_list<int> nts = {2, 5
     return true;
 }
 
+// the VBMI rows against ggml's dot; IQ1_S's delta term in the form this build's ggml-cpu took (fused: GCC / Clang)
+bool iq512v_match(int type, std::initializer_list<int> nts, int rows) {
+    if (rows_match_ggml(iq512v_rows, type, nts, rows)) return true;
+    if (type != GGML_TYPE_IQ1_S) return false;
+    iq512v_set_iq1s_fused(false);   // (MSVC: the multiply, then the add)
+    if (rows_match_ggml(iq512v_rows, type, nts, rows)) return true;
+    iq512v_set_iq1s_fused(true);
+    return false;
+}
+
 RowsFn pick_rows(int type) {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_GLM_CPU_MT");
@@ -91,9 +101,12 @@ RowsFn pick_rows(int type) {
     const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
     RowsFn fn = nullptr;
     void (*set_q5k)(bool) noexcept = nullptr;
-    // (E-3, see pick_rows1: the grid looked up in registers; a mismatch here falls back to iq512_rows)
-    if (avx512 && iq512v_supported(type) && std::getenv("STRATA_NO_IQ512_VBMI") == nullptr && iq512v_ready()) {
-        if (rows_match_ggml(iq512v_rows, type)) return iq512v_rows;
+    // (E-3, see pick_rows1: the grid looked up in registers; a mismatch here falls back to iq512_rows.  IQ2_S's
+    // 1024-entry grid takes 32 registers' worth of lookups there: iq512_rows is faster for it - L2-resident rows, a
+    // Zen 5 core, 2 / 4 tokens 8.0 / 4.8 ns a block a token against 8.8 / 5.7)
+    if (avx512 && iq512v_supported(type) && type != GGML_TYPE_IQ2_S && std::getenv("STRATA_NO_IQ512_VBMI") == nullptr &&
+        iq512v_ready()) {
+        if (iq512v_match(type, {2, 5, 11}, 17)) return iq512v_rows;
         std::fprintf(stderr, "native experts: the AVX-512 VBMI %s rows differ from ggml-cpu's dot in this build - "
                              "the AVX-512 ones\n", ggml_type_name((ggml_type) type));
     }
@@ -144,9 +157,12 @@ RowsFn pick_rows1(int type) {
     // DeepSeek V4's experts (glm_cpu_bench): one thread an IQ2_XS / IQ3_XXS expert 1175 -> 665 us, an IQ2_XXS gate/up
     // 848 -> 424; 16 threads 109 -> 90-102 us and 111 -> 80 (now ~89 GB/s of the ~113 the RAM gives: memory-bound).
     // Decode without the iGPU lane (AI PRO R9700): DeepSeek V4 UD-Q2_K_XL 42.3-42.9 -> 44.8-45.6 tok/s, huihui Q2
-    // +3-5%, GLM-5.3-Flash Maya-S-v2 +6-9%.  STRATA_NO_IQ512_VBMI=1 keeps the rows below
-    if (iq512v_supported(type) && cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512_VBMI") == nullptr && iq512v_ready()) {
-        if (rows_match_ggml(iq512v_rows, type, {1}, 306)) return iq512v_rows;
+    // +3-5%, GLM-5.3-Flash Maya-S-v2 +6-9%.  STRATA_NO_IQ512_VBMI=1 keeps the rows below.  Not IQ2_S and IQ1_S: for
+    // one token ggml's dot is faster (L2-resident rows, a Zen 5 core: IQ2_S 9.3 against 16.6 ns a block - its 1024
+    // codes take 32 registers' worth of lookups -, IQ1_S 9.4 against 12.2 - its 2048 qwords gathered)
+    if (iq512v_supported(type) && type != GGML_TYPE_IQ2_S && type != GGML_TYPE_IQ1_S && cpu_avx512_ok() &&
+        std::getenv("STRATA_NO_IQ512_VBMI") == nullptr && iq512v_ready()) {
+        if (iq512v_match(type, {1}, 306)) return iq512v_rows;
         std::fprintf(stderr, "native experts: the AVX-512 one-token %s rows differ from ggml-cpu's dot in this build - "
                              "the AVX-2 ones\n", ggml_type_name((ggml_type) type));
     }

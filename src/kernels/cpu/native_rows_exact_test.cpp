@@ -85,14 +85,17 @@ int compare(RowsFn fn, int type, int n, int rows, int nt, std::mt19937& rng) {
 }
 
 void check_kernel(const char* name, RowsFn fn, void (*set_q5k)(bool) noexcept, int type, std::mt19937& rng) {
-    // Q5_K: the min term's form that matches this build's ggml-cpu (as native_expert.cpp picks it)
-    if (type == GGML_TYPE_Q5_K) {   // (306 results, as the engine's probe: a form off in ~7% of them shows)
+    // Q5_K: the min term's form that matches this build's ggml-cpu (as native_expert.cpp picks it); IQ1_S's delta
+    // term the same way (the VBMI rows)
+    if (type == GGML_TYPE_IQ1_S) set_q5k = cpu::iq512v_set_iq1s_fused;
+    if (type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ1_S) {   // (306 results, as the engine's probe)
         set_q5k(true);
         int off = 0;
         for (int nt : {2, 5, 11}) off += compare(fn, type, 2048, 17, nt, rng);
         if (off != 0) {
             set_q5k(false);
-            std::printf("  %s q5_K: ggml-cpu's min term is unfused in this build\n", name);
+            std::printf("  %s %s: ggml-cpu's %s term is unfused in this build\n", name, ggml_type_name((ggml_type) type),
+                        type == GGML_TYPE_Q5_K ? "min" : "delta");
         }
     }
     int bad = 0, total = 0;
@@ -104,7 +107,7 @@ void check_kernel(const char* name, RowsFn fn, void (*set_q5k)(bool) noexcept, i
     std::printf("  %-7s %-8s %5d results, %d differ from ggml-cpu's dot\n", name, ggml_type_name((ggml_type) type), total,
                 bad);
     if (bad != 0) ++failures;
-    if (type == GGML_TYPE_Q5_K) set_q5k(true);
+    if (type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ1_S) set_q5k(true);
 }
 
 // GLM's split rows: nt tokens at once vs each token alone (the token path), bit for bit, swiglu clamp 10
@@ -152,12 +155,12 @@ int main() {
     ggml_cpu_init();
     std::mt19937 rng(20261013);
     const int types[] = {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS,
-                         GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS};
+                         GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_S};
     const bool avx512 = cpu::cpu_avx512bw_ok(), avx2 = cpu::cpu_avx2_ok();
     std::printf("native_rows_exact_test: AVX-512BW %s, AVX2 %s\n", avx512 ? "yes" : "no", avx2 ? "yes" : "no");
-    for (int t : types) {
-        if (avx512) check_kernel("avx512", cpu::iq512_rows, cpu::iq512_set_q5k_fused, t, rng);
-        if (avx2) check_kernel("avx2", cpu::iq256_rows, cpu::iq256_set_q5k_fused, t, rng);
+    for (int t : types) {   // (IQ1_S: the VBMI rows only)
+        if (avx512 && cpu::iq512_supported(t)) check_kernel("avx512", cpu::iq512_rows, cpu::iq512_set_q5k_fused, t, rng);
+        if (avx2 && cpu::iq256_supported(t)) check_kernel("avx2", cpu::iq256_rows, cpu::iq256_set_q5k_fused, t, rng);
         if (avx2 && cpu::iq256_rows1_supported(t)) check_kernel("avx2-1t", cpu::iq256_rows1, cpu::iq256_set_q5k_fused, t, rng);
         if (cpu::cpu_avx512_ok() && cpu::iq512v_supported(t) && cpu::iq512v_ready())
             check_kernel("avx512-vbmi", cpu::iq512v_rows, cpu::iq512_set_q5k_fused, t, rng);

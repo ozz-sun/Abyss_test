@@ -2,6 +2,8 @@
 // HIP_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=/opt/rocm/lib build-multi/hip_expert_kernel_bench
 // --parity-only also checks sparse plans, CPU contributions and shared experts.
 // --sweep exposes rejected tuning variants; --shared times the fused Q6_K shared down.
+// --shape 5120x2304 (n_embd x n_ff: DeepSeek V4.1's) and --pair 19,16 (gate/up type, down type; repeatable) pick the
+// fixtures; a type without tuning variants (IQ1_S 19, Q2_K 10, ...) times its production kernel alone.
 #include "strata/kernels/glm_expert_bench.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -23,7 +25,10 @@ namespace gf = strata::kernels::glmf;
 namespace bench = gf::hip_expert_bench;
 using V = bench::Variant;
 namespace {
-constexpr int NE = 8, EMB = 4096, FF = 2048, POOLS = 5, CALLS = 60, ROUNDS = 7;
+constexpr int NE = 8, POOLS = 5, CALLS = 60, ROUNDS = 7;
+int EMB = 4096, FF = 2048;   // (--shape)
+int pools_used = POOLS;      // (--pools n <= 5: less VRAM, e.g. beside a running engine)
+bool has_variants(int t) { return t == 16 || t == 17 || t == 18 || t == 22; }
 void check(hipError_t e, const char* what) {
     if (e != hipSuccess) {
         std::fprintf(stderr, "%s: %s (no processes will be stopped)\n", what, hipGetErrorString(e));
@@ -53,8 +58,10 @@ float half_float(uint16_t b) {
 }
 int block_bytes(int t) {
     switch (t) {
+        case 10: return sizeof(block_q2_K);
         case 14: return sizeof(block_q6_K);
         case 16: return sizeof(block_iq2_xxs);
+        case 19: return sizeof(block_iq1_s);
         case 17: return sizeof(block_iq2_xs);
         case 18: return sizeof(block_iq3_xxs);
         case 22: return sizeof(block_iq2_s);
@@ -68,7 +75,11 @@ void weights(uint8_t* dst, size_t bytes, int t, std::mt19937& rng) {
         // Finite, signed scales; all other block bits are valid grid/scale/sign indices.
         const float magnitude = (1 + (rng() % 1024)) / 65536.f;
         const uint16_t d = half_bits((rng() & 1) ? magnitude : -magnitude);
-        std::memcpy(dst + i + (t == 14 ? bs - 2 : 0), &d, 2);
+        std::memcpy(dst + i + (t == 14 ? bs - 2 : t == 10 ? bs - 4 : 0), &d, 2);
+        if (t == 10) {   // Q2_K's dmin, finite too
+            const uint16_t m = half_bits((1 + (rng() % 1024)) / 65536.f);
+            std::memcpy(dst + i + bs - 2, &m, 2);
+        }
     }
 }
 std::vector<uint8_t> activation(int n, std::mt19937& rng, bool zeros = false) {
@@ -137,7 +148,7 @@ struct Graph {
     hipGraphExec_t exec{};
     Graph(hipStream_t s, const std::function<void(int)>& launch) {
         check(hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal), "capture begin");
-        for (int i = 0; i < CALLS; ++i) launch(i % POOLS);
+        for (int i = 0; i < CALLS; ++i) launch(i % pools_used);
         check(hipStreamEndCapture(s, &graph), "capture end");
         check(hipGraphInstantiateWithFlags(&exec, graph, 0), "graph instantiate");
     }
@@ -170,7 +181,7 @@ void timing(const char* kernel, V variant, size_t bytes, hipStream_t s,
     check(hipEventDestroy(start), "event destroy"); check(hipEventDestroy(end), "event destroy");
 }
 bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool sweep, hipStream_t s) {
-    const int pools = parity_only ? 1 : POOLS;
+    const int pools = parity_only ? 1 : pools_used;
     const size_t gu_bytes = size_t(2) * FF * (EMB / 256) * block_bytes(gu_type);
     const size_t dn_bytes = size_t(EMB) * (FF / 256) * block_bytes(dn_type);
     const size_t blob_bytes = gu_bytes + dn_bytes;
@@ -206,13 +217,16 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
         plans[p].plan_ptr = ptrs.as<unsigned long long>() + p * NE;
         plans[p].plan_w = w.as<float>(); plans[p].cpu_flag = flag.as<int>(); plans[p].cpu_part = cpu.as<float>();
     }
-    const std::vector<V> gu_variants = sweep ? std::vector<V>{
+    const std::vector<V> gu_variants = sweep && has_variants(gu_type) ? std::vector<V>{
         V::signs, V::waves8, V::global_grid, V::global_plain, V::global_waves8, V::split_shared,
         V::direct_signs, V::vector_load, V::occupancy8, V::direct_lds, V::production} : std::vector<V>{V::production};
-    const std::vector<V> dn_variants = sweep ? std::vector<V>{
+    const std::vector<V> dn_variants = sweep && has_variants(dn_type) ? std::vector<V>{
         V::signs, V::rows2, V::rows8, V::global_grid, V::global_plain, V::global_rows2, V::global_rows8,
         V::direct_signs, V::vector_load, V::direct_lds, V::direct_rows4, V::direct_lds_rows4,
         V::production} : std::vector<V>{V::production};
+    // (a type without variants: production against itself)
+    const V gu_base = has_variants(gu_type) ? V::baseline : V::production;
+    const V dn_base = has_variants(dn_type) ? V::baseline : V::production;
     bool ok = true;
     // Include k<8, absent experts, CPU/shared branches, zero activations and unclamped SwiGLU.
     const int cases = parity_only ? 6 : 1;
@@ -234,7 +248,7 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
             bench::down(v, dn_type, plans[pool], k, EMB, FF, gu_bytes, h,
                         use_shared ? shared.as<float>() : nullptr, dst, s);
         };
-        old_hq.zero(hbytes); gu(V::baseline, 0, old_hq.p, sh_old.as<float>());
+        old_hq.zero(hbytes); gu(gu_base, 0, old_hq.p, sh_old.as<float>());
         check(hipStreamSynchronize(s), "baseline gu sync");
         auto ref_h = old_hq.get(hbytes);
         auto ref_sh = use_shared ? sh_old.get(EMB * 4) : std::vector<uint8_t>{};
@@ -251,7 +265,7 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
             }
         }
         // Down uses the identical baseline hq so gate/up differences cannot mask errors.
-        dn(V::baseline, 0, old_hq.p, old_out.as<float>()); check(hipStreamSynchronize(s), "baseline dn sync");
+        dn(dn_base, 0, old_hq.p, old_out.as<float>()); check(hipStreamSynchronize(s), "baseline dn sync");
         auto ref_d = old_out.get(EMB * 4);
         for (V v : dn_variants) {
             dn(v, 0, old_hq.p, out.as<float>()); check(hipStreamSynchronize(s), "dn sync");
@@ -268,10 +282,10 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
             const std::string dlabel = "down<" + std::to_string(dn_type) + ">";
             for (V v : gu_variants)
                 timing(glabel.c_str(), v, NE * gu_bytes + (use_shared ? sw.size() : 0), s,
-                       [&](int p) { gu(V::baseline, p, hq.p, sh_result.as<float>()); }, [&](int p) { gu(v, p, hq.p, sh_result.as<float>()); });
+                       [&](int p) { gu(gu_base, p, hq.p, sh_result.as<float>()); }, [&](int p) { gu(v, p, hq.p, sh_result.as<float>()); });
             for (V v : dn_variants)
                 timing(dlabel.c_str(), v, NE * dn_bytes, s,
-                       [&](int p) { dn(V::baseline, p, old_hq.p, out.as<float>()); },
+                       [&](int p) { dn(dn_base, p, old_hq.p, out.as<float>()); },
                        [&](int p) { dn(v, p, old_hq.p, out.as<float>()); });
         }
     }
@@ -280,13 +294,24 @@ bool run(int gu_type, int dn_type, bool parity_only, bool shared_mode, bool swee
 }
 int main(int argc, char** argv) {
     bool parity_only = false, shared_mode = false, sweep = false;
+    std::vector<std::pair<int, int>> pairs;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--parity-only") parity_only = true;
         else if (std::string(argv[i]) == "--shared") shared_mode = true;
         else if (std::string(argv[i]) == "--sweep") sweep = true;
-        else { std::fprintf(stderr, "usage: %s [--parity-only] [--shared] [--sweep]\n", argv[0]); return 2; }
+        else if (std::string(argv[i]) == "--shape" && i + 1 < argc) std::sscanf(argv[++i], "%dx%d", &EMB, &FF);
+        else if (std::string(argv[i]) == "--pools" && i + 1 < argc) pools_used = std::max(1, std::min(POOLS, std::atoi(argv[++i])));
+        else if (std::string(argv[i]) == "--pair" && i + 1 < argc) {
+            int g = 0, d = 0;
+            std::sscanf(argv[++i], "%d,%d", &g, &d);
+            pairs.emplace_back(g, d);
+        } else {
+            std::fprintf(stderr, "usage: %s [--parity-only] [--shared] [--sweep] [--shape EMBxFF] [--pair GU,DOWN]...\n",
+                         argv[0]);
+            return 2;
+        }
     }
-    check(hipSetDevice(0), "GPU 0");
+    check(hipSetDevice(0), "GPU 0");   // (HIP_VISIBLE_DEVICES picks the card: 1 = an APU's iGPU beside a Radeon)
     hipDeviceProp_t prop;
     check(hipGetDeviceProperties(&prop, 0), "device properties");
     size_t free_bytes, total_bytes;
@@ -295,10 +320,15 @@ int main(int argc, char** argv) {
                 prop.name, prop.gcnArchName, free_bytes / 1048576., CALLS, ROUNDS);
     hipStream_t stream;
     check(hipStreamCreate(&stream), "stream create");
-    bool ok = run(17, 18, parity_only, shared_mode, sweep, stream);   // DeepSeek V4 Flash UD-Q2_K_XL
-    ok &= run(16, 22, parity_only, shared_mode, sweep, stream);
-    ok &= run(16, 18, parity_only, shared_mode, sweep, stream);
-    if (parity_only) { ok &= run(18, 16, true, shared_mode, sweep, stream); ok &= run(22, 22, true, shared_mode, sweep, stream); }
+    bool ok = true;
+    if (!pairs.empty()) {
+        for (const auto& [g, d] : pairs) ok &= run(g, d, parity_only, shared_mode, sweep, stream);
+    } else {
+        ok &= run(17, 18, parity_only, shared_mode, sweep, stream);   // DeepSeek V4 Flash UD-Q2_K_XL
+        ok &= run(16, 22, parity_only, shared_mode, sweep, stream);
+        ok &= run(16, 18, parity_only, shared_mode, sweep, stream);
+        if (parity_only) { ok &= run(18, 16, true, shared_mode, sweep, stream); ok &= run(22, 22, true, shared_mode, sweep, stream); }
+    }
     check(hipStreamDestroy(stream), "stream destroy");
     std::printf("hip_expert_kernel_bench: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
