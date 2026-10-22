@@ -347,6 +347,13 @@ struct Glm5Model::FastState {
         int eng = -1;                                               // Engram table (-1: none)
         WSlot idx_k_w, eng_kv;                                      // indexer.attn_k (BF16), engram_kv (BF16)
         const float *idx_k_norm = nullptr, *eng_qn = nullptr, *eng_kn = nullptr;
+        // ---- qwen35moe (qwen35_fast_path.cu)
+        WSlot qkv, zg, ssm_o, alpha_w, beta_w;                      // GDN: attn_qkv, attn_gate, ssm_out, ssm_alpha, ssm_beta
+        const float* conv1d = nullptr;                              // ssm_conv1d, [C][d_conv] (GGUF: ne0 = d_conv)
+        WSlot aq, ak, av;                                           // attention: attn_q (q | gate a head), attn_k, attn_v
+        const float *q_norm = nullptr, *k_norm = nullptr, *post_norm = nullptr, *sh_gate_w = nullptr;
+        float *gdn_state = nullptr, *gdn_conv = nullptr;            // (S x h_v x S), (C x (d_conv - 1))
+        uint16_t *kc = nullptr, *vc = nullptr;                      // the KV cache, FP16 [ctx][attn_head_kv][head_dim]
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
         strata::kernels::exl3::ExpertLayout xl;
@@ -377,6 +384,11 @@ struct Glm5Model::FastState {
     void* v41_eng_q = nullptr;                                  // the Engram rows as Q8_1 (a quantized engram_kv)
     float *v41_pblk = nullptr, *v41_pblk_h = nullptr;           // the prompt path's block of rows (256 tokens' 24 x 256)
     int32_t cur_tok = 0;                                        // the token in flight (hash routing)
+    // ---- qwen35moe activations (qwen35_fast_path.cu)
+    float *q35_qkv = nullptr, *q35_z = nullptr, *q35_h = nullptr, *q35_ab = nullptr, *q35_gate = nullptr,
+          *q35_o = nullptr, *q35_y = nullptr, *q35_qf = nullptr, *q35_k = nullptr, *q35_v = nullptr, *q35_q = nullptr,
+          *q35_ao = nullptr, *q35_part = nullptr, *q35_shg = nullptr;
+    void *q35_yq = nullptr, *q35_aoq = nullptr;
     // ---- the VRAM tier: per-layer partitions.  A slot is FREE, RESIDENT (in tab), a SPARE (handed to the
     //      device, which may fill it during a token and mark it resident itself) or DRAINING (its old expert
     //      is being demoted to the RAM tier by a D2H; it becomes free when that copy lands).

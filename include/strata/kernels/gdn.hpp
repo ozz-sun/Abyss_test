@@ -93,5 +93,8 @@ void gdn_beta_gate(float* beta, int64_t h_v, void* stream);
 /// The norm is over the LAST axis: one RMS per head, so it is per-ROW here and not over the whole (h_v, S).
 void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
                   float eps, void* stream);
+/// The same with SiLU on the gate: `y = rms_norm(o, eps) * ssm_norm * silu(z)` (Qwen3.5-MoE's build_norm_gated).
+void gdn_out_norm_silu(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
+                       float eps, void* stream);
 
 }  // namespace strata::kernels

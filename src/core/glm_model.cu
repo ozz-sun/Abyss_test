@@ -468,6 +468,7 @@ static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src,
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
     if (g.get("deepseek4.block_count")) return from_gguf_dsv4(g, out, err);
     if (g.get("deepseek41.num_hidden_layers") || g.get("deepseek41.block_count")) return from_gguf_dsv41(g, out, err);
+    if (g.get("qwen35moe.block_count")) return from_gguf_qwen35(g, out, err);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -578,6 +579,84 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
         err = "glm5_model: hc != 4 is not supported (the mHC kernels pin 4 streams)";
         return false;
     }
+    return true;
+}
+
+// qwen35moe: the hparams llama.cpp's loader reads (src/models/qwen35moe.cpp load_arch_hparams) with Ornith-1.5-122B's
+// values as defaults.  The fields the shared code reads mean: n_head_kv[il] 0 = a gated delta-net layer, else the
+// attention layers' KV heads; n_ff_exp * n_shared = the shared expert's width (n_ff_shexp must equal n_ff_exp);
+// gating 2 = softmax top-k; swiglu clamps off (+inf); hc 1 (plain residuals); dense_lead 0
+bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "qwen35moe.";
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        if (!v) return def;
+        if (v->type == strata::MetaType::ARRAY) return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+    out.arch = 2;
+    out.hc = 1;
+    out.n_embd = (int) num("embedding_length", 3072);
+    const int block_count = (int) num("block_count", 49);
+    out.nextn = (int) num("nextn_predict_layers", 0);
+    out.n_layers = block_count - out.nextn;
+    out.n_head = (int) num("attention.head_count", 32);
+    out.attn_head_kv = (int) num("attention.head_count_kv", 2);
+    out.head_dim = (int) num("attention.key_length", 256);
+    out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
+    out.n_rot = (int) num("rope.dimension_count", 64);
+    out.rope_base = (float) num("rope.freq_base", 10000000.0);
+    out.n_expert = (int) num("expert_count", 256);
+    out.n_exp_used = (int) num("expert_used_count", 8);
+    out.n_ff_exp = (int) num("expert_feed_forward_length", 1024);
+    out.n_ff_shexp = (int) num("expert_shared_feed_forward_length", out.n_ff_exp);
+    out.n_shared = out.n_ff_shexp > 0 ? 1 : 0;
+    out.n_ff_dense = 0;
+    out.dense_lead = 0;
+    out.d_conv = (int) num("ssm.conv_kernel", 4);
+    out.ssm_k_heads = (int) num("ssm.group_count", 16);
+    out.ssm_inner = (int) num("ssm.inner_size", 8192);
+    out.ssm_state = (int) num("ssm.state_size", 128);
+    out.ssm_v_heads = (int) num("ssm.time_step_rank", 64);
+    out.gating = 2;
+    out.w_scale = (float) num("expert_weights_scale", 1.0);
+    out.norm_w = 1;
+    out.swiglu_exp = out.swiglu_shexp = INFINITY;
+    out.kda_head_dim = out.ssm_state;   // (d_inner() = kda_head_dim * n_head sizes a few generic buffers)
+    if (const auto* v = g.get("tokenizer.ggml.tokens"); v && v->type == strata::MetaType::ARRAY)
+        out.n_vocab = (int) v->count;   // (the reader keeps only the first items of a long array)
+    else
+        out.n_vocab = 248320;
+    if (out.n_layers < 1 || out.n_embd <= 0 || out.n_expert <= 0 || out.n_exp_used < 1 || out.n_exp_used > 8) {
+        err = "qwen35moe: block_count / embedding_length / expert_count / expert_used_count are off";
+        return false;
+    }
+    if (out.n_shared != 0 && out.n_ff_shexp != out.n_ff_exp) {
+        err = "qwen35moe: the shared expert's width " + std::to_string(out.n_ff_shexp) + " differs from the experts' " +
+              std::to_string(out.n_ff_exp) + " (not supported)";
+        return false;
+    }
+    if (out.ssm_v_heads % out.ssm_k_heads != 0 || out.ssm_inner != out.ssm_v_heads * out.ssm_state || out.ssm_state > 128) {
+        err = "qwen35moe: ssm.time_step_rank / group_count / inner_size / state_size do not fit the GDN kernels";
+        return false;
+    }
+    if (out.head_dim != 256 || out.n_head % out.attn_head_kv != 0 || out.n_rot <= 0 || out.n_rot > out.head_dim ||
+        out.n_rot % 2 != 0) {
+        err = "qwen35moe: the attention kernels take head_dim 256, n_head a multiple of head_count_kv, an even n_rot";
+        return false;
+    }
+    // the layer types: attention.recurrent_layers (per block, the NextN block included), else every
+    // full_attention_interval-th layer is attention (llama.cpp's rule)
+    out.n_head_kv.assign((size_t) out.n_layers, 0);
+    if (const auto* v = g.get(p + "attention.recurrent_layers"); v && v->type == strata::MetaType::ARRAY &&
+                                                              v->items.size() >= (size_t) out.n_layers) {
+        for (int il = 0; il < out.n_layers; ++il) out.n_head_kv[(size_t) il] = v->items[(size_t) il].u != 0 ? 0 : out.attn_head_kv;
+    } else {
+        const int every = (int) num("full_attention_interval", 4);
+        for (int il = 0; il < out.n_layers; ++il) out.n_head_kv[(size_t) il] = (il + 1) % every == 0 ? out.attn_head_kv : 0;
+    }
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    out.comp_ratio.assign((size_t) out.n_layers, 0);
     return true;
 }
 
@@ -1035,6 +1114,7 @@ void Glm5Model::reset() {
         cudaStreamSynchronize(0);
     }
     pos_ = 0;
+    if (g_.qwen35()) qwen35_reset();
     dspark_reset();
     if (split_next_) {
         split_next_->reset();
@@ -3095,7 +3175,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
     for (int il = 0; il < g_.n_layers; ++il) {
         if (il < l0_ || il >= l1_) continue;   // the other half's caches stay on the other device
-        if (g_.dsv4()) continue;               // deepseek4's caches: dsv4_alloc (dsv4_fast_path.cu)
+        if (g_.dsv4() || g_.qwen35()) continue;   // their caches: dsv4_alloc / qwen35_alloc
         if (g_.is_recr(il)) {
             kda_S_[(size_t) il] = floats;
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;

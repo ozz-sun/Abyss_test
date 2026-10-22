@@ -99,6 +99,16 @@ struct Glm5Geometry {
     int ratio(int il) const { return il < (int) comp_ratio.size() ? comp_ratio[(size_t) il] : 0; }
     static bool from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
     static bool from_gguf_dsv41(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+    // ---- qwen35moe (Qwen3.5-MoE: Ornith-1.5-122B; src/core/qwen35_fast_path.cu): arch 2 - plain residuals (no
+    // hyper-connections, hc 1), gated delta-net layers (ssm_*: S x h_v x S states, a d_conv conv) with a full-attention
+    // layer (GQA n_head / attn_head_kv of head_dim, NEOX RoPE on the first n_rot dims, q / k norms, a sigmoid output
+    // gate from the q projection) where attention.recurrent_layers says so, a softmax top-k router with renormalised
+    // weights (gating 2), a shared expert behind a sigmoid gate, a NextN block the pack drops
+    bool qwen35() const { return arch == 2; }
+    int ssm_state = 128, ssm_k_heads = 16, ssm_v_heads = 64, ssm_inner = 8192;   // S, h_k, h_v, h_v * S
+    int attn_head_kv = 2, n_ff_shexp = 1024;
+    int ssm_conv_dim() const { return 2 * ssm_k_heads * ssm_state + ssm_inner; }
+    static bool from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
@@ -415,6 +425,15 @@ public:
     void dsv41_reset();                                    // a new sequence: the Engram history, the pending pairs
     void dsv41_engram_report() const;                      // STRATA_GLM_TIMING: the Engram rows and the cache's share
     bool dsv41_head(std::string& err);                     // the collapse with the last sublayer's pre -> head_x / xq
+    // ---- qwen35moe (src/core/qwen35_fast_path.cu): the token path (its prompt goes through it a token at a time:
+    // no prompt path, no snapshots, no verify windows or layer splits yet)
+    void* qwen35_state_ = nullptr;                         // the GDN states, conv states, KV caches and activations
+    void qwen35_bind(int il, std::string& missing);        // fast_setup's layer loop: this layer's weights
+    bool qwen35_alloc(std::string& err);
+    void qwen35_reset();                                   // a new sequence: the states zeroed (on the fast stream)
+    bool fast_qwen35_layers(int64_t p, std::string& err);  // fast_layers for this arch, head_x / head_xq at the end
+    bool fast_qwen35_gdn(int il, std::string& err);        // x / xq -> mixer
+    bool fast_qwen35_attn(int il, int64_t p, std::string& err);
     // a verify window's columns (toks[0..T) at p0..): their Engram rows read and uploaded before the layers (the n-gram
     // history advances over them), then column t's add at layer il into its streams R
     bool dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std::string& err);

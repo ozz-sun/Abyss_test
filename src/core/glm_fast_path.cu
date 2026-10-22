@@ -18,6 +18,7 @@
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
@@ -589,6 +590,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.recr = is_mtp ? false : g.is_recr(il);
         Ly.moe = il >= g.dense_lead;
         Ly.mtp = is_mtp;
+        if (g.qwen35()) {
+            qwen35_bind(il, missing);   // (qwen35_fast_path.cu: no hyper-connections, its own mixers)
+        } else {
         if (is_mtp) {
             // no hyper-connections: eh_proj in, plain residuals, the shared head's norm out
             Ly.eh = q("nextn.eh_proj.weight");
@@ -643,14 +647,15 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.v_b = b16("attn_v_b.weight");
         }
         if (!g.dsv4()) Ly.out = q("attn_output.weight");
+        }   // (!qwen35)
         if (Ly.moe) {
-            if (g.v41 && w16_.find(P + "ffn_gate_inp.weight") == w16_.end()) {   // (ds4's V4.1 GGUF: F32, served as F32)
+            if ((g.v41 || g.qwen35()) && w16_.find(P + "ffn_gate_inp.weight") == w16_.end()) {   // (F32 routers, served as F32)
                 Ly.router = (const uint16_t*) f32("ffn_gate_inp.weight");
                 Ly.router_type = gf::kTypeF32;
             } else {
                 Ly.router = b16("ffn_gate_inp.weight");
             }
-            if (!(g.dsv4() && il < g.hash_layers)) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers: none)
+            if (!(g.dsv4() && il < g.hash_layers) && !g.qwen35()) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
             Ly.sh_down = q("ffn_down_shexp.weight");
@@ -697,6 +702,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     }
     if (g.dsv4() && !g.v41 && (!dsv4_bind(err) || !dsv4_alloc(err))) return false;
     if (g.v41 && (!dsv41_bind(err) || !dsv41_alloc(err))) return false;
+    if (g.qwen35() && !qwen35_alloc(err)) return false;
 
     // ---- the activation arena
     const int64_t E = g.n_embd, DI = g.d_inner(), FF = g.n_ff_exp * g.n_shared;
@@ -886,8 +892,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int i = 0; i < 8; ++i) sp[i] = (unsigned long long) (F->scratch + (size_t) i * sstride);
             cudaMemcpy(F->md.scratch, sp, sizeof sp, cudaMemcpyHostToDevice);
         }
-        // the batched prompt path: its sizes (it borrows the pool's tail, see below)
-        if (!prefill_setup(err)) return false;
+        // the batched prompt path: its sizes (it borrows the pool's tail, see below); qwen35moe has none yet (its
+        // prompts go through the token path)
+        if (!g.qwen35() && !prefill_setup(err)) return false;
         // DSpark (STRATA_DS4_DSPARK): the drafter's weights and expert cache before the pool takes what is left
         if (!dspark_load(err)) return false;
         size_t free_b = 0, total_b = 0;
@@ -4800,6 +4807,9 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         j[1] = {Ly.sh_gate.q, F->xq, F->x, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
         j[2] = {Ly.sh_up.q, F->xq, F->x, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
     }
+    // qwen35moe: the shared expert's gate logit (sigmoid(w . x) scales its output, below)
+    if (g.qwen35() && Ly.sh_gate_w != nullptr)
+        j[nj++] = {Ly.sh_gate_w, nullptr, F->x, F->q35_shg, nullptr, 1.0f, gf::kTypeF32, g.n_embd, 1};
     // the next layer's router on THIS layer's FFN input: its experts, one layer early
     // (only with prefetch on: the prediction costs a router GEMV and a second top-k per layer)
     const bool pred = F->max_pf > 0 && il + 1 < l1_ && F->L[(size_t) il + 1].moe;
@@ -4929,6 +4939,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, Ly.sh_down.q,
                     Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
     if (F->prof_on) F->mark("moe_gate_up");
+    if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // the shared expert behind its sigmoid gate
+        strata::kernels::q35::scale_sigmoid(F->sh_out, g.n_embd, F->q35_shg, s);
     gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s);
     if (F->prof_on) F->mark("moe_down");
@@ -5024,6 +5036,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     F->kda_graph_on = graphs;
     if (graphs) F->bg_drain(nullptr, SIZE_MAX);   // (paced copies are not issued from inside a capture)
     F->hc_cpu_on = F->bg_after_hc = false;
+    if (g.qwen35()) return fast_qwen35_layers(p, err);   // (plain residuals: qwen35_fast_path.cu)
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -5255,7 +5268,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         if (img) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
         cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     }
-    gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+    if (g.qwen35())   // one residual stream
+        cudaMemcpyAsync(state_, F->emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+    else
+        gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     if (g.v41) {
         static const float onehot[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // layer 0's attention collapses stream 0
         cudaMemcpyAsync(F->v41_pre[1], onehot, sizeof(onehot), cudaMemcpyHostToDevice, F->cs);
@@ -5289,7 +5305,9 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     FastState* FT = tail->fast_;
     cudaSetDevice(tail->dev_);
-    if (g.v41) {
+    if (g.qwen35()) {
+        // (fast_qwen35_layers left head_x / head_xq)
+    } else if (g.v41) {
         if (!tail->dsv41_head(err)) return false;
     } else if (g.dsv4()) {
         if (!tail->dsv4_head(err)) return false;
@@ -5969,6 +5987,7 @@ void Glm5Model::snap_pool_copy(bool restore) {
 }
 
 bool Glm5Model::snapshot_save() {
+    if (g_.qwen35()) return false;   // (no conversation snapshots yet: the prompt runs again)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;
         const Glm5Geometry& g = m->g_;

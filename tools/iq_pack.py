@@ -126,7 +126,16 @@ DEEPSEEK41_F16_TO_BF16 = DEEPSEEK4_F16_TO_BF16 + ("indexer.attn_k.weight", "engr
 DEEPSEEK41_ANY_TO_BF16 = ("indexer.attn_k.weight",)
 DEEPSEEK41_ANY_TO_F32 = ("indexer.proj.weight",)
 DEEPSEEK41_NATIVE_OK = DEEPSEEK4_NATIVE_OK + ("engram_wkv.weight", "engram_kv.weight")
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41")   # unsloth spells glm5-next without the hyphen
+# qwen35moe (Qwen3.5-MoE: Ornith-1.5-122B): every non-expert tensor is served as stored - the Q8_0 projections by the
+# quantized GEMV, the F32 norms / conv / router / gates / ssm_a as F32 - so nothing is converted; the NextN block
+# (blk.{trunk}) is dropped as glm5-next's
+QWEN35MOE_NATIVE_OK = (
+    "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ssm_alpha.weight", "ssm_beta.weight",
+    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+    "token_embd.weight", "output.weight",
+)
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -140,6 +149,8 @@ def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
         # as F32 by config), so ONLY the listed projections take the BF16 path.
         return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
+    if arch == "qwen35moe":
+        return False
     if name in BF16_OUTPUT:
         return True
     if not name.startswith("blk."):
@@ -318,6 +329,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
             elif arch in ("glm5-next", "glm5next") and not name.endswith(GLM5NEXT_NATIVE_OK):
                 print("%s is %s: not on the BF16 upgrade list nor the glm5-next native set "
                       "(GLM5NEXT_NATIVE_OK); refusing to pack it silently" % (t.name, t.type_name))
+                return 1
+            elif arch == "qwen35moe" and not name.endswith(QWEN35MOE_NATIVE_OK):
+                print("%s is %s: not on the qwen35moe native set (QWEN35MOE_NATIVE_OK); refusing to pack it "
+                      "silently" % (t.name, t.type_name))
                 return 1
             else:
                 served += 1
@@ -529,9 +544,12 @@ def main() -> int:
         prefix = "glm5-next." if arch == "glm5-next" else "glm5next."
         print("%s: packing for the Glm5Model runner (quantized dense served natively; the driver "
               "gate remains closed until the pack wiring lands - docs/maya/GLM5-FLASH.md §9)" % arch)
+    if arch == "qwen35moe":
+        prefix = "qwen35moe."
+        print("qwen35moe: packing for the Glm5Model runner's qwen35moe path (every dense tensor served as stored)")
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41"):
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe"):
         bc = g.metadata.get(prefix + "block_count", g.metadata.get(prefix + "num_hidden_layers"))
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -594,7 +612,7 @@ def main() -> int:
     else:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
-    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41"):
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe"):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     else:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)

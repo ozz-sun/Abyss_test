@@ -1,0 +1,238 @@
+// src/core/qwen35_fast_path.cu - the qwen35moe (Qwen3.5-MoE: Ornith-1.5-122B) pieces of the fast decode path
+// (Glm5Model members).  A layer: x = rms(R) * attn_norm -> the mixer (a gated delta-net layer: gdn.hpp's recurrence
+// with SiLU on the output gate; or a full-attention layer: GQA over an FP16 KV cache, q / k norms, NEOX RoPE on the
+// first n_rot dims, a sigmoid gate from the q projection) -> R += mixer -> x = rms(R) * post_attention_norm -> the
+// MoE (fast_moe: a softmax top-k router, the routed experts through the tiers and the lanes, the shared expert behind
+// its sigmoid gate) -> R += ffn.  No hyper-connections: the residual R is state_ (n_embd floats).  The math follows
+// llama.cpp's src/models/qwen35moe.cpp and delta-net-base.cpp.
+#include "glm_fast_state.hpp"
+#include "strata/core/glm_model.hpp"
+#include "strata/kernels/gdn.hpp"
+#include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/qwen35_fast.hpp"
+
+#include <cuda_runtime.h>
+
+#include <cmath>
+#include <cstdio>
+#include <string>
+
+namespace strata::core {
+
+namespace gf = strata::kernels::glmf;
+namespace q35 = strata::kernels::q35;
+
+namespace {
+size_t al(size_t b) { return (b + 255u) & ~(size_t) 255u; }
+}  // namespace
+
+void Glm5Model::qwen35_bind(int il, std::string& missing) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    auto& Ly = F->L[(size_t) il];
+    const std::string P = "blk." + std::to_string(il) + ".";
+    const auto f32 = [&](const char* n) -> const float* {
+        auto it = w_.find(P + n);
+        if (it == w_.end()) { missing += P + n + " (f32) "; return nullptr; }
+        return it->second;
+    };
+    const auto q = [&](const char* n, int64_t n_in, int64_t n_out) -> WSlot {
+        auto it = ws_map_.find(P + n);
+        if (it == ws_map_.end() || it->second.type == 0 || !gf::mv_supported(it->second.type)) {
+            missing += P + n + " (quant) ";
+            return WSlot{};
+        }
+        if ((it->second.n_in != 0 && it->second.n_in != n_in) || (it->second.n_out != 0 && it->second.n_out != n_out))
+            missing += P + n + " (shape " + std::to_string(it->second.n_in) + "x" + std::to_string(it->second.n_out) +
+                       ", expected " + std::to_string(n_in) + "x" + std::to_string(n_out) + ") ";
+        return it->second;
+    };
+    const int E = g.n_embd, C = g.ssm_conv_dim(), V = g.ssm_inner, D = g.head_dim;
+    Ly.attn_norm = f32("attn_norm.weight");
+    Ly.post_norm = f32("post_attention_norm.weight");
+    if (Ly.recr) {
+        Ly.qkv = q("attn_qkv.weight", E, C);
+        Ly.zg = q("attn_gate.weight", E, V);
+        Ly.ssm_o = q("ssm_out.weight", V, E);
+        Ly.alpha_w = q("ssm_alpha.weight", E, g.ssm_v_heads);
+        Ly.beta_w = q("ssm_beta.weight", E, g.ssm_v_heads);
+        Ly.conv1d = f32("ssm_conv1d.weight");
+        Ly.dt_bias = f32("ssm_dt.bias");
+        Ly.ssm_a = f32("ssm_a");
+        Ly.ssm_norm = f32("ssm_norm.weight");
+    } else {
+        Ly.aq = q("attn_q.weight", E, (int64_t) g.n_head * 2 * D);
+        Ly.ak = q("attn_k.weight", E, (int64_t) g.attn_head_kv * D);
+        Ly.av = q("attn_v.weight", E, (int64_t) g.attn_head_kv * D);
+        Ly.out = q("attn_output.weight", (int64_t) g.n_head * D, E);
+        Ly.q_norm = f32("attn_q_norm.weight");
+        Ly.k_norm = f32("attn_k_norm.weight");
+    }
+    if (Ly.moe && g.n_shared > 0) Ly.sh_gate_w = f32("ffn_gate_inp_shexp.weight");
+}
+
+bool Glm5Model::qwen35_alloc(std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim(), V = (size_t) g.ssm_inner;
+    const size_t D = (size_t) g.head_dim, HD = (size_t) g.n_head * D, KV = (size_t) g.attn_head_kv * D;
+    const size_t ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
+    const size_t state_b = al(S * HV * S * 4), conv_b = al(C * (size_t) (g.d_conv - 1) * 4), cache_b = al(ctx * KV * 2);
+    int n_rec = 0, n_attn = 0;
+    for (int il = l0_; il < l1_; ++il) (F->L[(size_t) il].recr ? n_rec : n_attn) += 1;
+    const size_t part = q35::attn_part_floats(g.n_head, g.head_dim, (int) ctx);
+    size_t bytes = (size_t) n_rec * (state_b + conv_b) + (size_t) n_attn * 2 * cache_b;
+    bytes += al(C * 4) + al(V * 4) + al(C * 4) + al(2 * HV * 4) + al(HV * 4) + al(V * 4) + al(V * 4) + al(V / 32 * 36) +
+             al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
+    if (cudaMalloc(&qwen35_state_, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        err = "qwen35moe: the states and caches (" + std::to_string(bytes >> 20) + " MB for " + std::to_string(ctx) +
+              " tokens) did not allocate";
+        return false;
+    }
+    cudaMemset(qwen35_state_, 0, bytes);
+    uint8_t* at = (uint8_t*) qwen35_state_;
+    const auto take = [&](size_t b) {
+        uint8_t* p = at;
+        at += al(b);
+        return p;
+    };
+    for (int il = l0_; il < l1_; ++il) {
+        auto& Ly = F->L[(size_t) il];
+        if (Ly.recr) {
+            Ly.gdn_state = (float*) take(S * HV * S * 4);
+            Ly.gdn_conv = (float*) take(C * (size_t) (g.d_conv - 1) * 4);
+        } else {
+            Ly.kc = (uint16_t*) take(ctx * KV * 2);
+            Ly.vc = (uint16_t*) take(ctx * KV * 2);
+        }
+    }
+    F->q35_qkv = (float*) take(C * 4);
+    F->q35_z = (float*) take(V * 4);
+    F->q35_h = (float*) take(C * 4);
+    F->q35_ab = (float*) take(2 * HV * 4);
+    F->q35_gate = (float*) take(HV * 4);
+    F->q35_o = (float*) take(V * 4);
+    F->q35_y = (float*) take(V * 4);
+    F->q35_yq = take(V / 32 * 36);
+    F->q35_qf = (float*) take(HD * 2 * 4);
+    F->q35_k = (float*) take(KV * 4);
+    F->q35_v = (float*) take(KV * 4);
+    F->q35_q = (float*) take(HD * 4);
+    F->q35_ao = (float*) take(HD * 4);
+    F->q35_aoq = take(HD / 32 * 36);
+    F->q35_part = (float*) take(part * 4);
+    F->q35_shg = (float*) take(256);
+    std::fprintf(stderr, "qwen35moe: CUDA%d %d delta-net layers (states %.0f MB), %d attention layers (KV caches %.2f GB "
+                         "for %lld tokens)\n", dev_, n_rec, (double) n_rec * (state_b + conv_b) / 1048576.0, n_attn,
+                 (double) n_attn * 2 * cache_b / 1073741824.0, (long long) ctx);
+    return true;
+}
+
+void Glm5Model::qwen35_reset() {
+    FastState* F = fast_;
+    if (F == nullptr || qwen35_state_ == nullptr) return;
+    const Glm5Geometry& g = g_;
+    const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim();
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (!Ly.recr) continue;
+        cudaMemsetAsync(Ly.gdn_state, 0, S * HV * S * 4, F->cs);
+        cudaMemsetAsync(Ly.gdn_conv, 0, C * (size_t) (g.d_conv - 1) * 4, F->cs);
+    }
+    cudaStreamSynchronize(F->cs);
+}
+
+bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int E = g.n_embd, C = g.ssm_conv_dim(), V = g.ssm_inner, S = g.ssm_state, HK = g.ssm_k_heads, HV = g.ssm_v_heads;
+    // 1. the projections: qkv (C), z (V), alpha and beta (h_v each) in one launch
+    gf::MvJob j[4];
+    j[0] = {Ly.qkv.q, F->xq, F->x, F->q35_qkv, nullptr, 1.0f, Ly.qkv.type, E, C};
+    j[1] = {Ly.zg.q, F->xq, F->x, F->q35_z, nullptr, 1.0f, Ly.zg.type, E, V};
+    j[2] = {Ly.alpha_w.q, F->xq, F->x, F->q35_ab, nullptr, 1.0f, Ly.alpha_w.type, E, HV};
+    j[3] = {Ly.beta_w.q, F->xq, F->x, F->q35_ab + HV, nullptr, 1.0f, Ly.beta_w.type, E, HV};
+    if (!gf::mv(j, 4, s)) { err = "qwen35moe: the delta-net projections"; return false; }
+    if (F->prof_on) F->mark("q35_gdn_mv");
+    // 2. the conv over [state | x] (the state slides), SiLU on the whole output, q / k L2-normed, q scaled by 1/sqrt(S)
+    strata::kernels::gdn_conv_step(Ly.gdn_conv, F->q35_qkv, Ly.conv1d, F->q35_h, C, g.d_conv, (void*) s);
+    q35::silu(F->q35_h, C, s);
+    strata::kernels::gdn_l2_norm(F->q35_h, HK, S, g.norm_eps, (void*) s);
+    strata::kernels::gdn_l2_norm(F->q35_h + (size_t) HK * S, HK, S, g.norm_eps, (void*) s);
+    q35::scale(F->q35_h, HK * S, 1.0f / std::sqrt((float) S), s);
+    // 3. the gates, the recurrence (the state in place), the gated norm, the output projection
+    q35::gdn_gates(F->q35_ab, Ly.dt_bias, Ly.ssm_a, F->q35_ab + HV, F->q35_gate, HV, s);
+    strata::kernels::GdnShapes sh;
+    sh.S = S;
+    sh.h_k = HK;
+    sh.h_v = HV;
+    strata::kernels::gdn_step(Ly.gdn_state, F->q35_h, F->q35_h + (size_t) HK * S, F->q35_h + (size_t) 2 * HK * S,
+                              F->q35_gate, F->q35_ab + HV, F->q35_o, sh, (void*) s);
+    strata::kernels::gdn_out_norm_silu(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
+    if (F->prof_on) F->mark("q35_gdn");
+    gf::quantize_q8_1(F->q35_y, F->q35_yq, V, s);
+    gf::MvJob o = {Ly.ssm_o.q, F->q35_yq, F->q35_y, F->mixer, nullptr, 1.0f, Ly.ssm_o.type, V, E};
+    if (!gf::mv(&o, 1, s)) { err = "qwen35moe: ssm_out"; return false; }
+    if (F->prof_on) F->mark("q35_gdn_out");
+    return true;
+}
+
+bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int E = g.n_embd, D = g.head_dim, HD = g.n_head * D, KV = g.attn_head_kv * D, p = (int) p64;
+    gf::MvJob j[3];
+    j[0] = {Ly.aq.q, F->xq, F->x, F->q35_qf, nullptr, 1.0f, Ly.aq.type, E, 2 * HD};
+    j[1] = {Ly.ak.q, F->xq, F->x, F->q35_k, nullptr, 1.0f, Ly.ak.type, E, KV};
+    j[2] = {Ly.av.q, F->xq, F->x, F->q35_v, nullptr, 1.0f, Ly.av.type, E, KV};
+    if (!gf::mv(j, 3, s)) { err = "qwen35moe: the attention projections"; return false; }
+    if (F->prof_on) F->mark("q35_attn_mv");
+    q35::attn_prep(F->q35_qf, F->q35_k, F->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D, g.n_rot,
+                   g.rope_base, p, Ly.kc, Ly.vc, F->q35_q, s);
+    q35::attn_decode(F->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p + 1, 1.0f / std::sqrt((float) D), F->q35_part,
+                     F->q35_ao, s);
+    q35::attn_gate(F->q35_ao, F->q35_qf, g.n_head, D, s);
+    if (F->prof_on) F->mark("q35_attend");
+    gf::quantize_q8_1(F->q35_ao, F->q35_aoq, HD, s);
+    gf::MvJob o = {Ly.out.q, F->q35_aoq, F->q35_ao, F->mixer, nullptr, 1.0f, Ly.out.type, HD, E};
+    if (!gf::mv(&o, 1, s)) { err = "qwen35moe: attn_output"; return false; }
+    if (F->prof_on) F->mark("q35_attn_out");
+    return true;
+}
+
+bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    bool pf_pending = false;
+    if (F->prof_on) F->mark("start");
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        // the residual R (state_) takes the last FFN's output, then x = rms(R) * attn_norm (and its q8_1)
+        gf::rms_q8(state_, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        if (F->prof_on) F->mark("q35_norm");
+        if (Ly.recr) {
+            if (!fast_qwen35_gdn(il, err)) return false;
+        } else {
+            if (!fast_qwen35_attn(il, p, err)) return false;
+        }
+        gf::rms_q8(state_, F->mixer, Ly.post_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        if (F->prof_on) F->mark("q35_norm");
+        if (!Ly.moe) { err = "qwen35moe: a dense FFN layer (not supported)"; return false; }
+        if (!fast_moe(il, pf_pending, err)) return false;
+    }
+    // the head: R += the last FFN, x = rms(R) * output_norm -> head_x / head_xq (fast_token runs the output rows)
+    const auto nw = w_.find("output_norm.weight");
+    if (nw == w_.end()) { err = "qwen35moe: output_norm.weight"; return false; }
+    gf::rms_q8(state_, F->ffn, nw->second, g.norm_eps, g.n_embd, F->head_x, F->head_xq, s);
+    if (F->prof_on) F->mark("q35_head");
+    { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("qwen35moe: ") + cudaGetErrorString(e); return false; } }
+    return true;
+}
+
+}  // namespace strata::core

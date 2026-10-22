@@ -2362,7 +2362,7 @@ struct RouteArgs {
     int promote_min;            // STRATA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged route count
                                 // clears this; 0 keeps the old rule (a spare, if one is free)
     int pf_rank;                // STRATA_GLM_PREFETCH_RANK: prefetch only the prediction's first pf_rank ranks
-    int gating;                 // 0: sigmoid (glm5-next), 1: sqrt(softplus) (deepseek4)
+    int gating;                 // 0: sigmoid (glm5-next), 1: sqrt(softplus) (deepseek4), 2: softmax top-k (qwen35moe)
     const int* hash_ids;        // deepseek4's hash-routed layers: the token's k expert ids (no selection)
     float skip_w;               // ... and those not in VRAM whose share of the route's probability is below skip_w
     int early_x;                // 1: the request's x (16 KB, host-mapped) is written at the kernel's start, beside
@@ -2386,9 +2386,11 @@ __device__ __forceinline__ void route_put_xq(const RouteArgs& a, MoeRequest* rq,
     for (int e = tid; e < a.n_embd / 32 * 9; e += ROUTE_THREADS) d[e] = s[e];
 }
 
-// the router's per-expert probability
+// the router's per-expert probability (gating 2, softmax: the logit itself - the top-k by logit is the top-k by
+// softmax, and the plan takes the softmax over the k chosen, which is the renormalised top-k of the full softmax)
 __device__ __forceinline__ float route_score(float x, int gating) {
     if (gating == 1) return sqrtf(x > 20.0f ? x : logf(1.0f + expf(x)));   // ggml's softplus, then sqrt
+    if (gating == 2) return x;
     return 1.0f / (1.0f + expf(-x));
 }
 
@@ -2629,7 +2631,13 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     if (tid < 32) {
         const int i = lane;
         const bool on = i < a.k;
-        const float p = on ? s_p[s_ids[i]] : 0.0f;
+        float p = on ? s_p[s_ids[i]] : 0.0f;
+        if (a.gating == 2) {   // softmax over the k chosen logits
+            float mx = on ? p : -INFINITY;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            p = on ? expf(p - mx) : 0.0f;
+        }
         double sum = 0.0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {

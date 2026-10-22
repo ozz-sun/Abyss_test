@@ -129,7 +129,8 @@ __global__ void gdn_l2_kernel(float* __restrict__ x, int cols, float eps) {
     for (int i = threadIdx.x; i < cols; i += blockDim.x) p[i] *= inv;
 }
 
-/// y = rms_norm(o, eps) * ssm_norm * sigmoid(z), one warp per head, norm over that head's S values.
+/// y = rms_norm(o, eps) * ssm_norm * sigmoid(z) (SILU: * silu(z)), one warp per head, norm over that head's S values.
+template <bool SILU>
 __global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __restrict__ z,
                                     const float* __restrict__ ssm_norm, float* __restrict__ y, int S,
                                     float eps) {
@@ -145,7 +146,7 @@ __global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __
     __syncthreads();
     const float inv = (float) (1.0 / sqrt(ssum / (double) S + (double) eps));
     for (int i = threadIdx.x; i < S; i += blockDim.x)
-        py[i] = po[i] * inv * ssm_norm[i] * sigmoid_f(pz[i]);
+        py[i] = po[i] * inv * ssm_norm[i] * (SILU ? pz[i] * sigmoid_f(pz[i]) : sigmoid_f(pz[i]));
 }
 
 }  // namespace
@@ -235,7 +236,7 @@ void gdn_beta_gate(float* beta, int64_t h_v, void* stream) {
 void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
                   float eps, void* stream) {
     if (h_v <= 0 || S <= 0) return;
-    gdn_out_norm_kernel<<<(unsigned) h_v, 32, 0, (cudaStream_t) stream>>>(o, z, ssm_norm, y, (int) S, eps);
+    gdn_out_norm_kernel<false><<<(unsigned) h_v, 32, 0, (cudaStream_t) stream>>>(o, z, ssm_norm, y, (int) S, eps);
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
@@ -245,4 +246,16 @@ void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* 
     }
 }
 
+void gdn_out_norm_silu(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
+                       float eps, void* stream) {
+    if (h_v <= 0 || S <= 0) return;
+    gdn_out_norm_kernel<true><<<(unsigned) h_v, 32, 0, (cudaStream_t) stream>>>(o, z, ssm_norm, y, (int) S, eps);
+    if (stream == nullptr) {
+        const cudaError_t e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "gdn_out_norm_silu: %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+    }
+}
 }  // namespace strata::kernels
