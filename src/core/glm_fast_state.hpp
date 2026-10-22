@@ -360,7 +360,11 @@ struct Glm5Model::FastState {
     int* ds_sel = nullptr;                                      // the indexer's chosen rows
     // ---- deepseek41 (dsv41_fast_path.cu)
     uint16_t *v41_comp[4] = {}, *v41_idx[4] = {};               // per KV slot: compressed rows (512) and index keys
-    float* v41_pend[4] = {};                                    // per KV slot (ratio 2): the parked token (v | g)
+    // per KV slot (ratio 2): the parked even token (v | g), a ring of kV41PendRing entries by the pair's index (p / 2):
+    // a verify window's rejected tokens park theirs in other entries, so the pair a rewind left half done still finds
+    // its first half
+    static constexpr int kV41PendRing = 8;
+    float* v41_pend[4] = {};
     float* v41_pre[2] = {};                                     // the hyper-connections' pre, alternating sublayers
     float *v41_score = nullptr, *v41_bscore = nullptr;          // the index scores (ctx), the block maxima (ctx / 8)
     int* v41_bsel = nullptr;                                    // the selected candidate blocks

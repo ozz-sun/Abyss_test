@@ -388,7 +388,7 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
     size_t bytes = 0;
     bytes += (size_t) g.n_layers * al((size_t) ds_ring_ * D * 2);
     for (int s = 0; s < 4; ++s)
-        if (slot_rows[s]) bytes += al(slot_rows[s] * D * 2) + al(slot_rows[s] * K * 2) + al(2 * D * 4);
+        if (slot_rows[s]) bytes += al(slot_rows[s] * D * 2) + al(slot_rows[s] * K * 2) + al(FastState::kV41PendRing * 2 * D * 4);
     const size_t HD = (size_t) g.n_head * D, OL = (size_t) g.o_groups * g.o_lora;
     bytes += 2 * al(D * 4) + al(HD * 4) + al(HD / 32 * 36) + al(OL * 4) + al(OL / 32 * 36) + al((size_t) g.idx_top_k * 4);
     bytes += 2 * al(4 * 4) + al((ctx + 1) * 4) + al(B * 4) + al((size_t) g.cand_blocks * 4) + al(B);
@@ -412,7 +412,7 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
         if (slot_rows[s]) {
             F->v41_comp[s] = (uint16_t*) take(slot_rows[s] * D * 2);
             F->v41_idx[s] = (uint16_t*) take(slot_rows[s] * K * 2);
-            F->v41_pend[s] = (float*) take(2 * D * 4);
+            F->v41_pend[s] = (float*) take(FastState::kV41PendRing * 2 * D * 4);
         }
     for (int il = 0; il < g.n_layers; ++il) {
         auto& Ly = F->L[(size_t) il];
@@ -752,6 +752,32 @@ bool Glm5Model::dsv41_engram_prompt(int il, int T, float* R, std::string& err) {
     return true;
 }
 
+bool Glm5Model::dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std::string& err) {
+    FastState* F = fast_;
+    auto* E = (V41Engram*) v41_eng_;
+    if (E == nullptr) { err = "deepseek41: Engram is not open"; return false; }
+    if (T < 1 || T * 2 > kV41Blk) { err = "deepseek41: a verify window of " + std::to_string(T) + " columns"; return false; }
+    if (!engram_sync(*E, err)) return false;   // (the pool is the background reader's too)
+    engram_pf_stop(*E);
+    // column t's table k: rows (t * 2 + k) * 24 .. of the prompt path's block buffers (pinned, then the device's)
+    std::vector<uint64_t> rows((size_t) T * 2 * kEngCols);
+    std::vector<int> ks(rows.size());
+    for (int t = 0; t < T; ++t) {
+        if (!engram_rows(*E, toks[t], p0 + t, rows.data() + (size_t) t * 2 * kEngCols, err)) return false;
+        for (int j = 0; j < 2 * kEngCols; ++j) ks[(size_t) t * 2 * kEngCols + j] = j / kEngCols;
+    }
+    if (!engram_rows_par(*E, (int) rows.size(), rows.data(), 0, ks.data(), F->v41_pblk_h, err)) return false;
+    cudaMemcpyAsync(F->v41_pblk, F->v41_pblk_h, rows.size() * kEngDim * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+    return true;
+}
+
+bool Glm5Model::dsv41_engram_window_add(int il, int t, float* R, std::string& err) {
+    FastState* F = fast_;
+    const int k = F->L[(size_t) il].eng;
+    if (k < 0) { err = "deepseek41: layer " + std::to_string(il) + " has no Engram table"; return false; }
+    return dsv41_engram_add(il, R, err, F->v41_pblk + (size_t) (t * 2 + k) * kEngCols * kEngDim);
+}
+
 bool Glm5Model::dsv41_engram_add(int il, float* R, std::string& err, const float* rows) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -820,7 +846,7 @@ bool Glm5Model::fast_dsv41_attn(int il, int64_t p64, std::string& err) {
         d41::PublishArgs pa;
         pa.v = F->ds_ckv[0];
         pa.g = r == 2 ? F->ds_csc[0] : nullptr;
-        pa.pend = F->v41_pend[Ly.slot];
+        pa.pend = F->v41_pend[Ly.slot] + (size_t) ((p / 2) % FastState::kV41PendRing) * 2 * D;   // (the pair's entry)
         pa.norm = Ly.comp_norm;
         pa.idx_k = (const uint16_t*) Ly.idx_k_w.q;
         pa.idx_k_norm = Ly.idx_k_norm;

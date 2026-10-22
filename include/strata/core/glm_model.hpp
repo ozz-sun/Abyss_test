@@ -399,8 +399,8 @@ public:
     bool dsv4_bind(std::string& err);                      // in fast_setup: the per-layer weights
     bool fast_dsv4_attn(int il, int64_t p, std::string& err);   // one attention mixer (x -> mixer) at position p
     bool dsv4_head(std::string& err);                      // the hyper-connection head -> head_x / head_xq
-    // ---- deepseek41 (src/core/dsv41_fast_path.cu): the token path only (no prompt batches, verify windows, snapshots
-    // or layer splits yet)
+    // ---- deepseek41 (src/core/dsv41_fast_path.cu): the token path, prompt chunks (their attention a token at a time),
+    // snapshots and verify windows (dsv4_verify.cu, the batched kind); no layer splits
     void* dsv41_state_ = nullptr;                          // the window rings, the 4 KV slots and the scratch
     void* v41_eng_ = nullptr;                              // the host's Engram state (dsv41_fast_path.cu V41Engram)
     bool dsv41_bind(std::string& err);
@@ -415,11 +415,16 @@ public:
     void dsv41_reset();                                    // a new sequence: the Engram history, the pending pairs
     void dsv41_engram_report() const;                      // STRATA_GLM_TIMING: the Engram rows and the cache's share
     bool dsv41_head(std::string& err);                     // the collapse with the last sublayer's pre -> head_x / xq
+    // a verify window's columns (toks[0..T) at p0..): their Engram rows read and uploaded before the layers (the n-gram
+    // history advances over them), then column t's add at layer il into its streams R
+    bool dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std::string& err);
+    bool dsv41_engram_window_add(int il, int t, float* R, std::string& err);
     void* vb_ = nullptr;                                   // the verify window's buffers (dsv4_verify.cu)
     bool verify_alloc(std::string& err);
     // columns tb .. tb + n - 1 on stream s (the batched window: all of them on the compute stream; the pipelined one:
     // a token on its own stream; verify_moe's route waits for wait_ev and records done_ev when they are set)
     bool verify_attn(int il, int64_t p0, int tb, int n, cudaStream_t s, std::string& err);
+    bool verify_attn_v41(int il, int64_t p0, int tb, int n, cudaStream_t s, std::string& err);   // deepseek41's
     void fast_dump_feat(int il, const float* R);   // STRATA_DS4_DUMP_FEAT (the DSpark probe)
     // ---- DSpark, DeepSeek V4 Flash's block drafter (src/core/dspark.cu, STRATA_DS4_DSPARK=<its GGUF>)
     void* dsp_ = nullptr;
@@ -441,6 +446,7 @@ public:
     // before the last, the columns' residuals into the next part's (the host hop), else the head, the logits and the
     // argmax; the last part records its buffers' done event
     bool verify_part(const std::vector<int32_t>& toks, int64_t p0, std::string& err);
+    bool verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // deepseek41's (one part)
     const Glm5Model* verify_tail() const;
     // the conversation snapshot's deepseek4 state: every layer's window ring and compressor rings (the compressed
     // caches are append-only by position - a row is written exactly when it becomes visible - so the position alone

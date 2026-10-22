@@ -22,8 +22,15 @@
 // A layer split: the parts one after another (verify_part), as a token's - each part's last layer writes its columns'
 // complete residuals, which cross to the next part through a pinned host buffer, the copies ordered by an event; the
 // last part runs the head and keeps the logits and the argmax (verify_argmax / _sample / _logits read its buffers).
+// deepseek41 (verify_part_v41, verify_attn_v41; the batched kind, one part): fast_dsv41_attn's attention with the
+// dense GEMVs over the columns; per column its two lagged pre buffers, its index selection and candidate blocks (a
+// later layer of the same column reads them), and its Engram rows - read for every column before the layers, the
+// n-gram history advancing over the window's tokens.  A rejected column leaves nothing a later position reads: the
+// window ring has kSpecSlack spare rows, a KV slot's rows are written at their position's row and become visible only
+// past it, and a ratio-2 slot parks a pair's first token in the pair's own entry (kV41PendRing).
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/kernels/dsv41_fast.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
@@ -43,6 +50,7 @@ namespace strata::core {
 
 namespace gf = strata::kernels::glmf;
 namespace ds = strata::kernels::dsv4;
+namespace d41 = strata::kernels::dsv41;
 
 namespace {
 constexpr size_t kQ8 = 36;   // bytes of a q8_1 block (32 values)
@@ -111,6 +119,13 @@ struct VerifyBuf {
     static constexpr int kScrSets = 3;
     unsigned long long* scr_set[kScrSets + 1] = {};
     int n_scr = 0;
+    // deepseek41, a column each: its two pre buffers ([0, 4) the attention side's, [4, 8) the FFN side's - the lagged
+    // collapse), its index scores (ctx + 1), block maxima, chosen blocks and candidate mask (fast_dsv41_attn's v41_*)
+    float* v41_pre = nullptr;
+    float *v41_score = nullptr, *v41_bscore = nullptr;
+    int* v41_bsel = nullptr;
+    unsigned char* v41_keep = nullptr;
+    size_t v41_score_n = 0, v41_b_n = 0;
 };
 }  // namespace
 
@@ -119,7 +134,8 @@ bool Glm5Model::verify_ready() const {
     // MoE layers; the head's weights on the last
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const FastState* F = m->fast_;
-        if (F == nullptr || !m->g_.dsv4() || m->g_.v41 || m->mtp_il_ >= 0 || F->max_pf > 0 || F->n_ahead > 0) return false;
+        if (F == nullptr || !m->g_.dsv4() || m->mtp_il_ >= 0 || F->max_pf > 0 || F->n_ahead > 0) return false;
+        if (m->g_.v41 && (F->defer || m->split_next_ != nullptr || m != this)) return false;   // (one part, no deferral)
         for (int il = m->l0_; il < m->l1_; ++il)
             if (!F->L[(size_t) il].moe) return false;
     }
@@ -174,6 +190,17 @@ bool Glm5Model::verify_alloc(std::string& err) {
     ok = ok && cudaMalloc((void**) &V->score, V->score_n * TM * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc((void**) &V->sel, (size_t) g.idx_top_k * TM * sizeof(int)) == cudaSuccess;
     if (ok) cudaMemset(V->hcnt, 0, (size_t) 64 * TM);
+    if (ok && g.v41) {
+        const size_t ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
+        V->v41_score_n = ctx + 1;
+        V->v41_b_n = ctx / (size_t) g.cand_bs + 2;
+        ok = cudaMalloc((void**) &V->v41_pre, (size_t) TM * 8 * sizeof(float)) == cudaSuccess &&
+             cudaMalloc((void**) &V->v41_score, V->v41_score_n * TM * sizeof(float)) == cudaSuccess &&
+             cudaMalloc((void**) &V->v41_bscore, V->v41_b_n * TM * sizeof(float)) == cudaSuccess &&
+             cudaMalloc((void**) &V->v41_bsel, (size_t) g.cand_blocks * TM * sizeof(int)) == cudaSuccess &&
+             cudaMalloc((void**) &V->v41_keep, V->v41_b_n * TM) == cudaSuccess;
+        if (ok) cudaMemset(V->v41_keep, 0, V->v41_b_n * TM);
+    }
     V->st[0] = fast_->cs;
     for (int t = 0; t < TM && ok; ++t) {
         if (t > 0) ok = cudaStreamCreateWithFlags(&V->st[t], cudaStreamNonBlocking) == cudaSuccess;
@@ -219,7 +246,9 @@ bool Glm5Model::verify_alloc(std::string& err) {
     // (sets for up to 4 groups: the 8-column window keeps 4 columns' worth, 192 MB a 8 MB blob)
     const int NS = std::min(TM - 1, (int) VerifyBuf::kScrSets);
     V->scr_set[0] = fast_->md.scratch;
-    if (ok && sstride > 0 && cudaMalloc(&V->scr, (size_t) NS * 8 * sstride) == cudaSuccess) {
+    if (g.v41) {
+        // (deepseek41: the batched window only - no scratch sets)
+    } else if (ok && sstride > 0 && cudaMalloc(&V->scr, (size_t) NS * 8 * sstride) == cudaSuccess) {
         for (int k = 1; k <= NS && ok; ++k) {
             unsigned long long sp[8];
             for (int i = 0; i < 8; ++i)
@@ -392,6 +421,147 @@ bool Glm5Model::verify_attn(int il, int64_t p0, int tb, int T, cudaStream_t s, s
     return true;
 }
 
+// deepseek41's attention for columns tb.. (fast_dsv41_attn with the dense GEMVs over the columns): the projections,
+// then a token at a time in position order the norms, RoPE and window ring rows, a KV source's slot row (its pending
+// pair in the pair's own ring entry), q's RoPE, the index scores / candidate blocks / top-k of an index source (into the
+// column's own selection: the layers after it read that), the attention; then the output LoRA over the columns
+bool Glm5Model::verify_attn_v41(int il, int64_t p0, int tb, int T, cudaStream_t s, std::string& err) {
+    FastState* F = fast_;
+    auto* V = (VerifyBuf*) vb_;
+    const Glm5Geometry& g = g_;
+    const auto& Ly = F->L[(size_t) il];
+    const int D = g.head_dim, r = Ly.ratio, E = g.n_embd;
+    const ds::Rope rope = layer_rope_v(g, r != 0), crope = layer_rope_v(g, true);
+    const int HD = g.n_head * D, OL = g.o_groups * g.o_lora;
+    const size_t q8e = (size_t) (E / 32) * kQ8;
+    void* const xq = (uint8_t*) V->xq + tb * q8e;
+    float* const x = V->x + (size_t) tb * E;
+    float* const qr_raw = V->qr_raw + (size_t) tb * g.q_lora;
+    float* const qr = V->qr + (size_t) tb * g.q_lora;
+    void* const qr_qb = (uint8_t*) V->qr_q + (size_t) tb * (g.q_lora / 32) * kQ8;
+    float* const kv_raw = V->kv_raw + (size_t) tb * D;
+    float* const iwb = V->iw + (size_t) tb * g.idx_heads;
+    float* const ckv0 = V->ckv[0] + (size_t) tb * 2 * D;
+    float* const csc0 = V->csc[0] + (size_t) tb * 2 * D;
+    float* const qb = V->q + (size_t) tb * HD;
+    float* const iqb = V->iq + (size_t) tb * g.idx_heads * g.idx_key;
+    float* const ob = V->o + (size_t) tb * HD;
+    void* const oqb = (uint8_t*) V->oq + (size_t) tb * (HD / 32) * kQ8;
+    float* const oab = V->oa + (size_t) tb * OL;
+    void* const oaqb = (uint8_t*) V->oaq + (size_t) tb * (OL / 32) * kQ8;
+    float* const mixer = V->mixer + (size_t) tb * E;
+    // 1. the projections of x: q_a, kv, the compressor (KV sources), the indexer's weights (index sources)
+    gf::MvJob j[gf::kMaxMvJobs];
+    int nj = 0;
+    j[nj++] = {Ly.q_a.q, xq, x, qr_raw, nullptr, 1.0f, Ly.q_a.type, E, g.q_lora};
+    j[nj++] = {Ly.kv.q, xq, x, kv_raw, nullptr, 1.0f, Ly.kv.type, E, D};
+    if (Ly.kv_src) {
+        j[nj++] = {Ly.comp_kv.q, xq, x, ckv0, nullptr, 1.0f, Ly.comp_kv.type, E, D, 0, 2 * D};
+        if (r == 2) j[nj++] = {Ly.comp_gate.q, xq, x, csc0, nullptr, 1.0f, Ly.comp_gate.type, E, D, 0, 2 * D};
+    }
+    if (Ly.idx_src)
+        j[nj++] = {Ly.idx_proj_f, nullptr, x, iwb, nullptr, 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)),
+                   gf::kTypeF32, E, g.idx_heads};
+    if (!gf::mvn(j, nj, T, s)) { err = "deepseek41 verify: attention projections"; return false; }
+    // 2. per token, in position order: qr's norm, kv's norm + RoPE into the window ring, then the KV source's row
+    for (int t = 0; t < T; ++t) {
+        const int p = (int) (p0 + tb + t);
+        ds::PrepArgs a;
+        a.qr_raw = qr_raw + (size_t) t * g.q_lora;
+        a.q_a_norm = Ly.q_a_norm;
+        a.qr = qr + (size_t) t * g.q_lora;
+        a.qr_q = (uint8_t*) qr_qb + (size_t) t * (g.q_lora / 32) * kQ8;
+        a.q_lora = g.q_lora;
+        a.kv_raw = kv_raw + (size_t) t * D;
+        a.kv_norm = Ly.kv_a_norm;
+        a.raw = Ly.raw;
+        a.ring = ds_ring_;
+        a.head_dim = D;
+        a.n_rot = g.n_rot;
+        a.rope = rope;
+        a.comp_rope = crope;
+        a.p = p;
+        a.eps = g.norm_eps;
+        ds::prep(a, s);
+        if (Ly.kv_src) {
+            d41::PublishArgs pa;
+            pa.v = ckv0 + (size_t) t * 2 * D;
+            pa.g = r == 2 ? csc0 + (size_t) t * 2 * D : nullptr;
+            pa.pend = F->v41_pend[Ly.slot] + (size_t) ((p / 2) % FastState::kV41PendRing) * 2 * D;
+            pa.norm = Ly.comp_norm;
+            pa.idx_k = (const uint16_t*) Ly.idx_k_w.q;
+            pa.idx_k_norm = Ly.idx_k_norm;
+            pa.comp_cache = Ly.comp_cache;
+            pa.idx_cache = Ly.idx_cache;
+            pa.ratio = r;
+            pa.p = p;
+            pa.D = D;
+            pa.idx_dim = g.idx_key;
+            pa.n_rot = g.n_rot;
+            pa.rope = crope;
+            pa.eps = g.norm_eps;
+            d41::publish(pa, s);
+        }
+    }
+    // 3. q_b (and the indexer's q), every column at once
+    gf::MvJob j2[2];
+    int nj2 = 0;
+    j2[nj2++] = {Ly.q_b.q, qr_qb, qr, qb, nullptr, 1.0f, Ly.q_b.type, g.q_lora, HD};
+    if (Ly.idx_src)
+        j2[nj2++] = {Ly.idx_q_b_q.q, qr_qb, qr, iqb, nullptr, 1.0f, Ly.idx_q_b_q.type, g.q_lora,
+                     g.idx_heads * g.idx_key};
+    if (!gf::mvn(j2, nj2, T, s)) { err = "deepseek41 verify: q_b"; return false; }
+    // 4. per token: RoPE (no per-head norm), the keys - the window, and the slot's visible rows (all of them up to
+    // top_k; beyond, the column's top-k: this layer's own when it is an index source, its last index source's
+    // otherwise) - and the attention
+    for (int t = 0; t < T; ++t) {
+        const int c = tb + t, p = (int) (p0 + c);
+        float* q = qb + (size_t) t * HD;
+        float* iq = iqb + (size_t) t * g.idx_heads * g.idx_key;
+        d41::q_rope(q, g.n_head, D, g.n_rot, rope, Ly.idx_src ? iq : nullptr, g.idx_heads, g.idx_key, crope, p, s);
+        const int n_raw = std::min(p + 1, g.n_swa);
+        int n_comp = 0;
+        const int* sel = nullptr;
+        if (r != 0) {
+            const int n_vis = (p + 1) / r;
+            if (n_vis > g.idx_top_k) {
+                int* cs = V->sel + (size_t) c * g.idx_top_k;
+                if (Ly.idx_src) {
+                    float* sc = V->v41_score + (size_t) c * V->v41_score_n;
+                    unsigned char* keep = V->v41_keep + (size_t) c * V->v41_b_n;
+                    ds::indexer_scores(iq, Ly.idx_cache, iwb + (size_t) t * g.idx_heads, g.idx_heads, n_vis, sc, s);
+                    if (il == g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                        d41::candidates(sc, n_vis, g.cand_bs, g.cand_blocks, V->v41_bscore + (size_t) c * V->v41_b_n,
+                                        V->v41_bsel + (size_t) c * g.cand_blocks, keep, s);
+                    if (il > g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                        d41::candidate_mask(sc, n_vis, g.cand_bs, keep, s);
+                    ds::indexer_select(sc, n_vis, g.idx_top_k, cs, s);
+                }
+                n_comp = g.idx_top_k;
+                sel = cs;
+            } else {
+                n_comp = n_vis;
+            }
+        }
+        ds::attend(q, Ly.raw, ds_ring_, n_raw, Ly.comp_cache, sel, n_comp, Ly.sinks, g.n_head, D, g.n_rot, rope, p,
+                   ob + (size_t) t * HD, s, c, (uint8_t*) oqb + (size_t) t * (HD / 32) * kQ8);
+    }
+    // 5. the grouped output LoRA, every column at once (a group's rows of column t at o + t * HD + gi * gin)
+    const int gin = g.n_head / g.o_groups * D;
+    const size_t wrow = gf::row_bytes(Ly.out_a.type, gin);
+    if (wrow == 0 || g.o_groups > gf::kMaxMvJobs) { err = "deepseek41 verify: wo_a type"; return false; }
+    gf::MvJob jo[gf::kMaxMvJobs];
+    for (int gi = 0; gi < g.o_groups; ++gi)
+        jo[gi] = {(const uint8_t*) Ly.out_a.q + (size_t) gi * g.o_lora * wrow,
+                  (const uint8_t*) oqb + (size_t) gi * (gin / 32) * kQ8, ob + (size_t) gi * gin,
+                  oab + (size_t) gi * g.o_lora, nullptr, 1.0f, Ly.out_a.type, gin, g.o_lora, HD / 32, OL};
+    if (!gf::mvn(jo, g.o_groups, T, s)) { err = "deepseek41 verify: wo_a"; return false; }
+    gf::quantize_q8_1(oab, oaqb, T * OL, s);
+    gf::MvJob jb = {Ly.out_b.q, oaqb, oab, mixer, nullptr, 1.0f, Ly.out_b.type, OL, E};
+    if (!gf::mvn(&jb, 1, T, s)) { err = "deepseek41 verify: wo_b"; return false; }
+    return true;
+}
+
 bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& toks, cudaStream_t s,
                            cudaEvent_t wait_ev, cudaEvent_t done_ev, std::string& err) {
     FastState* F = fast_;
@@ -402,7 +572,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     const size_t q8e = (size_t) (E / 32) * kQ8;
     gf::MvJob j[3];
     j[0] = {Ly.router, nullptr, V->x + (size_t) tb * E, V->rlog + (size_t) tb * g.n_expert, nullptr, 1.0f,
-            gf::kTypeBF16, E, g.n_expert};
+            Ly.router_type, E, g.n_expert};   // (as fast_moe: deepseek4's BF16, deepseek41's F32)
     j[1] = {Ly.sh_gate.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_g + (size_t) tb * FFs, nullptr, 1.0f,
             Ly.sh_gate.type, E, FFs};
     j[2] = {Ly.sh_up.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_u + (size_t) tb * FFs, nullptr, 1.0f,
@@ -432,8 +602,9 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                       (uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
                       s, nullptr, nullptr, 0, nullptr, nullptr, 0, fast_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min, pf_rank,
                       g.gating, Ly.tid2eid != nullptr ? Ly.tid2eid + (size_t) toks[(size_t) t] * k : nullptr,
-                      fast_skip_w(il), 0, nullptr, tb + T - 1 - t);   // (the columns after this one: the CPU lane
-                                                                      // answers a batched window's columns together)
+                      fast_skip_w(il), F->tail_skip_disk ? 1 : 0, nullptr, tb + T - 1 - t);   // (the columns after
+                                    // this one: the CPU lane answers a batched window's columns together; the disk
+                                    // tail skip as the token path's)
         ++F->expected;
     }
     if (late) {
@@ -441,6 +612,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         gf::sh_swiglu(V->sh_g + (size_t) tb * FFs, V->sh_u + (size_t) tb * FFs, g.swiglu_shexp, T * FFs,
                       (uint8_t*) V->sh_hq + (size_t) tb * (FFs / 32) * kQ8, s);
     }
+    if (F->prof_on) F->mark("vm_route_shexp");
     // ... then each token's resident experts (its own plan and h) ...
     static const bool wait_fetch = [] {   // STRATA_GLM_WAIT_FETCH, as fast_moe's
         const char* v = getenv("STRATA_GLM_WAIT_FETCH");
@@ -456,7 +628,9 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         const char* v = getenv("STRATA_DS4_WIN_COLS");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on;
+    // (deepseek41: a column's experts right after its own fetch - its SSD reads land in the token path's 8 scratch
+    // slots, which every column of a batched window shares)
+    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && !g.v41;
     // STRATA_DS4_WIN_COLS_CHECK=1: every 16th group of columns also through a launch a column, compared bit by bit
     static const bool cols_chk = getenv("STRATA_DS4_WIN_COLS_CHECK") != nullptr && std::atoi(getenv("STRATA_DS4_WIN_COLS_CHECK")) != 0;
     const bool chk = cols && cols_chk && (V->chk_calls++ % 16) == 0;
@@ -468,11 +642,15 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         const gf::MoeDev& md = V->md[(size_t) t];
         float* sh_out = V->sh_out + (size_t) t * E;
         void* hq = (uint8_t*) V->hq + (size_t) t * V->hq_n;
-        if (wait_fetch && !F->prof_on) {   // (one launch: gf::moe_wait_fetch, as fast_moe)
-            gf::moe_wait_fetch(md, E, k, Ly.blob, s);
+        if (wait_fetch && !F->prof_on) {   // (one launch: gf::moe_wait_fetch, as fast_moe; streamed as its)
+            if (F->stream_fetch) gf::moe_wait_fetch(md, E, k, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks);
+            else gf::moe_wait_fetch(md, E, k, Ly.blob, s);
         } else {
             gf::moe_wait(md, E, s);
-            gf::moe_fetch(md, k, Ly.blob, s);
+            if (F->prof_on) F->mark("vm_wait");
+            if (F->stream_fetch) gf::moe_fetch(md, k, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks);
+            else gf::moe_fetch(md, k, Ly.blob, s);
+            if (F->prof_on) F->mark("vm_fetch");
         }
         // the next route may find this one's promotions resident: it goes after their copies have landed
         if (done_ev != nullptr && t == tb + T - 1) cudaEventRecord(done_ev, s);
@@ -482,6 +660,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                         FFs, sh_out, s);
         gf::moe_down(Ly.d_type, md, k, E, g.n_ff_exp, Ly.down_off, hq, Ly.sh_down.q != nullptr ? sh_out : nullptr,
                      V->ffn + (size_t) t * E, s);
+        if (F->prof_on) F->mark("vm_experts");
     }
     if (cols) {
         const size_t shq = (size_t) (FFs / 32) * kQ8;
@@ -526,7 +705,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         return v != nullptr && std::atoi(v) != 0;
 #endif
     }();
-    const bool hc_cpu = lane && hc_cpu_env && !F->defer && !Ly.mtp && !F->prof_on && il != l1_ - 1 && gf::hc_fuses_cpu(E);
+    const bool hc_cpu = lane && hc_cpu_env && !F->defer && !Ly.mtp && !F->prof_on && il != l1_ - 1 &&
+                        !(g.v41 && F->L[(size_t) il + 1].eng >= 0) && gf::hc_fuses_cpu(E);   // (as fast_moe)
     if (F->defer && Ly.moe && !Ly.mtp && il != l1_ - 1) {
         if (lane)
             for (int t = tb; t < tb + T; ++t) gf::copy_floats(V->post_defer + (size_t) t * 8, V->post + (size_t) t * 8, 8, s);
@@ -534,6 +714,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         for (int t = tb; t < tb + T; ++t) V->hc_cpu[t] = true;
     } else if (lane) {
         for (int t = tb; t < tb + T; ++t) gf::moe_cpu_wait(V->md[(size_t) t], E, V->ffn + (size_t) t * E, s);
+        if (F->prof_on) F->mark("vm_cpu_wait");
     }
     if (hc_cpu) V->bg_after[tb] = true;
     else F->bg_drain(s, F->bg_pace);   // the paced promotions' next bytes, as fast_moe
@@ -578,8 +759,9 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         return 1;
 #endif
     }();
-    bool timed = pipe_env < 0 && V->pipe_choice[T] < 0 && T > 1 && !F->prof_on;
-    const bool use_pipe = pipe_env >= 0 ? pipe_env != 0
+    bool timed = pipe_env < 0 && V->pipe_choice[T] < 0 && T > 1 && !F->prof_on && !g.v41;
+    const bool use_pipe = g.v41 ? false   // (deepseek41: the batched window)
+                        : pipe_env >= 0 ? pipe_env != 0
                         : V->pipe_choice[T] >= 0 ? V->pipe_choice[T] != 0
                         : V->ms_pipe[T].size() <= V->ms_batch[T].size();   // (timing: alternate a width, pipelined first)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -604,6 +786,17 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
     }
     cudaSetDevice(dev_);
     const auto t0 = std::chrono::steady_clock::now();
+    // STRATA_DS4_WIN_TIMING=1 (investigation): the host's time a window - to the layers' first launch, the launches,
+    // the wait for the device - as means every 32 windows
+    static const bool win_timing = getenv("STRATA_DS4_WIN_TIMING") != nullptr && std::atoi(getenv("STRATA_DS4_WIN_TIMING")) != 0;
+    static double wt_pre = 0.0, wt_eng = 0.0, wt_launch = 0.0, wt_wait = 0.0;
+    static int wt_n = 0;
+    auto wt_mark = std::chrono::steady_clock::now();
+    const auto wt_lap = [&](double& acc) {
+        const auto now = std::chrono::steady_clock::now();
+        acc += std::chrono::duration<double, std::milli>(now - wt_mark).count();
+        wt_mark = now;
+    };
     // ---- the embedding rows -> each token's 4 streams (the first part's columns)
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
@@ -621,6 +814,14 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         cudaMemcpyAsync(V->emb, V->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, s);
     }
     for (int t = 0; t < T; ++t) gf::embed_streams(V->emb + (size_t) t * E, V->R + (size_t) t * 2 * HCE, g.n_embd, s);
+    if (g.v41) {   // every column's Engram rows (read while the embedding runs), layer 0's one-hot pre
+        static const float onehot[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // (as fast_token: layer 0 collapses stream 0)
+        for (int t = 0; t < T; ++t)
+            cudaMemcpyAsync(V->v41_pre + (size_t) t * 8 + 4, onehot, sizeof(onehot), cudaMemcpyHostToDevice, s);
+        wt_lap(wt_pre);
+        if (!dsv41_engram_window(toks.data(), p0, T, err)) return false;
+        wt_lap(wt_eng);
+    }
     if (gp) {
         cudaEventRecord(F->ev_gs, s);
         F->gap_emb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -630,8 +831,9 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         cudaSetDevice(m->dev_);
         m->pos_ = pos_;
         ((VerifyBuf*) m->vb_)->T = T;
-        if (!m->verify_part(toks, p0, err)) return false;
+        if (!(g.v41 ? m->verify_part_v41(toks, p0, err) : m->verify_part(toks, p0, err))) return false;
     }
+    wt_lap(wt_launch);
     cudaSetDevice(dev_);
     const Glm5Model* tail = verify_tail();
     auto* VT = (VerifyBuf*) tail->vb_;
@@ -642,6 +844,13 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         if (F->token_spin) glmfast::cpu_relax(); else std::this_thread::yield();
     }
     if (!glmfast::cuda_ok(done, "deepseek4 verify completion", err)) return false;
+    if (win_timing) {
+        wt_lap(wt_wait);
+        if (++wt_n % 32 == 0)
+            std::fprintf(stderr, "deepseek4 verify timing: %d windows, a window: %.2f ms to the layers (Engram rows %.2f), "
+                                 "%.2f ms launching them, %.2f ms waiting for the device\n", wt_n, wt_pre / wt_n,
+                         wt_eng / wt_n, wt_launch / wt_n, wt_wait / wt_n);
+    }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (!m->fast_->route_ok(err)) return false;
     if (gf::launch_errors() > 0) {
@@ -869,6 +1078,135 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
         for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok + t, s);
         cudaMemcpyAsync(V->tok_h, V->tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, s);
     }
+    cudaEventRecord(V->done, s);
+    return true;
+}
+
+// deepseek41's window (one part, the batched kind): fast_layers' V4.1 layer loop with the columns side by side -
+// an Engram layer writes the previous FFN alone, adds the column's rows, then reads without a write; the reads
+// collapse with the previous sublayer's pre (each column's pair of buffers, layer 0's one-hot set by verify); then
+// the last write half, the head's collapse with the last FFN's pre, the output rows of every column at once and each
+// column's argmax
+bool Glm5Model::verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, std::string& err) {
+    FastState* F = fast_;
+    auto* V = (VerifyBuf*) vb_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int T = V->T;
+    const size_t E = (size_t) g.n_embd, HCE = (size_t) g.hc * E, q8e = (E / 32) * kQ8;
+    std::vector<float*> Rc((size_t) T), Ro((size_t) T);
+    for (int t = 0; t < T; ++t) {
+        Rc[(size_t) t] = V->R + (size_t) t * 2 * HCE;
+        Ro[(size_t) t] = Rc[(size_t) t] + HCE;
+    }
+    const auto hc_read = [&](int il, int t, const float* block_out, bool attn) {
+        const auto& Ly = F->L[(size_t) il];
+        float* pp = V->v41_pre + (size_t) t * 8;   // [0, 4) the attention side's pre, [4, 8) the FFN side's
+        gf::HcArgs h;
+        h.block_out = block_out;
+        h.R_old = Rc[(size_t) t];
+        h.R_new = Ro[(size_t) t];
+        h.post_in = V->post + (size_t) t * 8;
+        h.comb_in = V->comb + (size_t) t * 16;
+        h.pre = attn ? pp : pp + 4;
+        h.pre_use = attn ? pp + 4 : pp;
+        h.post = V->post + (size_t) t * 8;
+        h.comb = V->comb + (size_t) t * 16;
+        h.w_fn = attn ? Ly.hc_attn_fn : Ly.hc_ffn_fn;
+        h.w_scale = attn ? Ly.hc_attn_scale : Ly.hc_ffn_scale;
+        h.w_base = attn ? Ly.hc_attn_base : Ly.hc_ffn_base;
+        h.norm_w = attn ? Ly.attn_norm : Ly.ffn_norm;
+        h.norm_eps = g.norm_eps;
+        h.hc_eps = g.hc_eps;
+        h.iters = g.sinkhorn_iters;
+        h.n_embd = g.n_embd;
+        h.x = V->x + (size_t) t * E;
+        h.xq = (uint8_t*) V->xq + (size_t) t * q8e;
+        h.part = V->hpart + (size_t) t * V->hpart_n;
+        h.counter = V->hcnt + (size_t) t * 16;
+        if (attn && block_out != nullptr && V->hc_cpu[t]) {   // the column's last MoE answer, added here
+            h.cpu_seq = V->md[(size_t) t].cpu_seq;
+            h.cpu_ans = V->md[(size_t) t].cpu_ans;
+            V->hc_cpu[t] = false;
+        }
+        gf::hc(h, s);
+        if (block_out != nullptr) std::swap(Rc[(size_t) t], Ro[(size_t) t]);
+        if (attn && V->bg_after[t]) {
+            V->bg_after[t] = false;
+            F->bg_drain(s, F->bg_pace);
+        }
+    };
+    // STRATA_GLM_PROF (as the token path's): the window's phases, marked v<T>_*
+    const bool prof = F->prof_on;
+    static std::vector<std::string> names;   // (mark keeps the pointer)
+    if (prof && names.empty())
+        for (int n = 1; n <= kVerifyMax; ++n)
+            for (const char* ph : {"hc_attn", "attn", "hc_ffn", "moe", "head"}) names.push_back("v" + std::to_string(n) + "_" + ph);
+    const auto mark = [&](int ph) { if (prof) F->mark(names[(size_t) (T - 1) * 5 + ph].c_str()); };
+    if (prof) F->mark("v_start");
+    for (int t = 0; t < kVerifyMax; ++t) V->hc_cpu[t] = V->bg_after[t] = false;
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        for (int t = 0; t < T; ++t) {
+            bool wrote = il != l0_;
+            if (Ly.eng >= 0) {
+                if (il != l0_) {   // (verify_moe leaves no answer for a read before an Engram layer)
+                    gf::hc_post(V->ffn + (size_t) t * E, Rc[(size_t) t], V->post + (size_t) t * 8,
+                                V->comb + (size_t) t * 16, g.n_embd, Ro[(size_t) t], s);
+                    std::swap(Rc[(size_t) t], Ro[(size_t) t]);
+                    wrote = false;
+                }
+                if (!dsv41_engram_window_add(il, t, Rc[(size_t) t], err)) return false;
+            }
+            hc_read(il, t, wrote ? V->ffn + (size_t) t * E : nullptr, true);
+        }
+        mark(0);
+        if (!verify_attn_v41(il, p0, 0, T, s, err)) return false;
+        mark(1);
+        for (int t = 0; t < T; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false);
+        mark(2);
+        if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
+        mark(3);
+    }
+    for (int t = 0; t < T; ++t) {   // (verify_moe leaves no answer past the last layer; the check is for safety)
+        if (V->hc_cpu[t]) {
+            gf::moe_cpu_wait(V->md[(size_t) t], g.n_embd, V->ffn + (size_t) t * E, s);
+            V->hc_cpu[t] = false;
+        }
+        if (V->bg_after[t]) {
+            V->bg_after[t] = false;
+            F->bg_drain(s, F->bg_pace);
+        }
+    }
+    const auto nw = w_.find("output_norm.weight");
+    if (nw == w_.end()) { err = "deepseek41 verify: output_norm.weight"; return false; }
+    for (int t = 0; t < T; ++t) {
+        gf::hc_post(V->ffn + (size_t) t * E, Rc[(size_t) t], V->post + (size_t) t * 8, V->comb + (size_t) t * 16,
+                    g.n_embd, Ro[(size_t) t], s);
+        // the last sublayer (layer n-1's FFN) wrote its pre into the column's FFN-side buffer
+        d41::head_prep(Ro[(size_t) t], V->v41_pre + (size_t) t * 8 + 4, nw->second, g.norm_eps, g.n_embd,
+                       V->head_x + (size_t) t * E, (uint8_t*) V->head_xq + (size_t) t * q8e, s);
+    }
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
+    if (gf::mvn_supported(ow.type)) {
+        if (!gf::mvn(&o, 1, T, s)) { err = "deepseek41 verify: output head"; return false; }
+    } else {
+        for (int t = 0; t < T; ++t) {
+            gf::MvJob ot = o;
+            ot.xq = (const uint8_t*) V->head_xq + (size_t) t * q8e;
+            ot.xf = V->head_x + (size_t) t * E;
+            ot.y = V->logits + (size_t) t * g.n_vocab;
+            if (!gf::mv(&ot, 1, s)) { err = "deepseek41 verify: output head (type " + std::to_string(ow.type) + ")"; return false; }
+        }
+    }
+    if (F->zero_copy) {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok_hd + t, s);
+    } else {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok + t, s);
+        cudaMemcpyAsync(V->tok_h, V->tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, s);
+    }
+    mark(4);
     cudaEventRecord(V->done, s);
     return true;
 }

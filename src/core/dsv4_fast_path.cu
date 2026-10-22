@@ -332,7 +332,7 @@ bool Glm5Model::dsv4_snap_copy(bool restore) {
         // position alone restores those; the HC lag and the index selection are per token.
         for (int il = l0_; il < l1_; ++il) runs.push_back({F->L[(size_t) il].raw, (size_t) ds_ring_ * D * 2});
         for (int sl = 0; sl < 4; ++sl)
-            if (F->v41_pend[sl] != nullptr) runs.push_back({F->v41_pend[sl], 2 * D * 4});
+            if (F->v41_pend[sl] != nullptr) runs.push_back({F->v41_pend[sl], FastState::kV41PendRing * 2 * D * 4});
     }
     for (int il = l0_; il < l1_ && !g.v41; ++il) {
         const auto& Ly = F->L[(size_t) il];
