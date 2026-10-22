@@ -39,13 +39,32 @@ class HipSetupTests(unittest.TestCase):
             patch.object(maya.S, "is_wsl", return_value=False),
             patch.object(maya.S, "cpu_info", return_value=("test CPU", True, True)),
             patch.object(maya, "mem_gb", return_value=(192, 128)),
-            patch.object(maya, "tool_version", return_value=(7, 2)),
+            patch.object(maya, "tool_version", return_value=(7, 15)),
             patch.object(maya.shutil, "which", return_value="/usr/bin/c++"),
         ):
             ctx.start()
             self.addCleanup(ctx.stop)
         self.a = SimpleNamespace(backend="hip", gpu=0, gpus=None, no_vision=False, env=[],
                                  port=8099, host=None, api_key=None, gguf_dir=None)
+
+    def test_rocm_before_hip_7_14_stops_setup_unless_asked(self):
+        # ROCm 7.0-7.2 (HIP 7.0-7.2) fail with current drivers (issues #1 and #8): setup stops, ABYSS_OLD_ROCM=1 goes on
+        with patch.object(maya, "tool_version", return_value=(7, 2)), patch.object(maya, "fail",
+                                                                                 side_effect=SystemExit) as fail:
+            with self.assertRaises(SystemExit):
+                maya.check_pc(self.a)
+        msg, hint = fail.call_args.args
+        self.assertIn("HIP 7.14 or newer", msg)
+        self.assertIn("HIP 7.2", msg)
+        self.assertIn("ROCm 10", hint)
+        self.assertIn("ABYSS_OLD_ROCM=1", hint)
+        with patch.object(maya, "tool_version", return_value=(7, 2)), patch.dict(os.environ, {"ABYSS_OLD_ROCM": "1"}), \
+                patch.object(maya, "warn") as warn:
+            pc = maya.check_pc(self.a)
+        self.assertEqual(pc["gpus"], [self.gpus[0]])
+        self.assertTrue(any("ABYSS_OLD_ROCM=1" in c.args[0] for c in warn.call_args_list))
+        with patch.object(maya, "tool_version", return_value=(7, 14)):
+            self.assertEqual(maya.check_pc(self.a)["gpus"], [self.gpus[0]])
 
     def test_selects_larger_supported_discrete_card(self):
         self.a.gpu = None

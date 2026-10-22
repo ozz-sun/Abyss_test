@@ -320,10 +320,11 @@ experts in VRAM, so the second card's VRAM holds more of them.
 DeepSeek V4 also runs on AMD Radeon cards: the RX 7900 XT / XTX (gfx1100), the RX 9070 / AI PRO R9700 (gfx1201) and
 the Ryzen AI Max's Radeon 8060S (gfx1151).
 
-- **Setup:** `./setup-deepseek.sh --backend hip` (chosen by itself when there is no NVIDIA GPU). On Linux it uses ROCm 7
-  or newer in `/opt/rocm` (ROCm 10: `/opt/rocm/core-10.0` too; the R9700 has been checked with ROCm 10 only). The
-  engine is built in `build-hip/strata`, and the config gets `"backend": "hip"`. After switching to another ROCm, run
-  it again (with `ROCM_PATH`): it builds the engine from scratch for that ROCm (v1.3.44).
+- **Setup:** `./setup-deepseek.sh --backend hip` (chosen by itself when there is no NVIDIA GPU). On Linux it uses ROCm 10
+  in `/opt/rocm` (or `/opt/rocm/core-10.0`). It needs HIP 7.14 or newer and stops on ROCm 7.0-7.2, which fail with
+  current drivers (issues #1 and #8; `ABYSS_OLD_ROCM=1` builds with one anyway). The engine is built in
+  `build-hip/strata`, and the config gets `"backend": "hip"`. After switching to another ROCm, run it again (with
+  `ROCM_PATH`): it builds the engine from scratch for that ROCm (v1.3.44).
 - **Driver and ROCm:** [docs/amd/README.md](amd/README.md) has the install steps (amdgpu, ROCm 10's per-architecture
   packages - an R9700 needs `amdrocm10.0-gfx1201` - and why `HSA_OVERRIDE_GFX_VERSION` must not be set), a check
   list, and troubleshooting.

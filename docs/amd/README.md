@@ -30,7 +30,8 @@ the iGPU computes the RAM-tier experts (the iGPU lane).
 | Driver | amdgpu-dkms 6.19.14 (amdgpu-install 31.40) |
 | ROCm | 10.0.0 (apt's `amdrocm` packages, `/opt/rocm/core-10.0`) |
 
-Setup accepts ROCm 7 or newer. On the R9700 only ROCm 10 has been checked; see [ROCm 7](#rocm-7).
+Setup needs HIP 7.14 or newer: **ROCm 10 on Linux** (HIP 7.15), AMD's ROCm SDK 7.14 (TheRock) on Windows. The ROCm
+7.0-7.2 releases fail with current drivers, and setup stops on them; see [Older ROCm (7.0-7.2)](#older-rocm-70-72).
 
 ## 1. The driver (amdgpu)
 
@@ -38,10 +39,12 @@ ROCm reaches the GPU through the kernel's amdgpu driver and the `/dev/kfd` devic
 
 1. **Install the driver.** The machine above has `amdgpu-dkms` and `amdgpu-dkms-firmware` from AMD's
    `amdgpu-install` (Radeon Software for Linux). The DKMS module is rebuilt when the kernel is updated.
-   - The kernel's own amdgpu has not been checked here, and on one PC it failed: after an update to Ubuntu's kernel
-     7.0.0-38, its amdgpu could no longer pin the RAM tier (`failed to pin userptr` in `dmesg`), and every request
-     failed with `kernel launch(es) failed`. amdgpu-dkms with `iommu=pt` and ROCm 10 fixed it
-     ([issue #1](https://github.com/zephel01/Abyss/issues/1)). Use amdgpu-dkms.
+   - The kernel's own amdgpu has not been checked here. With ROCm 10 it worked on a user's RX 9070 XT (Linux 7.2.11,
+     NixOS, in Docker, no `iommu=pt`: [issue #8](https://github.com/zephel01/Abyss/issues/8)). On another PC it
+     failed: after an update to Ubuntu's kernel 7.0.0-38, its amdgpu could no longer pin the RAM tier (`failed to pin
+     userptr` in `dmesg`), and every request failed with `kernel launch(es) failed`. amdgpu-dkms with `iommu=pt` and
+     ROCm 10 fixed it ([issue #1](https://github.com/zephel01/Abyss/issues/1)). When `dmesg` shows that error, use
+     amdgpu-dkms.
    - With Secure Boot on, the DKMS module must be signed; the install asks you to enroll a MOK key.
 2. **Add your user to the `render` and `video` groups,** then log in again.
 
@@ -93,16 +96,23 @@ architecture is missing, rocBLAS and hipBLASLt find no kernels.
    `/opt/rocm` first, then in the newest `/opt/rocm/core-<version>` when `/opt/rocm` has no compiler. Set
    `ROCM_PATH` when ROCm is somewhere else.
 
-### ROCm 7
+### Older ROCm (7.0-7.2)
 
-Setup accepts ROCm 7 (`amdgpu-install`'s `rocm`, amdrocm 7.x, or AMD's pip wheels), but on an R9700 only ROCm 10 has
-been checked here. A user's R9700 ran a ROCm 7.0 pip SDK up to v1.3.37. After a kernel update and a move to
-amdgpu-dkms 6.19.14, every kernel launch failed until the engine was built with ROCm 10
-([issue #1](https://github.com/zephel01/Abyss/issues/1)). On Linux, use ROCm 10.
+Setup stops on a HIP older than 7.14 (`hipcc --version`). The ROCm 7.0-7.2 releases (`amdgpu-install`'s `rocm`, AMD's
+ROCm 7.0 pip wheels, the `rocm/dev-ubuntu-*:7.2.1` images) fail with current drivers, and ROCm 10 fixed both PCs below
+with the same driver:
 
-amdrocm 7.x is split by architecture too, so install it the same way (`amdrocm7.14-gfx1201` and so on). With several
-versions installed it is hard to tell which one `/opt/rocm` points to: remove the ones you do not use, or name one
-with `ROCM_PATH`.
+- An R9700 ran a ROCm 7.0 pip SDK up to v1.3.37. After a kernel update and a move to amdgpu-dkms 6.19.14, every
+  kernel launch failed ([issue #1](https://github.com/zephel01/Abyss/issues/1)).
+- An RX 9070 XT in a ROCm 7.2.1 container: the RAM tier's registration failed (`iGPU lane off (hipHostRegister:
+  invalid argument)`, `glm_fast zero_copy: invalid argument`, nothing in `dmesg`), and every request failed
+  ([issue #8](https://github.com/zephel01/Abyss/issues/8)).
+
+`ABYSS_OLD_ROCM=1 ./setup-deepseek.sh --backend hip` builds with an older one anyway (a warning instead of the stop).
+
+amdrocm 7.14 (AMD's packages of the same HIP line as Windows' ROCm SDK 7.14) passes the check; it has not been run
+here on Linux. It is split by architecture too (`amdrocm7.14-gfx1201` and so on). With several versions installed it
+is hard to tell which one `/opt/rocm` points to: remove the ones you do not use, or name one with `ROCM_PATH`.
 
 ### Switching to another ROCm
 
@@ -317,7 +327,7 @@ windows are pipelined in two groups on the two hardware queues - another reason 
 |---|---|---|
 | `rocminfo` ends with `HSA_STATUS_ERROR_OUT_OF_RESOURCES` | `HSA_OVERRIDE_GFX_VERSION` is still set | remove it as in "3. Environment variables", then log in again |
 | `rocminfo` cannot open `/dev/kfd` (permission denied) | not in the `render` group | `sudo usermod -aG render,video $USER`, then log in again |
-| The model loads and `/health` answers, but every request fails at once with `kernel launch(es) failed` (HTTP 400) | the driver cannot pin the RAM tier: `sudo dmesg \| grep -i userptr` shows `failed to pin userptr` or `failed to validate BO` (the kernel's own amdgpu, issue #1). Or the engine's ROCm does not suit the driver (issue #1: a ROCm 7.0 pip SDK with amdgpu-dkms 6.19.14) | amdgpu-dkms and `iommu=pt` ("1. The driver"), ROCm 10, then setup again ("Switching to another ROCm") |
+| The model loads and `/health` answers, but every request fails at once with `kernel launch(es) failed` (HTTP 400) | the driver cannot pin the RAM tier: `sudo dmesg \| grep -i userptr` shows `failed to pin userptr` or `failed to validate BO` (the kernel's own amdgpu, issue #1). Or the engine was built with ROCm 7.0-7.2 (issue #1: a 7.0 pip SDK with amdgpu-dkms 6.19.14; issue #8: 7.2.1, the log shows `hipHostRegister: invalid argument`) | ROCm 10, then setup again ("Switching to another ROCm"); for the `dmesg` error amdgpu-dkms and `iommu=pt` ("1. The driver") |
 | Decode works, but the first prompt hangs; the server answers 503 and the engine is stopped after 180 s | rocBLAS / hipBLASLt have no kernels for that GPU (for example only gfx1151's are installed) | `sudo apt install amdrocm10.0-<arch>` (gfx1201 for an R9700); check as in "4. Check the install" |
 | The engine log shows `No compatible code objects found for: gfx1201`, or the iGPU lane fails with `invalid device function` | an older build's `libabyss_igpu.so` has no code for the engine's GPU. HIP refuses a library's kernels on every GPU when any visible GPU has no code in it | rebuild from the current source (`./setup-deepseek.sh --backend hip`) |
 | Slow with a discrete card attached, and the log's GPU is the iGPU (gfx1151) | the HIP numbers flipped and the config's `"gpu"` now names the iGPU | add `"gpu_pci"` to the config ("When the GPU numbers change"); check the order with `rocminfo` |

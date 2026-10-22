@@ -30,7 +30,9 @@ iGPU が計算します（iGPU レーン）。
 | ドライバ | amdgpu-dkms 6.19.14（amdgpu-install 31.40） |
 | ROCm | 10.0.0（apt の `amdrocm` パッケージ、`/opt/rocm/core-10.0`） |
 
-セットアップは ROCm 7 以降を受け付けます。R9700 で確かめたのは ROCm 10 だけです（「[ROCm 7](#rocm-7)」を参照）。
+セットアップに要るのは HIP 7.14 以降です。**Linux では ROCm 10**（HIP 7.15）、Windows では AMD の ROCm SDK 7.14
+（TheRock）を使います。ROCm 7.0〜7.2 はいまのドライバと組み合わせると失敗するので、セットアップはそこで止まります
+（「[古い ROCm（7.0〜7.2）](#古い-rocm7072)」を参照）。
 
 ## 1. ドライバ（amdgpu）
 
@@ -38,10 +40,12 @@ ROCm はカーネルの amdgpu ドライバと、ドライバが作る `/dev/kfd
 
 1. **ドライバを入れる。** 上の PC では、AMD の `amdgpu-install`（Radeon Software for Linux）で
    `amdgpu-dkms` と `amdgpu-dkms-firmware` を入れています。DKMS 版は、カーネルを更新したときに作り直されます。
-   - カーネルに入っている amdgpu は、ここでは確かめていません。ある PC では、Ubuntu のカーネルを 7.0.0-38 に
-     更新したあと、その amdgpu で RAM 層をピン留めできなくなり（`dmesg` に `failed to pin userptr`）、どの
-     リクエストも `kernel launch(es) failed` で失敗しました。amdgpu-dkms と `iommu=pt`、ROCm 10 で直っています
-     （[issue #1](https://github.com/zephel01/Abyss/issues/1)）。amdgpu-dkms を使ってください。
+   - カーネルに入っている amdgpu は、ここでは確かめていません。ある利用者の RX 9070 XT では、ROCm 10 と組み合わせて
+     動きました（Linux 7.2.11、NixOS、Docker の中、`iommu=pt` なし。[issue #8](https://github.com/zephel01/Abyss/issues/8)）。
+     別の PC では失敗しました。Ubuntu のカーネルを 7.0.0-38 に更新したあと、その amdgpu で RAM 層をピン留めできなく
+     なり（`dmesg` に `failed to pin userptr`）、どのリクエストも `kernel launch(es) failed` で失敗しました。
+     amdgpu-dkms と `iommu=pt`、ROCm 10 で直っています（[issue #1](https://github.com/zephel01/Abyss/issues/1)）。
+     `dmesg` にこのエラーが出るときは、amdgpu-dkms を使ってください。
    - Secure Boot が有効な PC では、DKMS のモジュールに署名が要ります（インストール時に MOK の登録を求められます）。
 2. **ユーザーを `render` と `video` のグループに入れる。** 入れたあと、ログインし直します。
 
@@ -94,17 +98,24 @@ ROCm 10 のパッケージは GPU のアーキテクチャごとに分かれて�
    セットアップは `/opt/rocm` を探し、そこにコンパイラがなければ一番新しい `/opt/rocm/core-<版>` を使います。
    別の場所にあるときは `ROCM_PATH` を設定します。
 
-### ROCm 7
+### 古い ROCm（7.0〜7.2）
 
-セットアップは ROCm 7（`amdgpu-install` の `rocm`、amdrocm 7.x、AMD の pip の wheel）も受け付けますが、R9700 で
-ここで確かめたのは ROCm 10 だけです。ある R9700 の PC では、ROCm 7.0 の pip SDK で v1.3.37 まで動いていました。
-カーネルの更新と amdgpu-dkms 6.19.14 への切り替えのあとは、エンジンを ROCm 10 でビルドし直すまで、すべての
-カーネルの起動が失敗しました（[issue #1](https://github.com/zephel01/Abyss/issues/1)）。
-Linux では ROCm 10 を使ってください。
+HIP が 7.14 より古いと（`hipcc --version`）、セットアップは止まります。ROCm 7.0〜7.2（`amdgpu-install` の `rocm`、
+AMD の ROCm 7.0 の pip の wheel、`rocm/dev-ubuntu-*:7.2.1` のイメージ）は、いまのドライバと組み合わせると失敗します。
+次の 2 台は、どちらも同じドライバのまま ROCm 10 にして直りました。
 
-amdrocm 7.x もアーキテクチャごとに分かれているので、入れ方は上と同じです（`amdrocm7.14-gfx1201` など）。複数の
-版を入れると `/opt/rocm` がどちらを指すかがわかりにくくなるので、使わない版は消すか、`ROCM_PATH` で版を指定して
-ください。
+- ある R9700 の PC では、ROCm 7.0 の pip SDK で v1.3.37 まで動いていました。カーネルの更新と amdgpu-dkms 6.19.14
+  への切り替えのあと、すべてのカーネルの起動が失敗しました（[issue #1](https://github.com/zephel01/Abyss/issues/1)）。
+- RX 9070 XT を ROCm 7.2.1 のコンテナで動かすと、RAM 層の登録が失敗し（`iGPU lane off (hipHostRegister: invalid
+  argument)`、`glm_fast zero_copy: invalid argument`。`dmesg` には何も出ない）、どのリクエストも失敗しました
+  （[issue #8](https://github.com/zephel01/Abyss/issues/8)）。
+
+それでも古い ROCm でビルドするときは、`ABYSS_OLD_ROCM=1 ./setup-deepseek.sh --backend hip` とします（止まる代わりに
+警告が出ます）。
+
+amdrocm 7.14（Windows の ROCm SDK 7.14 と同じ HIP の系列の、AMD のパッケージ）はこの確認を通りますが、Linux では
+ここで動かしていません。これもアーキテクチャごとに分かれています（`amdrocm7.14-gfx1201` など）。複数の版を入れると
+`/opt/rocm` がどちらを指すかがわかりにくくなるので、使わない版は消すか、`ROCM_PATH` で版を指定してください。
 
 ### 別の ROCm に切り替えるとき
 
@@ -325,7 +336,7 @@ iGPU のない PC でも、R9700 と十分な RAM があれば、この 6 問を
 |---|---|---|
 | `rocminfo` が `HSA_STATUS_ERROR_OUT_OF_RESOURCES` で終わる | `HSA_OVERRIDE_GFX_VERSION` が残っている | 「3. 環境変数」の手順で消し、ログインし直す |
 | `rocminfo` が `/dev/kfd` を開けない（permission denied） | `render` グループに入っていない | `sudo usermod -aG render,video $USER` のあとログインし直す |
-| モデルは読み込めて `/health` も答えるのに、どのリクエストも `kernel launch(es) failed`（HTTP 400）ですぐ失敗する | ドライバが RAM 層をピン留めできない: `sudo dmesg \| grep -i userptr` に `failed to pin userptr` や `failed to validate BO` が出る（カーネルの amdgpu。issue #1）。または、エンジンの ROCm がドライバと合わない（issue #1: ROCm 7.0 の pip SDK と amdgpu-dkms 6.19.14） | amdgpu-dkms と `iommu=pt`（「1. ドライバ」）、ROCm 10 にして、セットアップをもう一度（「別の ROCm に切り替えるとき」） |
+| モデルは読み込めて `/health` も答えるのに、どのリクエストも `kernel launch(es) failed`（HTTP 400）ですぐ失敗する | ドライバが RAM 層をピン留めできない: `sudo dmesg \| grep -i userptr` に `failed to pin userptr` や `failed to validate BO` が出る（カーネルの amdgpu。issue #1）。または、エンジンを ROCm 7.0〜7.2 でビルドした（issue #1: ROCm 7.0 の pip SDK と amdgpu-dkms 6.19.14。issue #8: 7.2.1。ログに `hipHostRegister: invalid argument`） | ROCm 10 にして、セットアップをもう一度（「別の ROCm に切り替えるとき」）。`dmesg` のエラーには amdgpu-dkms と `iommu=pt`（「1. ドライバ」） |
 | 生成はできるのに、最初の prompt で止まる。サーバーが 503 を返し、180 秒でエンジンが終了させられる | rocBLAS / hipBLASLt にその GPU のカーネルがない（例: gfx1151 の分しか入っていない） | `sudo apt install amdrocm10.0-<arch>`（R9700 なら gfx1201）。確かめ方は「4. 動作確認」 |
 | エンジンのログに `No compatible code objects found for: gfx1201` が出る。iGPU レーンで `invalid device function` になる | 古いビルドの `libabyss_igpu.so` に、エンジンの GPU 用のコードが入っていない。HIP は、見えている GPU のどれか 1 つでもコードがないライブラリだと、そのカーネルを全部の GPU で使えなくする | 今のソースでビルドし直す（`./setup-deepseek.sh --backend hip`） |
 | 単体カードがあるのに遅く、ログの GPU が iGPU（gfx1151）になっている | HIP の番号が入れ替わり、設定の `"gpu"` が iGPU を指している | 設定に `"gpu_pci"` を書く（「GPU の番号が変わる場合」）。`rocminfo` で順番を確かめる |

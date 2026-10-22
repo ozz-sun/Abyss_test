@@ -5,7 +5,7 @@ CUDA: Linux; Windows (experimental). HIP: experimental gfx1100/gfx1201/gfx1151, 
     ./abyss.sh                 the first run sets everything up and starts the dashboard; later runs just start it
     ./abyss.sh --setup         set up again (other GPUs, another context length, another model folder)
     ./abyss.sh --check         only check this PC
-    ./abyss.sh --backend hip --gpu 0 --check    check an RX 7900 XT / XTX with system ROCm 7
+    ./abyss.sh --backend hip --gpu 0 --check    check an RX 7900 XT / XTX with system ROCm 10
 
 On Windows START-ABYSS.bat takes the same options.  Both make the private Python environment (.venv) and run this
 file.  Its helpers (setup.py) do the PC checks, pip, llama.cpp's source and resumable downloads.
@@ -19,7 +19,7 @@ and Maya in the terminal as before; --yes: the setup in plain text.
 What the first run does (each step is skipped when it is already done):
 
   1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+, driver, CUDA toolkit (nvcc), the C++ compiler (g++;
-     on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
+     on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 10 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
      Maya-S24, Maya-M or Maya-L; or turboderp's EXL3 quant, experimental)
@@ -544,6 +544,28 @@ def hip_info(bindir) -> str | None:
 
 THEROCK_INDEX = "https://repo.amd.com/rocm/whl-multi-arch/"   # AMD's ROCm for Windows: TheRock's pip wheels
 THEROCK_VERSION = "7.14.1"                                     # 7.14: the first with Gorgon Halo (Ryzen AI Max 400)
+# The oldest HIP setup builds with: ROCm 10 (HIP 7.15) on Linux, TheRock's 7.14 on Windows.  The ROCm 7.0-7.2 releases
+# fail with current drivers - every request's kernel launches (issue #1, a 7.0 pip SDK after a kernel update) or the
+# RAM tier's host registration (issue #8, 7.2.1) - and ROCm 10 fixed both.  ABYSS_OLD_ROCM=1: build with one anyway
+HIP_MIN = (7, 14)
+
+
+def hip_new_enough(hipcc: str) -> None:
+    """Stops setup on a HIP older than HIP_MIN (ABYSS_OLD_ROCM=1: a warning, and the build goes on)."""
+    v = tool_version(hipcc)
+    if v >= HIP_MIN:
+        return
+    have = f"HIP {v[0]}.{v[1]} ({hipcc})" if v != (0, 0) else f"{hipcc} (it did not answer --version)"
+    why = ("ROCm 7.0-7.2 fail with current drivers: every request's kernel launches (issue #1) or the RAM tier's "
+           "registration (issue #8)")
+    if os.environ.get("ABYSS_OLD_ROCM") == "1":
+        warn(f"{have} is older than HIP {HIP_MIN[0]}.{HIP_MIN[1]}: {why} - building with it anyway (ABYSS_OLD_ROCM=1)")
+        return
+    fix = (f"let setup install AMD's ROCm SDK {THEROCK_VERSION} into Maya's .venv (unset ROCM_PATH)" if WIN else
+           "install ROCm 10 (AMD's amdrocm10.0 packages, /opt/rocm/core-10.0: docs/amd/README.md) and run setup "
+           "again, with ROCM_PATH=/opt/rocm/core-10.0 if an older ROCm is in /opt/rocm")
+    fail(f"Maya's HIP port requires HIP {HIP_MIN[0]}.{HIP_MIN[1]} or newer (ROCm 10, TheRock {THEROCK_VERSION}); "
+         f"found {have}. {why}", fix + " - ABYSS_OLD_ROCM=1 builds with it anyway")
 
 
 def rocm_pip(archs) -> list:
@@ -562,7 +584,7 @@ def install_rocm(a, chosen) -> None:
     what = f"AMD's ROCm SDK for Windows with the kernels for {', '.join(archs)}"
     if getattr(a, "check", False) or sys.prefix == sys.base_prefix:
         fail(f"{what} is not installed", f"install it into Maya's Python environment: {cmdline(cmd)}"
-             f" - then run {ME} again (or set ROCM_PATH / ROCM_VENV to a ROCm 7 that has one)")
+             f" - then run {ME} again (or set ROCM_PATH / ROCM_VENV to a ROCm SDK {THEROCK_VERSION} or newer that has one)")
     if ask(f"Install {what} ({THEROCK_VERSION}) into .venv now (pip, from repo.amd.com)?",
            ["y", "n"], "y", getattr(a, "yes", False)) != "y":
         fail("Maya's HIP engine is compiled with AMD's ROCm SDK", f"install it with: {cmdline(cmd)}")
@@ -634,21 +656,20 @@ def check_hip_pc(a, installed=False) -> dict:
         if hip_clang(root) is None or not (list(root.glob("lib/hipblas*.lib")) or list(bindir.glob("hipblas*.dll"))):
             fail(f"ROCm's HIP compiler and hipBLAS are not in {root}",
                  f"install AMD's ROCm SDK into Maya's .venv: {cmdline(rocm_pip(g['arch'] for g in chosen))} - or set "
-                 "ROCM_PATH to the root of a ROCm 7 for Windows")
+                 f"ROCM_PATH to the root of a ROCm SDK {THEROCK_VERSION} or newer for Windows")
         hipcc = next((p for p in (bindir / "hipcc.exe", root / "bin" / "hipcc.exe") if p.exists()), None)
-        if hipcc is not None and tool_version(str(hipcc)) < (7, 0):
-            fail("Maya's HIP port requires ROCm 7 or newer")
+        if hipcc is not None:
+            hip_new_enough(str(hipcc))
     else:
         root, found = linux_rocm_root()
         if not found:
             fail("ROCm's HIP compiler (llvm/bin/clang++ or lib/llvm/bin/clang++) and hipBLAS are required under "
-                 f"{root}", "install ROCm 7 or newer, or set ROCM_PATH to its root - ROCm 10's packages: "
+                 f"{root}", "install ROCm 10, or set ROCM_PATH to its root - ROCm 10's packages: "
                  "/opt/rocm/core-<version> (e.g. /opt/rocm/core-10.0); AMD's pip wheels: the directory rocm-sdk path "
                  "--root prints")
         # hipcc: <root>/bin, or lib/llvm/bin (ROCm 10's packages)
         hipcc = next((p for p in (root / "bin/hipcc", root / "lib/llvm/bin/hipcc") if p.exists()), root / "bin/hipcc")
-        if tool_version(str(hipcc)) < (7, 0):
-            fail("Maya's HIP port requires ROCm 7 or newer (" + str(hipcc) + " did not answer, or is older)")
+        hip_new_enough(str(hipcc))
         if not shutil.which("c++"):
             fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
     cpu, avx2, avx512 = S.cpu_info()
