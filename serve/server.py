@@ -233,6 +233,12 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[maya] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+def engine_model_path(args: list[str]) -> str:
+    """The model the engine's arguments name, for /props: `--native`, `--glm-pack` (GLM, V4.1, Ornith) or `--pack`."""
+    paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--glm-pack", "--pack")}
+    return paths.get("--native") or paths.get("--glm-pack") or paths.get("--pack", "pack/full")
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -247,8 +253,7 @@ class StrataEngine:
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        self.model_path = engine_model_path(args)
         self.log_path = log
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops

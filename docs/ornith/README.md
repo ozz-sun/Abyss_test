@@ -62,7 +62,7 @@ a config next to the others:
  "model_name": "ornith-1.5-122b",
  "gpu": [0],
  "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
- "port": 8083,
+ "port": 8082,
  "log": "<Abyss>/abyss-ornith.log",
  "env": {"STRATA_GLM_RAM_GB": "60", "STRATA_GLM_USAGE": "0"}
 }
@@ -74,7 +74,7 @@ model card's. Then:
 
 ```sh
 systemd-run --user --scope -p MemoryMax=88G .venv/bin/python serve/server.py --engine strata \
-  --config abyss-ornith.json --port 8083
+  --config abyss-ornith.json --port 8082
 ```
 
 ## Speed and quality (AI PRO R9700 + Radeon 8060S lane + 94 GB RAM, ROCm 10)

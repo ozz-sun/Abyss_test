@@ -7,6 +7,20 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.47 - 2026-10-23
+
+**`/props` names the model of a GLM, DeepSeek V4.1 or Ornith config; Ornith's docs use port 8082 like the other
+configs.**
+
+- The server's `/props` reported `model_path: "pack/full"` for every config that names its model with `--glm-pack`
+  (GLM-5.3-Flash, DeepSeek V4.1, Ornith-1.5-122B): it read only `--native` and `--pack`. It now reads `--glm-pack` too
+  (`engine_model_path`, a server test), so benchmark tools that read `/props` see the pack's real path and its quant.
+- docs/ornith: the config's example and the start command use port 8082, the port of the other models' configs (one
+  model runs at a time).
+- Known: with the NextN drafter, Ornith's decode slows down at long contexts (about 42 tok/s at a few thousand tokens,
+  about 8 tok/s past 20K): the verify window's full-attention layers run in 1-4 blocks that walk every cached position
+  one by one. A split attention for the window is next.
+
 ## v1.3.46 - 2026-10-22
 
 **Ornith-1.5-122B (Qwen3.5-MoE) runs on the engine, on HIP and CUDA - a prompt path, a verify window and the GGUF's

@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, Service, StrataEngine, request_timings, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, engine_model_path, Service, StrataEngine, request_timings, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -904,6 +904,12 @@ class WebApp(unittest.TestCase):
         props = json.loads(self.get("/props")[2])
         self.assertNotIn("build_info", props)
         self.assertNotIn("model_path", props)
+
+    def test_engine_model_path_reads_the_pack_flags(self):
+        self.assertEqual(engine_model_path(["--glm-pack", "/m/pack", "--max-context", "65536"]), "/m/pack")
+        self.assertEqual(engine_model_path(["--pack", "/m/pack-dsv4"]), "/m/pack-dsv4")
+        self.assertEqual(engine_model_path(["--native", "/m/a.gguf", "--pack", "/m/p"]), "/m/a.gguf")
+        self.assertEqual(engine_model_path(["--max-context", "65536"]), "pack/full")
 
     def test_discovery_does_not_restart_a_dead_engine(self):
         self.svc.engine.alive = lambda: False
