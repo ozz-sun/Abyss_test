@@ -39,6 +39,9 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - The decode recurrence through a register-column scan (the state read and written once; the GDN phase 3.0 -> 1.8 ms
   a token) and the conv / norms / gates in fewer launches.
 - Debug: `GLM_CB_DIR` seam dumps for the arch under llama.cpp's cb names (`GLM_CB_POS=1` a file a position).
+- The prompt path's F32 router (DeepSeek V4.1, Ornith) on HIP through the engine's own tile GEMM: rocBLAS's F32
+  GEMM took 15.7 ms a layer inside the engine (a third of an Ornith prompt: 575 tokens 233 -> 359 tok/s on an AI PRO
+  R9700) against 0.2 ms for the same shape alone; CUDA keeps cuBLAS.
 
 ## v1.3.45 - 2026-10-22
 

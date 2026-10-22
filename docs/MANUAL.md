@@ -375,7 +375,7 @@ layer with 8 routed and a gated shared expert, a plain residual. It is set up by
   Q8_0 dense weights that stay on the GPU. A 32 GB card holds ~25 GB of experts; a 60 GB RAM tier the rest, so on a
   94 GB box decode reads nothing from the SSD.
 - **Speed.** AI PRO R9700 + 8060S lane: decode 23-25 ms a token (41-43 tok/s; the CPU lane instead of the iGPU:
-  30 ms), a 575-token prompt at 233 tok/s through the batched path. KL 0.024 against llama.cpp over 559 positions - llama.cpp's own CPU and HIP backends differ by
+  30 ms), a 575-token prompt at 359 tok/s through the batched path. KL 0.024 against llama.cpp over 559 positions - llama.cpp's own CPU and HIP backends differ by
   0.027-0.029 on this model.
 - **Speculative decoding.** The n-gram drafts run through the verify window (one draft a window by default,
   `STRATA_DS4_SPEC=<k>` more): a copy task 57 tok/s with one, 76 with three. The GGUF's NextN block drafts too once

@@ -118,6 +118,9 @@ void mtp_in_rows(const float* emb, const float* h, const float* enorm, const flo
                  void* out16, cudaStream_t s);
 /// x[t] = rms(in[t]) * w as F32 and FP16.  n_embd <= 4096, a multiple of 256.
 void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, float* x, void* x16, cudaStream_t s);
+/// logits[t][e] = x[t] . w[e] over T rows of n_embd and NE expert rows (an F32 router): a 32 x 32 tile a block (the
+/// prompt router on HIP, where rocBLAS's F32 GEMM took ~15 ms a layer for 575 rows x 256 experts x 3072).
+void router_f32(const float* w, int NE, const float* x, int T, int n_embd, float* logits, cudaStream_t s);
 
 /// The router per token (router_sigmoid's arithmetic: sigmoid, bias selection, stable top-k, normalised weights).
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,

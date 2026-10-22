@@ -86,7 +86,7 @@ systemd-run --user --scope -p MemoryMax=88G .venv/bin/python serve/server.py --e
 | a copy task with the engine's n-gram drafts (the default, `STRATA_DS4_SPEC=1`; `=3`: three drafts) | 17.4 ms a token (57 tok/s); 13.1 (76 tok/s) |
 | with the NextN block's drafts (`STRATA_GLM_MTP_GGUF`, below): code / prose / the copy task | 16.9 (59 tok/s) / 20.0 (50) / 11.8 (85) |
 | ... the CPU computing the lane (no iGPU): code / prose | 24.0 (42 tok/s) / 25.5 (39), from 28.0 / 30.3 |
-| a 575-token prompt through the batched path (chunks up to 32768, sub-batches of 1024) | 233 tok/s |
+| a 575-token prompt through the batched path (chunks up to 32768, sub-batches of 1024) | 359 tok/s |
 | KL against llama.cpp (its CPU backend), 559 positions of a 576-token text | 0.024 |
 | ... the same text, the first half through the prompt path, the 287 positions after it | 0.026 |
 
@@ -95,7 +95,9 @@ quantisation noise of 48 layers), so both paths sit at that floor. Where a decod
 `STRATA_GLM_PROF=1`): the delta-net projections 5.0 ms, the recurrence and its norms 3.6 ms, the lane's answer 2.5,
 the pool's experts 3.4, `ssm_out` 2.0, the attention projections 1.4, the shared expert and router 1.8, the norms 1.0.
 Without the iGPU the CPU lane (16 threads, 0.046 ms an expert, ~200 experts a token) is what the GPU waits for:
-7.2 ms a token.
+7.2 ms a token. The prompt: the staged experts 63% (the RAM tier's, computed on the lane or copied), the delta-net
+projections 19%; the router runs on the engine's own tile kernel on HIP (rocBLAS's F32 GEMM took 15.7 ms a layer
+inside the engine, a third of the prompt, against 0.2 ms for the same shape alone).
 
 **Speculative decoding.** The engine's n-gram drafts (the latest earlier occurrence of the last tokens in the prompt
 and the answer proposes the next ones, [the manual](../MANUAL.md#memory-and-speed)) run on this model through its

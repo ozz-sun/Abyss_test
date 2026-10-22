@@ -370,7 +370,7 @@ llama.cpp の `qwen35moe`）も動かします。gated delta-net 層 36 + full a
   GPU に置く Q8_0 の dense 5.4 GB。32 GB のカードにはエキスパート約 25 GB が載り、残りは RAM 層 60 GB に入るので、
   94 GB の PC ではデコード中に SSD を読みません。
 - **速度。** AI PRO R9700 + 8060S レーン: デコード 1 トークン 23〜25 ms（41〜43 tok/s。iGPU の代わりに CPU が
-  レーンを計算すると 30 ms）、575 トークンのプロンプトはバッチ経路で 233 tok/s。llama.cpp との KL は 559 位置で 0.024（このモデルでは llama.cpp 自身の CPU と HIP の差が
+  レーンを計算すると 30 ms）、575 トークンのプロンプトはバッチ経路で 359 tok/s。llama.cpp との KL は 559 位置で 0.024（このモデルでは llama.cpp 自身の CPU と HIP の差が
   0.027〜0.029）。
 - **投機デコード。** n-gram ドラフトが検証窓を通って動きます（既定は 1 窓 1 ドラフト、`STRATA_DS4_SPEC=<k>` で増やす）:
   コピー課題で 1 ドラフト 57 tok/s、3 ドラフト 76 tok/s。GGUF の NextN ブロックもドラフターになります（エキスパートを

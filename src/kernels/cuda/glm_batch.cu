@@ -2058,6 +2058,62 @@ void mtp_in_rows(const float* emb, const float* h, const float* enorm, const flo
     check("mtp_in_rows");
 }
 
+// C[t][e] = sum_k X[t][k] W[e][k]: 32 x 32 outputs a block of 16 x 16 threads (2 x 2 each), k in tiles of 32 through
+// shared memory, both operands read along k (coalesced)
+__global__ void __launch_bounds__(256) router_f32_kernel(const float* __restrict__ w, int NE, const float* __restrict__ x,
+                                                         int T, int K, float* __restrict__ out) {
+    __shared__ float xs[32][33], ws[32][33];
+    const int t0 = blockIdx.x * 32, e0 = blockIdx.y * 32, tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
+    float acc[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        // 256 threads load 32 rows x 32 k of each operand: thread i -> row i / 8, k chunk (i % 8) * 4
+        const int r = threadIdx.x >> 3, kc = (threadIdx.x & 7) * 4;
+        const int tt = t0 + r, ee = e0 + r, kk = k0 + kc;
+        if (kk + 3 < K) {
+            if (tt < T) {
+                const float4 v = *reinterpret_cast<const float4*>(x + (size_t) tt * K + kk);
+                xs[r][kc] = v.x; xs[r][kc + 1] = v.y; xs[r][kc + 2] = v.z; xs[r][kc + 3] = v.w;
+            } else {
+                xs[r][kc] = xs[r][kc + 1] = xs[r][kc + 2] = xs[r][kc + 3] = 0.0f;
+            }
+            if (ee < NE) {
+                const float4 v = *reinterpret_cast<const float4*>(w + (size_t) ee * K + kk);
+                ws[r][kc] = v.x; ws[r][kc + 1] = v.y; ws[r][kc + 2] = v.z; ws[r][kc + 3] = v.w;
+            } else {
+                ws[r][kc] = ws[r][kc + 1] = ws[r][kc + 2] = ws[r][kc + 3] = 0.0f;
+            }
+        } else {
+            for (int j = 0; j < 4; ++j) {
+                const int k = kk + j;
+                xs[r][kc + j] = tt < T && k < K ? x[(size_t) tt * K + k] : 0.0f;
+                ws[r][kc + j] = ee < NE && k < K ? w[(size_t) ee * K + k] : 0.0f;
+            }
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int k = 0; k < 32; ++k) {
+            const float x0 = xs[ty * 2][k], x1 = xs[ty * 2 + 1][k];
+            const float w0 = ws[tx * 2][k], w1 = ws[tx * 2 + 1][k];
+            acc[0][0] += x0 * w0;
+            acc[0][1] += x0 * w1;
+            acc[1][0] += x1 * w0;
+            acc[1][1] += x1 * w1;
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int t = t0 + ty * 2 + i, e = e0 + tx * 2 + j;
+            if (t < T && e < NE) out[(size_t) t * NE + e] = acc[i][j];
+        }
+}
+void router_f32(const float* w, int NE, const float* x, int T, int n_embd, float* logits, cudaStream_t s) {
+    if (T <= 0 || NE <= 0) return;
+    router_f32_kernel<<<dim3((unsigned) ((T + 31) / 32), (unsigned) ((NE + 31) / 32)), 256, 0, s>>>(w, NE, x, T, n_embd, logits);
+    check("router_f32");
+}
 void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, float* x, void* x16, cudaStream_t s) {
     if (T <= 0) return;
     rms_rows_kernel<<<T, 256, 0, s>>>(in, w, eps, n_embd, x, (__half*) x16);

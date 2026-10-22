@@ -2281,12 +2281,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             S->mark("shexp", s);
         };
         if (!sh_late) shared_expert();
-        if (Ly.router_type == gf::kTypeF32)   // (deepseek41 from ds4's layout: an F32 router)
+        if (Ly.router_type == gf::kTypeF32) {   // (deepseek41, qwen35moe: an F32 router)
+#if defined(STRATA_USE_HIP)
+            // the engine's own tile kernel: rocBLAS's F32 GEMM took 15.7 ms a layer here (575 rows, 256 experts, 3072),
+            // 751 of a 575-token prompt's 2255 ms (an AI PRO R9700), against 0.2 ms for the same shape alone
+            gb::router_f32((const float*) Ly.router, NE, S->x, T, E, M.logits, s);
+#else
             blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, NE, T, E, &one, (const float*) Ly.router, E, S->x, E,
                                 &zero, M.logits, NE),
                     "router sgemm");
-        else
+#endif
+        } else {
             sgemm_bf16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
+        }
+        S->mark("router", s);
         gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s, g.gating,
                   Ly.tid2eid, S->toks_d);
         gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);
