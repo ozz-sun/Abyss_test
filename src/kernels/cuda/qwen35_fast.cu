@@ -165,9 +165,9 @@ __global__ void __launch_bounds__(kWarps * 32) attn_part_kernel(const float* __r
     }
 }
 
-// grid n_head, 256 threads (a dim each): the chunks' partials merged
+// grid (n_head, rows), 256 threads (a dim each): the chunks' partials merged (part and out row-major: [row][head])
 __global__ void __launch_bounds__(kD) attn_merge_kernel(const float* __restrict__ part, int n_chunks, float* __restrict__ out) {
-    const int h = blockIdx.x, d = threadIdx.x;
+    const int h = blockIdx.y * gridDim.x + blockIdx.x, d = threadIdx.x;
     const float* P = part + (size_t) h * n_chunks * (kD + 2);
     float M = -INFINITY;
     for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, P[(size_t) c * (kD + 2) + kD]);
@@ -449,6 +449,73 @@ __global__ void __launch_bounds__(256) attn_prompt_kernel(const float* __restric
         }
     }
 }
+// a verify window's attention (T <= 8 rows): attn_prompt_kernel's block (4 queries x one KV head's group) over one
+// chunk of kWinChunk key positions, its partials (max, sum, the unnormalized accumulator) into part
+// [row][head][chunk] for attn_merge_kernel - the window's few rows alone gave attn_prompt 1-4 blocks, each walking
+// every cached position.  grid (ceil(T / 4), n_head_kv, n_chunks)
+constexpr int kWinChunk = 128;
+template <int HW>
+__global__ void __launch_bounds__(256) attn_window_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kc,
+                                                          const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
+                                                          int64_t p0, int T, float scale, float* __restrict__ part,
+                                                          int n_chunks) {
+    constexpr int QB = 4;
+    const int g = blockIdx.y, t0 = blockIdx.x * QB, c = blockIdx.z, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int G = n_head / n_head_kv, h0 = g * G + warp * HW;
+    const int nq = min(QB, T - t0);
+    float qr[QB][HW][8], acc[QB][HW][8], m[QB][HW], l[QB][HW];
+#pragma unroll
+    for (int qi = 0; qi < QB; ++qi)
+#pragma unroll
+        for (int hi = 0; hi < HW; ++hi) {
+            const float* qp = q + ((size_t) (t0 + (qi < nq ? qi : 0)) * n_head + h0 + hi) * kD + lane * 8;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                qr[qi][hi][e] = qp[e] * scale;
+                acc[qi][hi][e] = 0.0f;
+            }
+            m[qi][hi] = -INFINITY;
+            l[qi][hi] = 0.0f;
+        }
+    const int64_t k0 = (int64_t) c * kWinChunk, k1 = min(k0 + kWinChunk, p0 + t0 + nq);
+    for (int64_t kp = k0; kp < k1; ++kp) {
+        const size_t row = ((size_t) kp * n_head_kv + g) * kD + lane * 8;
+        float kf[8], vf[8];
+        unpack8(*reinterpret_cast<const uint4*>(kc + row), kf);
+        unpack8(*reinterpret_cast<const uint4*>(vc + row), vf);
+#pragma unroll
+        for (int hi = 0; hi < HW; ++hi)
+#pragma unroll
+            for (int qi = 0; qi < QB; ++qi) {
+                float sdot = 0.0f;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) sdot += qr[qi][hi][e] * kf[e];
+                sdot = warp_sum(sdot);
+                if (qi < nq && kp <= p0 + t0 + qi) {   // (warp-uniform)
+                    const float mn = fmaxf(m[qi][hi], sdot);
+                    const float corr = expf(m[qi][hi] - mn), pe = expf(sdot - mn);
+                    l[qi][hi] = l[qi][hi] * corr + pe;
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[qi][hi][e] = acc[qi][hi][e] * corr + pe * vf[e];
+                    m[qi][hi] = mn;
+                }
+            }
+    }
+#pragma unroll
+    for (int qi = 0; qi < QB; ++qi) {
+        if (qi >= nq) break;
+#pragma unroll
+        for (int hi = 0; hi < HW; ++hi) {
+            float* op = part + (((size_t) (t0 + qi) * n_head + h0 + hi) * n_chunks + c) * (kD + 2);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) op[lane * 8 + e] = acc[qi][hi][e];
+            if (lane == 0) {
+                op[kD] = m[qi][hi];
+                op[kD + 1] = l[qi][hi];
+            }
+        }
+    }
+}
 __global__ void attn_gate_rows_kernel(float* __restrict__ o, const float* __restrict__ qf, int n_head) {
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     o[((size_t) t * n_head + h) * kD + d] *= sigmoid_f(qf[((size_t) t * n_head + h) * 2 * kD + kD + d]);
@@ -641,6 +708,27 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
     else if (G == 16) attn_prompt_kernel<2><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
     else attn_prompt_kernel<4><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
     check("attn_prompt");
+}
+size_t attn_window_floats(int n_head, int head_dim, int max_ctx, int max_rows) {
+    const size_t chunks = ((size_t) max_ctx + kWinChunk - 1) / kWinChunk + 1;
+    return (size_t) max_rows * n_head * chunks * ((size_t) head_dim + 2);
+}
+void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
+                 int64_t p0, int T, float scale, float* part, float* out, cudaStream_t s) {
+    if (T <= 0) return;
+    const int G = n_head_kv > 0 ? n_head / n_head_kv : 0;
+    if (head_dim != kD || G * n_head_kv != n_head || (G != 8 && G != 16 && G != 32)) {
+        std::fprintf(stderr, "qwen35 attn_window: head_dim %d, heads %d / %d (a group of 8, 16 or 32)\n", head_dim,
+                     n_head, n_head_kv);
+        return;
+    }
+    const int n_chunks = (int) ((p0 + T + kWinChunk - 1) / kWinChunk);
+    const dim3 grid((unsigned) ((T + 3) / 4), (unsigned) n_head_kv, (unsigned) n_chunks);
+    if (G == 8) attn_window_kernel<1><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+    else if (G == 16) attn_window_kernel<2><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+    else attn_window_kernel<4><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+    attn_merge_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(part, n_chunks, out);
+    check("attn_window");
 }
 void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_dim, cudaStream_t s) {
     if (T <= 0 || head_dim != kD) return;

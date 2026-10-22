@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.48 - 2026-10-23
+
+**Ornith's decode at long contexts: the verify window's attention split into chunks - 19K tokens in, 27 -> 40 tok/s
+with the NextN drafter; short answers unchanged.**
+
+- The verify window (a token and its drafts) ran its 12 full-attention layers through the prompt path's kernel, which
+  gives a block to every 4 rows and KV group: a window of 2-8 rows got 1-4 blocks, each walking every cached position
+  in turn - 25.6 ms a layer at 20K positions (4 rows, AI PRO R9700), and decode fell to ~8 tok/s in long swe-bench
+  answers. `q35::attn_window` keeps that block (each key read once for 4 rows x 16 heads) over chunks of 128 positions
+  and merges the chunks' partials: 0.69 ms a layer at 20K (37x), 0.33 at 8K, 0.18 at 2K.
+- Measured (UD-Q4_K_XL, R9700 + 8060S lane, greedy): a 18,955-token prompt then 2,048 tokens with the NextN drafter
+  27.8 / 26.8 -> 40.3 tok/s (without drafts 43.3, n-gram drafts only 44.5: at long contexts the drafter no longer
+  pays - next); 512-token answers prose 50.2 / 49.4 -> 51.9 / 52.8, code 54.1 / 56.6 -> 55.5 / 56.0; the drafts' accept
+  rate unchanged (71-76%).
+- The same sums as before up to their order (the window's attention against attn_prompt: 1.1e-4 relative at most,
+  windows of 1-8 rows at positions 0-20,000; `tests/hip/q35_attn_window.cpp`). Greedy answers part from the old
+  build's within the first few dozen tokens, as two runs of the same build do.
+- The window's scratch: 135 MB of VRAM at a 65,536-token context.
+
 ## v1.3.47 - 2026-10-23
 
 **`/props` names the model of a GLM, DeepSeek V4.1 or Ornith config; Ornith's docs use port 8082 like the other

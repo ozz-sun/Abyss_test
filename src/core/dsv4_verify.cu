@@ -138,7 +138,7 @@ struct VerifyBuf {
     float *q35_qkv = nullptr, *q35_rows = nullptr, *q35_alpha = nullptr, *q35_beta = nullptr;
     float *q35_snap = nullptr, *q35_csnap = nullptr;
     float *q35_z = nullptr, *q35_o = nullptr, *q35_y = nullptr, *q35_qf = nullptr, *q35_k = nullptr, *q35_v = nullptr,
-          *q35_q = nullptr, *q35_ao = nullptr, *q35_shg = nullptr;
+          *q35_q = nullptr, *q35_ao = nullptr, *q35_shg = nullptr, *q35_part = nullptr;
     void *q35_yq = nullptr, *q35_aoq = nullptr;
 };
 }  // namespace
@@ -221,6 +221,9 @@ bool Glm5Model::verify_alloc(std::string& err) {
         f(V->q35_z, Vd); f(V->q35_o, Vd); f(V->q35_y, Vd); b(V->q35_yq, Vd / 32 * kQ8);
         f(V->q35_qf, 2 * HD); f(V->q35_k, KV); f(V->q35_v, KV); f(V->q35_q, HD); f(V->q35_ao, HD); b(V->q35_aoq, HD / 32 * kQ8);
         f(V->q35_shg, 1);
+        ok = ok && cudaMalloc((void**) &V->q35_part,
+                              q35::attn_window_floats(g.n_head, (int) D, (int) std::max<int64_t>(max_ctx_, 1), (int) TM) *
+                                  sizeof(float)) == cudaSuccess;
     }
     if (ok && g.v41) {
         const size_t ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
@@ -1329,8 +1332,8 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             if (!gf::mvn(j, 3, T, s)) { err = "qwen35 verify: the attention projections"; return false; }
             q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
                                 g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s);
-            q35::attn_prompt(V->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p0, T, 1.0f / std::sqrt((float) D),
-                             V->q35_ao, s);
+            q35::attn_window(V->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p0, T, 1.0f / std::sqrt((float) D),
+                             V->q35_part, V->q35_ao, s);
             q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s);
             gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HD, s);
             gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HD, (int) E};

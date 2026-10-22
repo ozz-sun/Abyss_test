@@ -75,6 +75,13 @@ void attn_prep_rows(const float* q_full, const float* k, const float* v, const f
 /// 32 of them), a warp 1, 2 or 4 heads, a lane 8 dims; the keys stream past once a block.  head_dim 256.
 void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
                  int64_t p0, int T, float scale, float* out, cudaStream_t s);
+/// The scratch (floats) attn_window needs for max_rows rows of n_head heads over a cache of max_ctx positions.
+size_t attn_window_floats(int n_head, int head_dim, int max_ctx, int max_rows);
+/// attn_prompt for a verify window's few rows (row t at position p0 + t): the keys split into chunks of 128 positions,
+/// a block each per 4 rows and KV group, the partials into part, then merged - the same sums as attn_prompt up to
+/// their order.  head_dim 256.
+void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
+                 int64_t p0, int T, float scale, float* part, float* out, cudaStream_t s);
 /// attn_gate over T rows.
 void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_dim, cudaStream_t s);
 /// attn_prep_rows' K / V half alone: k / v rows [T][n_head_kv][head_dim] (k_norm, RoPE) into the caches' rows p0 ..
