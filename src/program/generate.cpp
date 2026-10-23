@@ -1674,6 +1674,60 @@ static int glm_pack_generate(const Options& o) {
             const auto ms_since = [](std::chrono::steady_clock::time_point a) {
                 return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
             };
+            // STRATA_DS4_SPEC_COST=1 (opt-in): the window's size by the tokens it is expected to keep a millisecond
+            // (Strata v0.2's draft policy) instead of the fixed confidence rules above.  A step of c columns (1 = the
+            // token alone) costs cw[c], this request's running mean of what such steps took; a draft is kept with
+            // probability a(confidence), the drafter's confidences calibrated against what the verify windows and
+            // single tokens produced (8 bins, prior: the confidence itself) - a repeat's drafts with their running
+            // shares.  k drafts are expected to keep E(k) = 1 + q1 + .. + qk tokens (qj: drafts 1..j all kept); the k
+            // of the largest E(k) / cw[k+1] wins, a wider one only by 2%.  Every 16th step tries a width measured
+            // fewer than 3 times.  Where windows cost the SSD more than they keep (short answers, new code), the
+            // token goes alone.
+            static const bool d_cost = [] {
+                const char* v = std::getenv("STRATA_DS4_SPEC_COST");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            double cw[7] = {0, 0, 0, 0, 0, 0, 0};
+            int cw_n[7] = {0, 0, 0, 0, 0, 0, 0};
+            double cal_h[8], cal_n[8];
+            for (int b = 0; b < 8; ++b) {
+                cal_h[b] = 4.0 * (b + 0.5) / 8.0;
+                cal_n[b] = 4.0;
+            }
+            const auto cal_bin = [](float p) { return std::max(0, std::min(7, (int) (p * 8.0f))); };
+            int64_t n_cost = 0;
+            const auto cost_pick = [&](const double* a, int kmax, int fallback) {
+                if (cw_n[1] == 0) return fallback;   // (nothing measured yet)
+                if ((++n_cost & 15) == 0)
+                    for (int c2 = 2; c2 <= kmax + 1; ++c2)
+                        if (cw_n[c2] < 3) return c2 - 1;
+                double best = -1.0, e = 1.0, q = 1.0, t_last = cw[1];
+                int bk = 0, c_last = 1;
+                for (int kk = 0; kk <= kmax; ++kk) {
+                    if (kk > 0) {
+                        q *= a[kk - 1];
+                        e += q;
+                    }
+                    // an unmeasured width: the widest measured below it, + 30% of a single token a column
+                    double t = cw[kk + 1];
+                    if (cw_n[kk + 1] > 0) {
+                        t_last = t;
+                        c_last = kk + 1;
+                    } else {
+                        t = t_last + 0.3 * cw[1] * (double) (kk + 1 - c_last);
+                    }
+                    const double v = e / t;
+                    if (v > best * (kk > 0 ? 1.02 : 1.0)) {
+                        best = v;
+                        bk = kk;
+                    }
+                }
+                return bk;
+            };
+            const auto cw_add = [&](int cols, double ms) {
+                cw[cols] = cw_n[cols] > 0 ? 0.9 * cw[cols] + 0.1 * ms : ms;
+                ++cw_n[cols];
+            };
             for (;;) {
                 if (stop_req.load()) {
                     finish = "cancel";
@@ -1696,7 +1750,13 @@ static int glm_pack_generate(const Options& o) {
                         pc *= ng_pp[k];
                         d[k] = ng[(size_t) k];
                     }
+                    if (rep && d_cost) {
+                        const int n = std::min<int>((int) ng.size(), 5);
+                        for (int i = 0; i < n; ++i) d[i] = ng[(size_t) i];
+                        k = cost_pick(ng_pp, n, k);
+                    }
                 }
+                int dk = 0;   // the drafter's drafts this step (all of them: the calibration's)
                 // the repeat's proposal against what the step produces (its accepted drafts, then the next token)
                 const auto ng_learn = [&]() {
                     for (size_t i = 0; i < ng.size() && i < came.size() && i < 5; ++i) {
@@ -1718,8 +1778,25 @@ static int glm_pack_generate(const Options& o) {
                     } else {
                         while (k < room && c[k] >= d_thr) ++k;
                     }
+                    dk = room;
+                    if (d_cost) {
+                        double a[5];
+                        for (int i = 0; i < room; ++i) a[i] = cal_h[cal_bin(c[i])] / cal_n[cal_bin(c[i])];
+                        k = cost_pick(a, room, k);
+                    }
                     ms_dr += ms_since(td);
                 }
+                // the drafter's drafts against what the step produced: a draft reached (the ones before kept) and
+                // kept or not, in its confidence's bin
+                const auto cal_learn = [&]() {
+                    for (int i = 0; i < dk && i < (int) came.size(); ++i) {
+                        const int b = cal_bin(c[i]);
+                        const bool hit = came[(size_t) i] == d[i];
+                        cal_h[b] = 0.995 * cal_h[b] + (hit ? 1.0 : 0.0);
+                        cal_n[b] = 0.995 * cal_n[b] + 1.0;
+                        if (!hit) break;
+                    }
+                };
                 if (!rep) ++n_k[k];
                 const auto tw = std::chrono::steady_clock::now();
                 if (k == 0) {
@@ -1736,9 +1813,12 @@ static int glm_pack_generate(const Options& o) {
                     }
                     tok = model.forced(tok);
                     sp.counter += 1;
-                    ms_one += ms_since(tw);
+                    const double m1 = ms_since(tw);
+                    ms_one += m1;
                     came.push_back(tok);
                     ng_learn();
+                    cal_learn();
+                    cw_add(1, m1);
                     continue;
                 }
                 win.assign(1, (int32_t) tok);
@@ -1782,8 +1862,10 @@ static int glm_pack_generate(const Options& o) {
                 }
                 model.spec_rewind(p0 + kept);
                 ng_learn();
+                cal_learn();
                 const double mw = ms_since(tw);
                 ms_win += mw;
+                cw_add(k + 1, mw);
                 // STRATA_DS4_DSPARK_LOG=<n>: every n windows, their mean time and size (the decode's drift)
                 static const int d_log = [] {
                     const char* v = std::getenv("STRATA_DS4_DSPARK_LOG");
@@ -1814,6 +1896,14 @@ static int glm_pack_generate(const Options& o) {
                          (long long) n_k[4], (long long) n_k[5], ms_win / (double) std::max<int64_t>(1, n_win),
                          ms_one / (double) std::max<int64_t>(1, n_one), ms_dr / (double) std::max<int64_t>(1, n_dsp),
                          (double) (steps + n_acc) / (double) std::max<int64_t>(1, steps));
+            if (d_cost)
+                std::fprintf(stderr, "ds4 spec cost: ms a step by columns 1..6: %.1f %.1f %.1f %.1f %.1f %.1f (%d %d %d %d "
+                                     "%d %d steps); the drafter's confidence bins kept: %.2f %.2f %.2f %.2f %.2f %.2f "
+                                     "%.2f %.2f\n",
+                             cw[1], cw[2], cw[3], cw[4], cw[5], cw[6], cw_n[1], cw_n[2], cw_n[3], cw_n[4], cw_n[5],
+                             cw_n[6], cal_h[0] / cal_n[0], cal_h[1] / cal_n[1], cal_h[2] / cal_n[2],
+                             cal_h[3] / cal_n[3], cal_h[4] / cal_n[4], cal_h[5] / cal_n[5], cal_h[6] / cal_n[6],
+                             cal_h[7] / cal_n[7]);
         } else if (spec_k > 0 && model.fast() && model.verify_ready()) {
             // deepseek4's n-gram speculative decode (STRATA_DS4_SPEC=<k>): after each token, the latest earlier
             // occurrence of the last spec_min tokens in the prompt + the answer so far proposes the next k; the token
