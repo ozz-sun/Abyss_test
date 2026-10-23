@@ -144,7 +144,7 @@ struct DSparkState {
     // statistics; STRATA_DS4_DSPARK_PROF=1: the device time of a draft's phases (events: start, each stage's attention
     // and MoE, the head, the Markov chain)
     uint64_t drafts = 0, uses = 0, misses = 0, uploads = 0, commits = 0;
-    double ms_draft = 0.0;
+    double ms_draft = 0.0, ms_up = 0.0;   // (ms_up: dspark_upload's host side - the staging copies)
     bool prof = false;
     static constexpr int kPh = 2 * kStages + 2;
     cudaEvent_t ev[kPh + 1] = {};
@@ -630,10 +630,10 @@ void Glm5Model::dspark_report() const {
     const auto* D = (const DSparkState*) dsp_;
     if (D == nullptr || D->drafts == 0) return;
     std::fprintf(stderr, "dspark: %llu drafts, %.2f ms each (host to results); routed experts %llu, %.1f%% without a "
-                         "slot (%s a stage), %llu uploads; %llu context commits\n",
+                         "slot (%s a stage), %llu uploads (%.1f ms on the host); %llu context commits\n",
                  (unsigned long long) D->drafts, D->ms_draft / (double) D->drafts, (unsigned long long) D->uses,
                  100.0 * (double) D->misses / (double) std::max<uint64_t>(1, D->uses), slots_str(D).c_str(),
-                 (unsigned long long) D->uploads, (unsigned long long) D->commits);
+                 (unsigned long long) D->uploads, D->ms_up, (unsigned long long) D->commits);
     if (D->prof) {
         static const char* names[DSparkState::kPh] = {"embed", "s0 attn", "s0 moe", "s1 attn", "s1 moe", "s2 attn",
                                                      "s2 moe", "head+markov"};
@@ -730,6 +730,7 @@ void Glm5Model::dspark_upload() {
     auto* D = (DSparkState*) dsp_;
     if (D == nullptr || D->ups.empty()) return;
     const int E = g_.n_embd, FF = D->ff;
+    const auto t0 = std::chrono::steady_clock::now();
     cudaEventSynchronize(D->ev_up);   // (the staging buffers of the last uploads; long done)
     const size_t gu = (size_t) FF * D->gu_rb, dn = (size_t) E * D->dn_rb;
     for (size_t i = 0; i < D->ups.size(); ++i) {
@@ -751,6 +752,7 @@ void Glm5Model::dspark_upload() {
     }
     D->ups.clear();
     cudaEventRecord(D->ev_up, D->up);
+    D->ms_up += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err) {
