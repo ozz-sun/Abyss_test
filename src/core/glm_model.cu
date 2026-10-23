@@ -850,7 +850,7 @@ bool Glm5Geometry::from_gguf_dsv41(const strata::GgufFile& g, Glm5Geometry& out,
         out.n_vocab = 129280;
     std::vector<int> ratios, kv_ids, idx_ids, eng_ids;
     if (!ids(llama ? "attention.compress_ratios" : "compress_ratios", ratios) || ratios.size() < (size_t) out.n_layers ||
-        !(ids("engram.layer_ids", eng_ids) || ids("ple.layers", eng_ids))) {
+        !(ids("engram.layer_ids", eng_ids) || ids("ple.layers", eng_ids) || ids("engram.layers", eng_ids))) {
         err = "deepseek41: compress_ratios / engram.layer_ids missing";
         return false;
     }

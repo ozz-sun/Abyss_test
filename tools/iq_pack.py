@@ -438,14 +438,15 @@ def write_engram(out, g, model: Model) -> int:
                 int(m.get("deepseek41.embedding_length_per_layer_input", 0)) != 256:
             print("deepseek41: ple heads_per_ngram / ngram_size / embedding_length_per_layer_input are not 8 / 4 / 256")
             return 1
-    else:
-        layers = list(m[p + "layer_ids"])
+    else:   # (Project Maya's V4.1 GGUFs name the keys engram.layers / head_dim / pad_token_id)
+        layers = list(m[p + "layer_ids"] if p + "layer_ids" in m else m[p + "layers"])
         primes, mult, tmap = list(m[p + "primes"]), list(m[p + "multipliers"]), m[p + "token_map"]
     if len(layers) != 2 or len(primes) != 48 or len(mult) != 8:
         print("deepseek41: unexpected engram metadata (layers %d, primes %d, multipliers %d)"
               % (len(layers), len(primes), len(mult)))
         return 1
-    if llama and not ple and (int(m.get(p + "head_count", 0)) != 8 or int(m.get(p + "key_length", 0)) != 256 or
+    if llama and not ple and (int(m.get(p + "head_count", 0)) != 8 or
+                              int(m.get(p + "key_length", m.get(p + "head_dim", 0))) != 256 or
                               int(m.get(p + "max_ngram_size", 0)) != 4):
         print("deepseek41: engram head_count / key_length / max_ngram_size are not 8 / 256 / 4")
         return 1
@@ -492,7 +493,7 @@ def write_engram(out, g, model: Model) -> int:
     lines.insert(0, "format " + fmt)
     lines.append("primes " + " ".join(str(int(x)) for x in primes))
     lines.append("multipliers " + " ".join(str(int(x)) for x in mult))
-    lines.append("pad %d" % int(m[p + ("pad_token_id" if ple else "pad_id")]))
+    lines.append("pad %d" % int(m[p + ("pad_token_id" if ple or p + "pad_id" not in m else "pad_id")]))
     lines.append("vocab %d" % len(tmap))
     (out / "engram.txt").write_text("# deepseek41 Engram: format <name> <row bytes>; table <k> <layer> <abs offset> "
                                     "<rows> <file>\n" + "\n".join(lines) + "\n", encoding="utf-8")

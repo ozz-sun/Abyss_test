@@ -118,8 +118,10 @@ struct VerifyBuf {
     // STRATA_GLM_HC_CPU) - and the paced promotion copies, which go out after that read
     bool hc_cpu[Glm5Model::kVerifyMax] = {}, bg_after[Glm5Model::kVerifyMax] = {};
     // the pipelined window's scratch slot sets (8 VRAM slots a set): set 0 the token path's, sets 1..n_scr the
-    // window's own - a group of columns runs on one stream, so its columns share their group's set
-    static constexpr int kScrSets = 3;
+    // window's own - a group of columns runs on one stream, so its columns share their group's set.  deepseek41 (the
+    // batched window only): a set a column up to kScrSets + 1 columns, so their SSD reads stay apart until the
+    // column-batched expert launches read them (V4's pipelined window keeps 3 sets)
+    static constexpr int kScrSets = 5;
     unsigned long long* scr_set[kScrSets + 1] = {};
     int n_scr = 0;
     // deepseek41, a column each: its two pre buffers ([0, 4) the attention side's, [4, 8) the FFN side's - the lagged
@@ -279,11 +281,9 @@ bool Glm5Model::verify_alloc(std::string& err) {
     for (int il = l0_; il < l1_; ++il) blob_max = std::max(blob_max, fast_->L[(size_t) il].blob);
     const size_t sstride = (blob_max + 255u) & ~(size_t) 255u;
     // (sets for up to 4 groups: the 8-column window keeps 4 columns' worth, 192 MB a 8 MB blob)
-    const int NS = std::min(TM - 1, (int) VerifyBuf::kScrSets);
+    const int NS = std::min(TM - 1, g.v41 ? (int) VerifyBuf::kScrSets : 3);
     V->scr_set[0] = fast_->md.scratch;
-    if (g.v41) {
-        // (deepseek41: the batched window only - no scratch sets)
-    } else if (ok && sstride > 0 && cudaMalloc(&V->scr, (size_t) NS * 8 * sstride) == cudaSuccess) {
+    if (ok && sstride > 0 && cudaMalloc(&V->scr, (size_t) NS * 8 * sstride) == cudaSuccess) {
         for (int k = 1; k <= NS && ok; ++k) {
             unsigned long long sp[8];
             for (int i = 0; i < 8; ++i)
@@ -295,7 +295,7 @@ bool Glm5Model::verify_alloc(std::string& err) {
         }
         for (int t = 1; t < TM; ++t) V->md[(size_t) t].scratch = V->scr_set[std::min(t, NS)];
         V->n_scr = NS;
-        V->pipe = ok;
+        V->pipe = ok && !g.v41;   // (deepseek41: the batched window only)
     } else {
         cudaGetLastError();
         std::fprintf(stderr, "deepseek4 verify: no VRAM for the pipelined window's scratch slots (%.0f MB) - batched\n",
@@ -663,9 +663,9 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         const char* v = getenv("STRATA_DS4_WIN_COLS");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    // (deepseek41: a column's experts right after its own fetch - its SSD reads land in the token path's 8 scratch
-    // slots, which every column of a batched window shares)
-    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && !g.v41;
+    // (deepseek41: its SSD reads land in the column's scratch set - a column a set up to 1 + n_scr columns; a longer
+    // window keeps each column's experts right after its own fetch)
+    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && (!g.v41 || T <= 1 + V->n_scr);
     if (g.qwen35() && Ly.sh_gate_w != nullptr) {   // the shared expert's gate logit a column (sigmoid below)
         gf::MvJob jg = {Ly.sh_gate_w, nullptr, V->x + (size_t) tb * E, V->q35_shg + tb, nullptr, 1.0f, gf::kTypeF32, E, 1};
         if (!gf::mvn(&jg, 1, T, s)) { err = "qwen35 verify: the shared expert's gate"; return false; }
