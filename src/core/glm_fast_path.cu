@@ -355,6 +355,20 @@ static void* numa_pinned(size_t bytes) {
 #endif
 }
 
+// the machine's RAM: MemTotal (Linux; 0 when unknown)
+static int64_t mem_total() {
+    long long kb = 0;
+#ifdef __linux__
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, f))
+            if (std::sscanf(line, "MemTotal: %lld kB", &kb) == 1) break;
+        std::fclose(f);
+    }
+#endif
+    return (int64_t) kb * 1024;
+}
+
 // the RAM free now: MemAvailable (Windows: the smaller of the free RAM and the free commit, which pinning is charged to);
 // 0 when unknown
 static int64_t avail_ram_now() {
@@ -1269,6 +1283,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         double head_gb = F->unified_memory ? 16.0 : 6.0;
         if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
         const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
+        // the disk staging pinned after the tier (one set of max(8, k) experts per in-flight route, below)
+        const int64_t stage_b = (int64_t) std::max(8, g.n_exp_used) * gf::kCpuAnswers *
+                                (int64_t) ((blob_max + 255u) & ~(size_t) 255u);
         const bool fixed_ram = getenv("STRATA_GLM_RAM_GB") != nullptr;
         if (budget < 0) {
             if (total < 0) {
@@ -1302,7 +1319,18 @@ bool Glm5Model::fast_setup(std::string& err) {
                         std::fclose(mf);
                     }
 #endif
-                    total = std::max<int64_t>(0, avail_kb * 1024 - head_b - unseen_pf);
+                    total = std::max<int64_t>(0, avail_kb * 1024 - head_b - unseen_pf - stage_b);
+                    // and at most 73% of the RAM (STRATA_GLM_RAM_FRAC; Linux, a discrete card): MemAvailable less
+                    // 6 GB pinned 82 of 94 GB for DeepSeek V4.1 (its experts outgrow the RAM) and the disk staging
+                    // then did not allocate; on that box 67-68 GB pinned ran for days and 73.9 GB thrashed (an 8K
+                    // prompt 301 s instead of 11) - the page cache the Engram tables and the shards go through
+                    // needs the room
+#ifdef __linux__
+                    double frac = F->unified_memory ? 1.0 : 0.73;
+                    if (const char* fr = getenv("STRATA_GLM_RAM_FRAC")) frac = std::max(0.0, std::atof(fr));
+                    if (const int64_t mt = mem_total(); mt > 0 && frac < 1.0)
+                        total = std::min<int64_t>(total, std::max<int64_t>(0, (int64_t) ((double) mt * frac) - stage_b));
+#endif
                 }
                 remaining = total;
                 remaining_layers = g.n_layers - g.dense_lead + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);

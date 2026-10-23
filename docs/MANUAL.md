@@ -525,6 +525,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_WARM` | on | `0`: no warm-up at start (the tiers fill as experts are used; the first answers are slower) |
 | `STRATA_GLM_RAM_GB` | from free RAM | a fixed size of the pinned RAM tier in GB |
 | `STRATA_GLM_RAM_HEADROOM_GB` | 6 | RAM left free for the system when the RAM tier is sized |
+| `STRATA_GLM_RAM_FRAC` | 0.73 | Linux, a discrete GPU: the RAM tier pins at most this share of the RAM (with no `STRATA_GLM_RAM_GB`); more than ~73% pinned thrashed a 94 GB machine |
 | `STRATA_GLM_STREAM_FETCH` | on | an expert read from the SSD is copied to VRAM chunk by chunk as the reads land, the PCIe copy running behind the SSD (v1.3.31; DeepSeek V4.1 -9% a token); `0`: the whole expert after the read |
 | `STRATA_GLM_RAM_THP` | on (Linux) | the RAM tier in transparent huge pages, as far as the free 2 MB blocks go (an APU lane re-validates 512x fewer pages: no multi-second lane stalls); `0`: the driver's pinned pages |
 | `STRATA_GLM_RESERVE_MB` | 700 | VRAM left free beside the expert pool |
