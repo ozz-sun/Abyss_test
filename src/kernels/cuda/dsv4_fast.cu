@@ -1654,11 +1654,14 @@ __global__ void __launch_bounds__(1024) dspark_head_kernel(const float* __restri
 }
 
 // a row of the drafter's Markov chain: m = w1[*prev] (rank 256, F16), out[v] = logits[v] + w2[v] . m (Q8_0 rows of
-// 256, a warp a row, lane l the values 8 l .. 8 l + 7); block 0 also the confidence sigmoid(cp . [h; m])
+// 256 - V4.1's drafter: F16 rows - a warp a row, lane l the values 8 l .. 8 l + 7); block 0 also the confidence
+// sigmoid(cp . [h; m] (+ *cb, V4.1's bias))
+template <bool F16W>
 __global__ void __launch_bounds__(256) dspark_markov_kernel(const float* __restrict__ logits,
-                                                            const block_q8_0* __restrict__ w2,
+                                                            const void* __restrict__ w2v,
                                                             const __half* __restrict__ w1, int n_vocab,
                                                             const int* __restrict__ prev, const float* __restrict__ cp,
+                                                            const float* __restrict__ cb,
                                                             const float* __restrict__ h, int n_embd,
                                                             float* __restrict__ out, float* __restrict__ conf) {
     constexpr int RANK = 256;
@@ -1673,17 +1676,32 @@ __global__ void __launch_bounds__(256) dspark_markov_kernel(const float* __restr
         for (int i = tid; i < n_embd; i += blockDim.x) a += cp[i] * h[i];
         for (int i = tid; i < RANK; i += blockDim.x) a += cp[n_embd + i] * s_m[i];
         a = block_sum(a, sh);
+        if (cb != nullptr) a += *cb;
         if (tid == 0) *conf = 1.0f / (1.0f + expf(-a));
     }
-    const int b = lane >> 2, j0 = (lane & 3) * 8;
     const int wpb = blockDim.x >> 5;
-    for (int v = blockIdx.x * wpb + warp; v < n_vocab; v += gridDim.x * wpb) {
-        const block_q8_0& B = w2[(size_t) v * (RANK / 32) + b];
-        float acc = 0.0f;
+    if constexpr (F16W) {
+        const __half* w2 = (const __half*) w2v;
+        const int j0 = lane * 8;
+        for (int v = blockIdx.x * wpb + warp; v < n_vocab; v += gridDim.x * wpb) {
+            const __half* r = w2 + (size_t) v * RANK + j0;
+            float acc = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) acc += (float) B.qs[j0 + j] * s_m[b * 32 + j0 + j];
-        acc = warp_sum(acc * __half2float(B.d));
-        if (lane == 0) out[v] = logits[v] + acc;
+            for (int j = 0; j < 8; ++j) acc += __half2float(r[j]) * s_m[j0 + j];
+            acc = warp_sum(acc);
+            if (lane == 0) out[v] = logits[v] + acc;
+        }
+    } else {
+        const block_q8_0* w2 = (const block_q8_0*) w2v;
+        const int b = lane >> 2, j0 = (lane & 3) * 8;
+        for (int v = blockIdx.x * wpb + warp; v < n_vocab; v += gridDim.x * wpb) {
+            const block_q8_0& B = w2[(size_t) v * (RANK / 32) + b];
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc += (float) B.qs[j0 + j] * s_m[b * 32 + j0 + j];
+            acc = warp_sum(acc * __half2float(B.d));
+            if (lane == 0) out[v] = logits[v] + acc;
+        }
     }
 }
 
@@ -2079,9 +2097,16 @@ void dspark_head(const float* R, const uint16_t* fn, const float* scale, const f
 }
 void dspark_markov(const float* logits, const void* w2, const uint16_t* w1, int n_vocab, const int* prev,
                    const float* cp, const float* h, int n_embd, float* out, float* conf, cudaStream_t s) {
-    dspark_markov_kernel<<<1024, 256, 0, s>>>(logits, (const block_q8_0*) w2, (const __half*) w1, n_vocab, prev, cp, h,
-                                              n_embd, out, conf);
+    dspark_markov_kernel<false><<<1024, 256, 0, s>>>(logits, w2, (const __half*) w1, n_vocab, prev, cp, nullptr, h,
+                                                     n_embd, out, conf);
     check("dspark_markov");
+}
+void dspark_markov_f16(const float* logits, const uint16_t* w2, const uint16_t* w1, int n_vocab, const int* prev,
+                       const float* cp, const float* cb, const float* h, int n_embd, float* out, float* conf,
+                       cudaStream_t s) {
+    dspark_markov_kernel<true><<<1024, 256, 0, s>>>(logits, w2, (const __half*) w1, n_vocab, prev, cp, cb, h, n_embd,
+                                                    out, conf);
+    check("dspark_markov_f16");
 }
 
 }  // namespace strata::kernels::dsv4

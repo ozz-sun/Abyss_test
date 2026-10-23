@@ -56,8 +56,12 @@ void engram_add(float* R, const float* kv, const float* qn, const float* kn, int
 void engram_wait(const unsigned int* flag, unsigned int want, const float* src, float* dst, int n, cudaStream_t s);
 
 /// The head's prologue (spec 6.2): h = sum_s pre_s R_s (the last sublayer's pre), x = rms(h) * norm_w -> x (f32) and
-/// xq (q8_1).
+/// xq (q8_1); h (may be null): h itself, before the norm (the DSpark drafter's confidence reads it).
 void head_prep(const float* R, const float* pre, const float* norm_w, float eps, int n_embd, float* x, void* xq,
-               cudaStream_t s);
+               cudaStream_t s, float* h = nullptr);
+
+/// rows rows of n floats (n % 32 == 0, any width - glmf::rms_q8 stops at 4096): x[r] = rms(in[r]) * w -> x (f32) and
+/// xq (q8_1, n / 32 blocks a row).
+void rms_rows(const float* in, int rows, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s);
 
 }  // namespace strata::kernels::dsv41
