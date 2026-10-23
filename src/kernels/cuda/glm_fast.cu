@@ -1854,6 +1854,30 @@ __global__ void embed_q5k_rows_kernel(const block_q5_K* __restrict__ table, cons
     }
 }
 
+// Q6_K rows (DeepSeek V4.1 UD-IQ1_S's token_embd): a thread a (super-block, l) - its 8 values, ggml's order
+__global__ void embed_q6k_rows_kernel(const block_q6_K* __restrict__ table, const int* __restrict__ toks, int n_embd,
+                                      float* __restrict__ out) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // super-block * 32 + l
+    const int nsb = n_embd / 256;
+    const int sb = i >> 5, l = i & 31;
+    if (sb >= nsb) return;
+    const block_q6_K* q = table + (size_t) toks[t] * nsb + sb;
+    const float d = __half2float(*(const __half*) &q->d);
+    float* y = out + (size_t) t * n_embd + (size_t) sb * 256;
+    const int is = l / 16;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const uint8_t* ql = q->ql + 64 * h;
+        const uint8_t qh = q->qh[32 * h + l];
+        const int8_t* sc = q->scales + 8 * h;
+        y[128 * h + l] = d * sc[is] * (float) ((int) ((ql[l] & 0xF) | ((qh & 3) << 4)) - 32);
+        y[128 * h + l + 32] = d * sc[is + 2] * (float) ((int) ((ql[l + 32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+        y[128 * h + l + 64] = d * sc[is + 4] * (float) ((int) ((ql[l] >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+        y[128 * h + l + 96] = d * sc[is + 6] * (float) ((int) ((ql[l + 32] >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+    }
+}
+
 // ---------------------------------------------------------------- KDA
 __global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ KdaPrepArgs a) {
     const int h = blockIdx.x, role = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -4125,11 +4149,18 @@ bool embed_rows_q(int type, const void* table, const int* toks, int T, int n_emb
         launch_check("embed_q5k_rows");
         return true;
     }
+    if (type == 14 && n_embd % 256 == 0) {
+        const int n = n_embd / 256 * 32;
+        embed_q6k_rows_kernel<<<dim3((unsigned) ((n + 127) / 128), (unsigned) T), 128, 0, s>>>(
+            (const block_q6_K*) table, toks, n_embd, out);
+        launch_check("embed_q6k_rows");
+        return true;
+    }
     return false;
 }
 
 bool embed_rows_q_supported(int type, int n_embd) {
-    return (type == 8 && n_embd % 32 == 0) || (type == 13 && n_embd % 256 == 0);
+    return (type == 8 && n_embd % 32 == 0) || ((type == 13 || type == 14) && n_embd % 256 == 0);
 }
 
 void kda_prep(const KdaPrepArgs& a, cudaStream_t s) {
