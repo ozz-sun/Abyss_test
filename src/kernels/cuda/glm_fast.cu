@@ -1097,6 +1097,42 @@ static int grid_pad(int blocks, int wpb) {
 static inline int grid_pad(int blocks, int) { return blocks; }
 #endif
 
+// ---------------------------------------------------------------- per-GPU choices for the dense GEMVs
+// Picked once per device from its architecture; a choice changes only where it was measured on that GPU, every other
+// GPU keeps the old default.  STRATA_GLM_MV_Q6K_SPLIT (0 / 1) overrides; the line "glm fast: dense GEMV tune" says
+// what a device got.
+//  - q6k_split: Q6_K GEMVs of up to 4,096 blocks 4 warps a row.  RTX 5090: faster (wo_a 24.1 -> 18.1 us).  gfx12 (AI PRO
+//    R9700, DeepSeek V4.1 UD-IQ1_S decode, rocprofv3): slower - 8.78 ms a token split 4 ways, 8.2 split 2, 7.45 one
+//    warp a row (475 -> 562 GB/s).  (Measured and not taken: DeepSeek V4.1's F32 routers, 384 rows, 4 warps a row on
+//    gfx12 - 19.3 -> 18.6 us, a small GEMV's floor there)
+struct MvTune {
+    bool q6k_split = true;
+};
+static const MvTune& mv_tune() {
+    static thread_local int dev = -1;
+    static thread_local MvTune t;
+    int d = 0;
+    if (cudaGetDevice(&d) != cudaSuccess || d == dev) return t;
+    dev = d;
+    t = MvTune{};
+    char arch[64] = "?";
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+#if defined(STRATA_USE_HIP)
+        std::snprintf(arch, sizeof arch, "%s", prop.gcnArchName);
+        if (char* c = std::strchr(arch, ':')) *c = 0;
+        const bool gfx12 = std::strncmp(arch, "gfx12", 5) == 0;   // RDNA 4 (gfx1200 / gfx1201)
+        t.q6k_split = !gfx12;
+#else
+        std::snprintf(arch, sizeof arch, "sm_%d%d", prop.major, prop.minor);
+#endif
+    }
+    if (const char* v = getenv("STRATA_GLM_MV_Q6K_SPLIT")) t.q6k_split = std::atoi(v) != 0;
+    std::fprintf(stderr, "glm fast: dense GEMV tune for device %d (%s, %d CUs): Q6_K %s\n", d, arch,
+                 prop.multiProcessorCount, t.q6k_split ? "4 warps a row (up to 4,096 blocks)" : "a warp a row");
+    return t;
+}
+
 // ---------------------------------------------------------------- multi-job GEMV
 struct MvBatch {
     MvJob j[kMaxMvJobs];
@@ -3907,7 +3943,9 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     // 512-block Q5_K shared gate/up got slower (8.4 -> 9.3: the dot's arithmetic, not latency) - so only the small ones.
     // Q6_K is the exception: one warp a row leaves its 6-bit dot latency-bound at every size measured (the attn-q6k
     // pack's wo_a 1,024 blocks 24.1 -> 18.1 us, wo_b 512 blocks 23.0 -> 19.8, q_b 4,096 blocks 19.2 -> 18.5 with 4
-    // warps a row; 1.14 -> 1.52 TB/s on wo_a), so Q6_K splits up to 4,096 blocks (STRATA_GLM_MV_SPLIT=0: never)
+    // warps a row; 1.14 -> 1.52 TB/s on wo_a), so Q6_K splits up to 4,096 blocks (STRATA_GLM_MV_SPLIT=0: never) - where
+    // mv_tune says so (not gfx12)
+    const bool q6k_split = mv_tune().q6k_split;
     static const int split_env = [] { const char* v = getenv("STRATA_GLM_MV_SPLIT"); return v ? std::atoi(v) : -1; }();
     constexpr int kTyped[] = {14, 8, 12, 13};
     bool done[kMaxMvJobs] = {};
@@ -3943,7 +3981,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             if (m == 0) continue;
             b.n = m;
             const int split = split_env >= 0 ? (split_env == 2 || split_env == 4 ? split_env : 1)
-                            : (acc < 256 || (T == 14 && acc <= 4096)) ? 4 : 1;
+                            : (acc < 256 || (q6k_split && T == 14 && acc <= 4096)) ? 4 : 1;
             if (split > 1) {   // the block ranges at MV_ROWS / split rows a block
                 const int rpb = MV_ROWS / split;
                 acc = 0;
