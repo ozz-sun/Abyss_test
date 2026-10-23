@@ -153,6 +153,34 @@ a sequence where the SSD had no slow spell (seq 0 / 1 / 2 / 4 / 5: 36.6 / 36.7 /
 31.4 / 31.2 / 26.6 / 26.2 / 26.1 ms a token); the dense weights drop to 6.50 GB and the VRAM tier gains 177 expert
 slots (2,321 -> 2,498). It stays optional until a swe-bench run shows the answers hold up.
 
+### Overlays: changed dense tensors without another copy of the model (v1.3.52)
+
+`tools/dense_overlay.py` writes only the changed tensors into a small first shard and links the model's own shards
+behind it; `iq_pack.py --first-wins` then takes the changed copies (the engine looks tensors up in shard order too).
+Two uses on unsloth's UD-IQ1_S (AI PRO R9700 + 8060S lane, 94 GB RAM, the 8 held-out sequences and the swe-bench
+subset of 8 tasks):
+
+- **Q5_K dense** (lossy, opt-in): the layers' Q6_K projections (attention, shared experts, `engram_kv`; 218 tensors,
+  3.85 -> 3.22 GB) re-quantized to Q5_K - a 3.2 GB overlay. GPU time a token -1.4 ms (~6%), dense VRAM 6.08 -> 5.50 GB,
+  swe-bench 40.1 -> 43.0 tok/s (two runs each, alternated); KL 0.3557 -> 0.3652, ppl 10.79 -> 10.93. Q5_K on
+  `output.weight` as well is no faster and costs more (KL 0.3686).
+- **A published abliteration edit**: mrfakename/DeepSeek-V4.1-Flash-1017-abliterated ships `abliteration-edit.npz`
+  (43 KB), a rank-2 refusal subspace and per-layer strengths; `--abl` applies `W - s Q Q^T W` to `attn_output_b` /
+  `ffn_down_shexp` (62 tensors, a 1.4 GB overlay). KL 0.3557 -> 0.3563, ppl 10.79 -> 10.76; 16 refusal-bait prompts
+  (12 English, 4 Japanese) refused 14 -> 0. With the Q5_K set too: KL 0.3738 (the edited tensors are rounded twice).
+
+```sh
+U=<models dir>/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ1_S
+O=<models dir>/ud-iq1s-q5k
+.venv/bin/python -I tools/dense_overlay.py $U/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00001-of-00005.gguf $O \
+  'blk\.\d+\.(attn_q_a|attn_q_b|attn_kv|attn_output_a|attn_output_b|ffn_(gate|up|down)_shexp|engram_kv)\.weight'
+#   (or the edit: ... $O --abl=<dir>/abliteration-edit.npz - both together: the regex and --abl in one call)
+.venv/bin/python tools/iq_pack.py --gguf $O/overlay-00001-of-00006.gguf --out $O/pack --compat-bf16 --first-wins
+cp $U/pack/expert_*.txt $O/pack/
+```
+
+Then point the config's `--glm-pack` and `tokenizer` at `$O/pack`. `GGUF_PY` / `LIBGGML` as for `requant_dense.py`.
+
 ## Quality and speed (RTX 5090 + Radeon 8060S lane + 94 GB RAM + NVMe at 3.4 GB/s)
 
 Quality is measured against the unquantized 1017's top-256 log-probs on Lucebox's 8 held-out sequences

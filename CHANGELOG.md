@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.52 - 2026-10-24
+
+**DeepSeek V4.1: the token's embedding row read on the GPU, and overlays - changed dense tensors (Q5_K, or a
+published abliteration edit) without another copy of the model.**
+
+- unsloth's V4.1 UD-IQ1_S stores `token_embd` as Q6_K, which the GPU row gather did not read, so every token
+  dequantized its row on the host and copied it in while the GPU waited. Q6_K rows are now gathered on the GPU from
+  the pinned table (518 MB pinned), as Q8_0 / Q5_K were. Bit-identical (8 sequences: KL 0.3557 as before); the GPU's
+  idle time between two tokens 0.99 -> 0.55 ms (`STRATA_GLM_GAP_PROF`), the host's embedding step 0.39 -> 0.24 ms.
+- `tools/dense_overlay.py` writes only the changed tensors into a small first shard and links the model's shards
+  behind it (`iq_pack.py --first-wins` takes the changed copies). On UD-IQ1_S (AI PRO R9700 + 8060S lane):
+  - Q5_K for the layers' Q6_K projections (opt-in, lossy): a 3.2 GB overlay, GPU time a token -1.4 ms, swe-bench
+    subset 40.1 -> 43.0 tok/s, KL 0.3557 -> 0.3652.
+  - `--abl`: mrfakename's DeepSeek-V4.1-Flash-1017-abliterated edit (`abliteration-edit.npz`) on `attn_output_b` /
+    `ffn_down_shexp`: a 1.4 GB overlay, KL 0.3563, 16 refusal-bait prompts refused 14 -> 0.
+  Recipes and numbers: docs/deepseek41/README.md, "Overlays".
+
 ## v1.3.51 - 2026-10-24
 
 **`./abyss.sh --gpu-tune`: the engine's per-GPU kernel choices, measured on this PC's GPU(s) without a model.**
