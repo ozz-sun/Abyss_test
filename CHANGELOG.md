@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.50 - 2026-10-23
+
+**DeepSeek V4.1 starts without `STRATA_GLM_RAM_GB` again: the RAM tier pins at most 73% of the RAM by default.**
+
+- With no `STRATA_GLM_RAM_GB`, the RAM tier took MemAvailable less 6 GB. DeepSeek V4.1's experts outgrow the RAM, so on
+  a 94 GB machine it pinned 82 GB; the disk staging pinned after it then did not allocate (`glm fast: pinned disk
+  staging did not allocate`) and the engine did not start - the R9700 V4.1 config as `setup-deepseek.sh` writes it.
+  The tier now also leaves room for that staging, and on Linux with a discrete GPU pins at most 73% of the RAM
+  (`STRATA_GLM_RAM_FRAC`; on that machine 67-68 GB pinned ran for days, 73.9 GB thrashed). Measured (AI PRO R9700 +
+  8060S lane, 94 GB): V4.1 UD-IQ1_S 67.5 GB, starts, 8K prompt and decode as with `STRATA_GLM_RAM_GB=60`; DeepSeek V4
+  UD-Q2_K_XL 67.37 -> 67.07 GB, decode 52-56 tok/s as before. `STRATA_GLM_RAM_GB` still sets the size outright.
+- DeepSeek V4.1's batched verify windows run their columns' VRAM-resident experts in one launch
+  (`STRATA_DS4_WIN_COLS`, as V4's since v1.3.43), with a scratch set per column (up to 6 columns, 8 slots each - ~350 MB
+  of VRAM on UD-IQ1_S, taken from the expert pool) so the columns' SSD reads stay apart. Bit-identical
+  (`STRATA_DS4_WIN_COLS_CHECK=1`: 260 columns, 0 differ); speed within noise on the R9700, where a V4.1 window column
+  is bound by the SSD's bandwidth (~9.5 of its ~20 ms).
+- `tools/iq_pack.py` and the loader read Project Maya's V4.1 GGUFs (Maya-S / Maya-XS): `deepseek41.engram.layers`,
+  `head_dim` and `pad_token_id` as aliases of the Engram keys.
+
 ## v1.3.49 - 2026-10-23
 
 **Ornith's NextN drafter works after a prompt again: 19K tokens in, 40 -> 51 tok/s.**
