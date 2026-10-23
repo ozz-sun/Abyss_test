@@ -916,6 +916,7 @@ bool Glm5Model::fast_dsv41_attn(int il, int64_t p64, std::string& err) {
     gf::MvJob ob = {Ly.out_b.q, F->ds_oaq, F->ds_oa, F->mixer, nullptr, 1.0f, Ly.out_b.type, g.o_groups * g.o_lora,
                     g.n_embd};
     if (!gf::mv(&ob, 1, s)) { err = "deepseek41: wo_b"; return false; }
+    abl_apply(il, 0, F->mixer, 1, g.n_embd, s);
     if (F->prof_on) F->mark("ds_out_mv");
     return true;
 }

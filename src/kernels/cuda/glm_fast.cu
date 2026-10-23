@@ -1878,6 +1878,32 @@ __global__ void embed_q6k_rows_kernel(const block_q6_K* __restrict__ table, cons
     }
 }
 
+// x_t -= s Q (Q^T x_t) for each row t (a refusal-direction edit applied to a block's output at run time - the same
+// as W' = W - s Q Q^T W on the weight that wrote x, without re-quantizing it): Q [n][r] row-major, r <= 4
+__global__ void abl_project_kernel(float* __restrict__ x, int ld, int n, const float* __restrict__ q, int r, float s) {
+    float* xr = x + (size_t) blockIdx.x * ld;
+    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        for (int j = 0; j < r; ++j) c[j] += q[(size_t) i * r + j] * v;
+    }
+    __shared__ float sh[4][256];
+    for (int j = 0; j < 4; ++j) sh[j][threadIdx.x] = c[j];
+    __syncthreads();
+    for (int w = 128; w > 0; w >>= 1) {
+        if (threadIdx.x < w)
+            for (int j = 0; j < 4; ++j) sh[j][threadIdx.x] += sh[j][threadIdx.x + w];
+        __syncthreads();
+    }
+    float cs[4];
+    for (int j = 0; j < 4; ++j) cs[j] = s * sh[j][0];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float d = 0.0f;
+        for (int j = 0; j < r; ++j) d += q[(size_t) i * r + j] * cs[j];
+        xr[i] -= d;
+    }
+}
+
 // ---------------------------------------------------------------- KDA
 __global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ KdaPrepArgs a) {
     const int h = blockIdx.x, role = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -4127,6 +4153,12 @@ void hc_post(const float* block_out, const float* R_old, const float* post, cons
 void head_prep(const float* R, const float* norm_w, float eps, int n_embd, float* x, void* xq, cudaStream_t s) {
     head_prep_kernel<<<1, 1024, 0, s>>>(R, norm_w, eps, n_embd, x, (block_q8_1*) xq);
     launch_check("head_prep");
+}
+
+void abl_project(float* x, int rows, int ld, int n, const float* q, int r, float s, cudaStream_t st) {
+    if (rows <= 0 || r < 1 || r > 4) return;
+    abl_project_kernel<<<rows, 256, 0, st>>>(x, ld, n, q, r, s);
+    launch_check("abl_project");
 }
 
 void embed_streams(const float* emb, float* R, int n_embd, cudaStream_t s) {

@@ -533,6 +533,41 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->gap_on = getenv("STRATA_GLM_GAP_PROF") != nullptr && std::atoi(getenv("STRATA_GLM_GAP_PROF")) != 0;
     F->token_spin = getenv("STRATA_GLM_TOKEN_SPIN") != nullptr && std::atoi(getenv("STRATA_GLM_TOKEN_SPIN")) != 0;
     if (F->prof_on) F->pskip = (uint64_t) std::max(0, std::atoi(getenv("STRATA_GLM_PROF")));
+    // STRATA_GLM_ABL=<file> (tools/dense_overlay.py --abl-export): a refusal-direction edit (an abliteration's subspace
+    // Q and its strengths a layer) applied to the attention and shared-expert outputs as they are written - the same as
+    // the edit baked into attn_output_b / ffn_down_shexp, without their re-quantization.  File: "ABL1", int32 n_embd,
+    // rank, layers, then float32 Q [n_embd][rank] and strengths [layers][2]
+    if (const char* ap = getenv("STRATA_GLM_ABL"); ap != nullptr && ap[0]) {
+        bool ok = false;
+        if (FILE* f = std::fopen(ap, "rb")) {
+            char magic[4];
+            int32_t hd[3];
+            if (std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "ABL1", 4) == 0 && std::fread(hd, 4, 3, f) == 3 &&
+                hd[0] == (int32_t) g.n_embd && hd[1] >= 1 && hd[1] <= 4 && hd[2] >= 1 && hd[2] <= 1024) {
+                std::vector<float> q((size_t) hd[0] * hd[1]);
+                F->abl_s.resize((size_t) hd[2] * 2);
+                if (std::fread(q.data(), 4, q.size(), f) == q.size() &&
+                    std::fread(F->abl_s.data(), 4, F->abl_s.size(), f) == F->abl_s.size() &&
+                    cudaMalloc((void**) &F->abl_q, q.size() * sizeof(float)) == cudaSuccess &&
+                    cudaMemcpy(F->abl_q, q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess) {
+                    F->abl_r = hd[1];
+                    ok = true;
+                    int na = 0, ns = 0;
+                    for (int l = 0; l < hd[2]; ++l) {
+                        na += F->abl_s[(size_t) l * 2] != 0.0f;
+                        ns += F->abl_s[(size_t) l * 2 + 1] != 0.0f;
+                    }
+                    std::fprintf(stderr, "glm fast: refusal-direction edit at run time (%s): rank %d, attention outputs "
+                                         "of %d layers, shared-expert outputs of %d\n", ap, hd[1], na, ns);
+                }
+            }
+            std::fclose(f);
+        }
+        if (!ok) {
+            err = std::string("glm fast: STRATA_GLM_ABL=") + ap + " is not an ABL1 file for n_embd " + std::to_string(g.n_embd);
+            return false;
+        }
+    }
     if (const char* pn = getenv("STRATA_GLM_PREFETCH_N")) F->max_pf = std::max(0, std::min(gf::kSpares - 1, std::atoi(pn)));
     if (const char* bp = getenv("STRATA_GLM_BG_PACE_KB")) F->bg_pace = (size_t) std::max(0, std::atoi(bp)) << 10;
     else F->bg_pace = (size_t) 1024 << 10;   // (FastState::bg_drain)
@@ -5074,6 +5109,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     // (the shared expert's down rides the gate/up launch: sh_out)
     gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, Ly.sh_down.q,
                     Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
+    if (Ly.sh_down.q != nullptr) abl_apply(il, 1, F->sh_out, 1, g.n_embd, s);
     if (F->prof_on) F->mark("moe_gate_up");
     if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // the shared expert behind its sigmoid gate
         strata::kernels::q35::scale_sigmoid(F->sh_out, g.n_embd, F->q35_shg, s);
@@ -5591,6 +5627,13 @@ int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err)
         ++F->gap_sample_n;
     }
     return F->tok_h[0];
+}
+
+void Glm5Model::abl_apply(int il, int which, float* x, int rows, int ld, cudaStream_t s) {
+    const FastState* F = fast_;
+    if (F == nullptr || F->abl_q == nullptr || il < 0 || (size_t) il * 2 + 1 >= F->abl_s.size()) return;
+    const float sc = F->abl_s[(size_t) il * 2 + which];
+    if (sc != 0.0f) gf::abl_project(x, rows, ld, g_.n_embd, F->abl_q, F->abl_r, sc, s);
 }
 
 // STRATA_GLM_GAP_PROF: a token (or window) is ready at the host - the spin since `tw` ends, the GPU's idle gap before

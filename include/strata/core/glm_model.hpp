@@ -425,6 +425,9 @@ public:
     void dsv41_reset();                                    // a new sequence: the Engram history, the pending pairs
     void dsv41_engram_report() const;                      // STRATA_GLM_TIMING: the Engram rows and the cache's share
     bool dsv41_head(std::string& err);                     // the collapse with the last sublayer's pre -> head_x / xq
+    // STRATA_GLM_ABL: rows of a layer's attention (which 0) or shared-expert (1) output, ld floats apart, minus their
+    // refusal-direction part (a no-op without the file, past its layers or at a zero strength)
+    void abl_apply(int il, int which, float* x, int rows, int ld, cudaStream_t s);
     // ---- qwen35moe (src/core/qwen35_fast_path.cu): the token path (its prompt goes through it a token at a time:
     // no prompt path, no snapshots, no verify windows or layer splits yet)
     void* qwen35_state_ = nullptr;                         // the GDN states, conv states, KV caches and activations

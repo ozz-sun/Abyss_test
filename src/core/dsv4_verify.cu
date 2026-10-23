@@ -594,6 +594,7 @@ bool Glm5Model::verify_attn_v41(int il, int64_t p0, int tb, int T, cudaStream_t 
     gf::quantize_q8_1(oab, oaqb, T * OL, s);
     gf::MvJob jb = {Ly.out_b.q, oaqb, oab, mixer, nullptr, 1.0f, Ly.out_b.type, OL, E};
     if (!gf::mvn(&jb, 1, T, s)) { err = "deepseek41 verify: wo_b"; return false; }
+    abl_apply(il, 0, mixer, T, E, s);
     return true;
 }
 
@@ -697,6 +698,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
                         hq, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
                         FFs, sh_out, s);
+        if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_out, 1, E, s);
         if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // (as fast_moe)
             q35::scale_sigmoid(sh_out, E, V->q35_shg + t, s);
         gf::moe_down(Ly.d_type, md, k, E, g.n_ff_exp, Ly.down_off, hq, Ly.sh_down.q != nullptr ? sh_out : nullptr,
@@ -710,6 +712,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         gf::moe_gate_up_cols(Ly.gu_type, V->cols_d + tb, T, k, E, g.n_ff_exp, g.swiglu_exp,
                              (const uint8_t*) V->xq + (size_t) tb * q8e, q8e, hq, V->hq_n, Ly.sh_down.q, Ly.sh_down.type,
                              (const uint8_t*) V->sh_hq + (size_t) tb * shq, shq, FFs, sh_out, E, s);
+        if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_out, T, E, s);
         if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // (the shared expert's gate a column)
             q35::scale_sigmoid_rows(sh_out, T, E, V->q35_shg + tb, s);
         gf::moe_down_cols(Ly.d_type, V->cols_d + tb, T, k, E, g.n_ff_exp, Ly.down_off, hq, V->hq_n,
@@ -721,6 +724,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                 void* hq1 = (uint8_t*) V->hq + (size_t) t * V->hq_n;
                 gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
                                 hq1, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * shq, FFs, sh_o, s);
+                if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_o, 1, E, s);
                 if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)
                     q35::scale_sigmoid(sh_o, E, V->q35_shg + t, s);
                 gf::moe_down(Ly.d_type, md, k, E, g.n_ff_exp, Ly.down_off, hq1, Ly.sh_down.q != nullptr ? sh_o : nullptr,

@@ -618,6 +618,11 @@ struct Glm5Model::FastState {
     int ram_slack = 0;           // extra RAM-tier slots per MoE layer (STRATA_GLM_RAM_SLACK; default 16 resident)
     // ---- STRATA_GLM_PROF=1: a cudaEvent after every launch, the gaps summed per kernel name (debug only)
     bool prof_on = false;
+    // ---- STRATA_GLM_ABL=<file>: a refusal-direction edit applied to the attention / shared-expert outputs at run time
+    // (Glm5Model::abl_apply): Q [n_embd][abl_r] on the device, the strengths [layer][attn, shexp] on the host
+    float* abl_q = nullptr;
+    int abl_r = 0;
+    std::vector<float> abl_s;
     // qwen35moe's NextN drafter: the pending position's normed hidden, the row kernels' scratch (<= kVerifyMax rows),
     // the chain's tokens and confidences
     float *q35_pend_h = nullptr, *q35_mt_emb = nullptr, *q35_mt_hid = nullptr, *q35_mt_x = nullptr, *q35_mt_k = nullptr,

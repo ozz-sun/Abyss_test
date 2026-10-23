@@ -1537,6 +1537,7 @@ bool Glm5Model::prefill_ds4_mixer(int il, int64_t p0_64, int tn, const uint16_t*
     }
     ds::to_f16(B.oa, B.oa16, (int64_t) tn * OL, s);
     hgemm(Ly.out_b, E, OL, B.oa16, OL, mixer, E);
+    abl_apply(il, 0, mixer, tn, E, s);
     S->mark("ds4_out", s);
     return true;
 }
@@ -2276,6 +2277,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 gb::swiglu_f16(M.sh_g, M.sh_u, M.sh16, (int64_t) tn * FF, g.swiglu_shexp, s);
                 hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
             }
+            abl_apply(il, 1, S->ffn, T, E, s);   // (S->ffn holds the shared expert alone here: the routed add later)
             if (g.qwen35() && Ly.sh_gate_w != nullptr)   // qwen35moe: the shared expert behind its sigmoid gate
                 q35::shexp_gate_rows(S->x, Ly.sh_gate_w, S->ffn, T, E, s);
             S->mark("shexp", s);
