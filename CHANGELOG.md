@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.51 - 2026-10-24
+
+**`./abyss.sh --gpu-tune`: the engine's per-GPU kernel choices, measured on this PC's GPU(s) without a model.**
+
+- The dense GEMVs pick their kernel shape from a per-GPU table (`mv_tune`, read from the GPU's architecture at start;
+  the log prints `glm fast: dense GEMV tune for device N (...)`). First entry: Q6_K a warp a row on gfx12 (AI PRO
+  R9700), where 4 warps a row left the bandwidth unused - rocprof, DeepSeek V4.1 UD-IQ1_S decode: Q6_K 8.78 -> 7.45 ms a
+  token (562 GB/s); 8 sequences alternated with v1.3.50: 33.2 / 34.3 -> 32.1 / 33.9 ms a token, KL 0.3533 -> 0.3557
+  (summation order only). Other GPUs as before. `STRATA_GLM_MV_Q6K_SPLIT=1/0` overrides.
+- `./abyss.sh --gpu-tune` (a new `abyss_gpu_tune` tool, built with the engine) times those choices on each GPU of the
+  installed configs, under a minute a GPU and without a model: the device, a device-to-device copy's bandwidth, and
+  the Q6_K split over the row counts the models have (the weights cycled through 1 GB so a large cache - the R9700's
+  64 MB Infinity Cache - does not fake the bandwidth). Only a 2% win changes a choice; it is written into the
+  configs' `env`. The report (`abyss-gpu-tune.txt`) is meant for a GitHub issue (new template "GPU tune report"), so
+  the table grows for GPUs we do not have. `setup-deepseek.sh` / `setup.sh` run it after writing the config (never
+  fatal).
+
 ## v1.3.50 - 2026-10-23
 
 **DeepSeek V4.1 starts without `STRATA_GLM_RAM_GB` again: the RAM tier pins at most 73% of the RAM by default.**
