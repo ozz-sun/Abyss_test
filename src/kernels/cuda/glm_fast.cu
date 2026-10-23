@@ -1133,6 +1133,9 @@ static const MvTune& mv_tune() {
     return t;
 }
 
+// (abyss_gpu_tune: a forced choice for the calls that follow, -1 = mv_tune's)
+static std::atomic<int> g_q6k_force{-1};
+
 // ---------------------------------------------------------------- multi-job GEMV
 struct MvBatch {
     MvJob j[kMaxMvJobs];
@@ -3899,6 +3902,9 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
     return true;
 }
 
+void mv_force_q6k_split(int split4) { g_q6k_force.store(split4); }
+bool mv_q6k_split_choice() { return mv_tune().q6k_split; }
+
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > kMaxMvJobs) return false;
     for (int i = 0; i < n; ++i)
@@ -3945,7 +3951,8 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     // pack's wo_a 1,024 blocks 24.1 -> 18.1 us, wo_b 512 blocks 23.0 -> 19.8, q_b 4,096 blocks 19.2 -> 18.5 with 4
     // warps a row; 1.14 -> 1.52 TB/s on wo_a), so Q6_K splits up to 4,096 blocks (STRATA_GLM_MV_SPLIT=0: never) - where
     // mv_tune says so (not gfx12)
-    const bool q6k_split = mv_tune().q6k_split;
+    const int q6k_force = g_q6k_force.load(std::memory_order_relaxed);
+    const bool q6k_split = q6k_force >= 0 ? q6k_force != 0 : mv_tune().q6k_split;
     static const int split_env = [] { const char* v = getenv("STRATA_GLM_MV_SPLIT"); return v ? std::atoi(v) : -1; }();
     constexpr int kTyped[] = {14, 8, 12, 13};
     bool done[kMaxMvJobs] = {};

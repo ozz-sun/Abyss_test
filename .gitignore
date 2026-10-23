@@ -41,6 +41,9 @@ td.log
 # Abyss-tools' run configs (abyss-<model>.json, run-abyss-<model>.sh) and engine logs
 /abyss-*.json
 /abyss-*.log
+# ./abyss.sh --gpu-tune: its report and the measurement's scratch
+/abyss-gpu-tune.txt
+/.abyss-gpu-tune-*.json
 /build-strata.bat
 /build-maya*.bat
 

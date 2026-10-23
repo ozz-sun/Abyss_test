@@ -166,7 +166,8 @@ def build_engine(arch: str | None, gpus, nvcc_arg: str | None = None) -> Path:
         S.say(f"  Configuring for {names} (CUDA arch {cc}) ...")
         S.run(conf + S.cmake_fresh(ROOT / "build", conf), quiet=True)
     S.say("  Compiling the engine (a few minutes the first time, only what changed later) ...")
-    S.run([cmake, "--build", ROOT / "build", "--target", "strata", "-j", str(max(2, (os.cpu_count() or 4)))], quiet=True)
+    S.run([cmake, "--build", ROOT / "build", "--target", "strata", "abyss_gpu_tune", "-j", str(max(2, (os.cpu_count() or 4)))],
+          quiet=True)
     S.ok(f"engine: {exe}")
     return exe
 
@@ -438,6 +439,16 @@ def main() -> int:
             pass
     cfg, _ = write_config(name, pack, a.context, a.port, a.rewrite_config,
                           gpus if len(gpus) > 1 and backend == "cuda" else None, hip_extra)
+
+    # the engine's per-GPU kernel choices measured on these GPUs (./abyss.sh --gpu-tune; under a minute a GPU, no
+    # model): a faster one goes into the config's env.  Never stops the setup
+    S.say()
+    S.say("  Checking the engine's per-GPU kernel choices on this GPU (./abyss.sh --gpu-tune) ...")
+    try:
+        import abyss as M   # noqa: E402  (constants and functions only)
+        M.gpu_tune(argparse.Namespace(backend=backend, gpu=None, gpus=None))
+    except (SystemExit, Exception) as e:   # (fail() exits)
+        S.warn(f"the GPU check did not run ({e or 'see above'}): the engine's own choices stay")
 
     S.step(7, "the DSpark drafter")
     dspark_step(a, data, cfg, fresh, had, gpus, backend)

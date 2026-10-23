@@ -1132,7 +1132,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=",".join(str(i) for i in gpu_ids))
     # nvcc takes 2-4 GB per job on the big kernels: half the threads, and no more jobs than RAM / 4 GB
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
-    build = [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)]
+    build = [cmake, "--build", str(BUILD), "--target", "strata", "abyss_gpu_tune", "-j", str(jobs)]
     say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) +
         " (10-30 minutes the first time, a few minutes after an update) ...")
     if cuda_archs == "native":
@@ -1279,7 +1279,7 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | No
     conf += S.cmake_fresh(BUILD, conf)   # (another ROCm than build-hip/ was configured with: S.cmake_fresh)
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
     say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
-    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)], env,
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "strata", "abyss_gpu_tune", "-j", str(jobs)], env,
                    "build-maya-hip.bat", vcvars=S.find_vcvars(cuda=False) if WIN else None):
         if soft:
             warn("HIP rebuild failed; starting the previous engine")
@@ -2017,6 +2017,117 @@ def calibrate_config(cfg_path: Path) -> bool:
     return True
 
 
+# ------------------------------------------------------------------------------------------------ GPU tuning
+GPU_TUNE_REPORT = ROOT / "abyss-gpu-tune.txt"
+GPU_TUNE_KEYS = ("STRATA_GLM_MV_Q6K_SPLIT",)          # what abyss_gpu_tune may set (src/program/gpu_tune.cpp)
+
+
+def all_configs() -> list:
+    """Every installed config (the setup's maya-*.json and setup-deepseek.sh's abyss-*.json - its engine in "exe"), the
+    most recently used first."""
+    out = []
+    for p in sorted(ROOT.glob("*.json"), key=lambda q: q.stat().st_mtime, reverse=True):   # (most recently used first)
+        if p.name.endswith(".shared-settings.json"):
+            continue
+        c = read_json(p)
+        if isinstance(c, dict) and c.get("exe") and c.get("args"):
+            out.append(p)
+    return out
+
+
+def gpu_tune(a) -> int:
+    """./abyss.sh --gpu-tune: abyss_gpu_tune measures the engine's per-GPU kernel choices on each GPU (no model, about
+    a minute a GPU); a choice that is clearly faster than the engine's own goes into the env of the installed configs
+    on that GPU (removed again when the engine's own is as fast), and abyss-gpu-tune.txt gets a report to paste into
+    a GitHub issue - the engine's table of per-GPU defaults grows from those."""
+    cfgs = all_configs()
+    backend = a.backend or (read_json(cfgs[0]).get("backend", "cuda") if cfgs else ("hip" if S.amd_gpus() else "cuda"))
+    cfgs = [p for p in cfgs if read_json(p).get("backend", "cuda") == backend]
+    select_build_backend(backend)
+    tool = BUILD / ("abyss_gpu_tune.exe" if WIN else "abyss_gpu_tune")
+    if not tool.exists():
+        if not (BUILD / "CMakeCache.txt").exists():
+            fail(f"the {backend.upper()} engine is not built here yet", f"run {ME} --setup first")
+        say("  Compiling the GPU check (abyss_gpu_tune) ...")
+        cmake = shutil.which("cmake") or "cmake"
+        if subprocess.run([cmake, "--build", str(BUILD), "--target", "abyss_gpu_tune", "-j", str(os.cpu_count() or 4)]
+                          ).returncode != 0 or not tool.exists():
+            fail("abyss_gpu_tune did not compile", f"{ME} --setup --rebuild compiles the engine again")
+    if not WIN and subprocess.run(["pgrep", "-x", "strata"], capture_output=True).returncode == 0:
+        fail("an engine is running: it would share the GPU with the measurement", f"stop it first ({ME} stop)")
+    if a.gpus or a.gpu is not None:
+        gpus = [int(g) for g in str(a.gpus or a.gpu).split(",") if g.strip().isdigit()]
+    else:
+        gpus = sorted({int(g) for p in cfgs for g in (read_json(p).get("gpu") or [0])}) or [0]
+    cfg0 = read_json(cfgs[0]) if cfgs else {}
+    env = {k: v for k, v in os.environ.items() if k not in GPU_TUNE_KEYS}   # (the engine's own choice, not an override)
+    for k, v in (cfg0.get("env") or {}).items():
+        if k in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"):
+            env[k] = str(v)
+    libs = [str(d) for d in cfg0.get("lib_dirs") or []]
+    if libs and not WIN:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(libs + [env.get("LD_LIBRARY_PATH", "")]).strip(os.pathsep)
+    say()
+    say(f"  Measuring the engine's per-GPU kernel choices on GPU(s) {', '.join(map(str, gpus))} - about a minute each,")
+    say("  no model needed.")
+    results, text = {}, []
+    for g in gpus:
+        js = ROOT / f".abyss-gpu-tune-{g}.json"
+        say()
+        r = subprocess.run([str(tool), "--device", str(g), "--json", str(js)], env=env, capture_output=True, text=True)
+        out = (r.stdout or "") + (r.stderr or "")
+        for line in (r.stdout or "").splitlines():
+            say("    " + line)
+        if r.returncode != 0 or not js.exists():
+            warn(f"GPU {g}: the measurement failed" + (f" ({out.strip().splitlines()[-1]})" if out.strip() else ""))
+            continue
+        res = json.loads(js.read_text(encoding="utf-8"))
+        js.unlink(missing_ok=True)
+        results[g] = res
+        text.append(r.stdout.rstrip())
+    if not results:
+        return 1
+    changed = []
+    for p in cfgs:
+        c = read_json(p)
+        on = [int(x) for x in c.get("gpu") or [0]]
+        if not all(x in results for x in on):
+            continue
+        want = {}
+        for x in on:                                   # (a split: a choice only when every GPU of it agrees)
+            want = results[x]["env"] if x == on[0] else {k: v for k, v in want.items() if results[x]["env"].get(k) == v}
+        e = {k: v for k, v in (c.get("env") or {}).items() if k not in GPU_TUNE_KEYS}
+        e.update(want)
+        if e != (c.get("env") or {}):
+            if e:
+                c["env"] = e
+            else:
+                c.pop("env", None)
+            p.write_text(json.dumps(c, indent=1), encoding="utf-8")
+            changed.append(p.name)
+    rep = ["### GPU tune report", "", f"- Abyss {maya_version()}, {backend.upper()}, {S.cpu_info()[0]}, "
+           f"{S.ram_gb():.0f} GB RAM", ""]
+    for g, res in results.items():
+        rep.append(f"- GPU {g}: {res['name']} ({res['arch']}, {res['cus']} CUs, {res['vram_gb']} GB): "
+                   + (", ".join(f"{k}={v}" for k, v in res["env"].items()) or "the engine's choices are the fastest"))
+    rep += ["", "```", *text, "```", ""]
+    try:
+        GPU_TUNE_REPORT.write_text("\n".join(rep), encoding="utf-8")
+    except OSError:
+        pass
+    say()
+    for g, res in results.items():
+        if res["env"]:
+            ok(f"GPU {g} ({res['name']}): " + ", ".join(f"{k}={v}" for k, v in res["env"].items()))
+        else:
+            ok(f"GPU {g} ({res['name']}): the engine's own choices are already the fastest here")
+    if changed:
+        say("  Written into: " + ", ".join(changed) + " (applies at the next start)")
+    say(f"  Report: {GPU_TUNE_REPORT} - please paste it into an issue (https://github.com/zephel01/Abyss/issues) when")
+    say("  your GPU is not an AI PRO R9700 or an RTX 5090: the engine's defaults for it come from such reports.")
+    return 0
+
+
 def server_command(cfg_path: Path, a) -> tuple:
     """The dashboard's server for an installed config: (its command, its environment, what the setup's screen shows of
     it).  The engine is compiled again first when its source changed (an update)."""
@@ -2556,6 +2667,10 @@ def main() -> int:
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's CPU lane for this PC (the PCIe share and the CPU threads, ~10-15 minutes), "
                          "then start the model (with --no-start: only tune)")
+    ap.add_argument("--gpu-tune", action="store_true",
+                    help="measure the engine's per-GPU kernel choices on this PC's GPU(s) (no model, about a minute "
+                         "each), write the faster ones into the installed configs and abyss-gpu-tune.txt (a report to "
+                         "paste into an issue)")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
@@ -2574,6 +2689,8 @@ def main() -> int:
     say(f"Project Maya v{version} - GLM-5.3-Flash on your own GPU(s).")
     if a.report:
         return report(version, a.backend, a.config)
+    if a.gpu_tune:
+        return gpu_tune(a)
     if a.bench:
         have = [a.config] if a.config is not None else configs()
         if a.backend:

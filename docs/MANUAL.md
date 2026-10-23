@@ -342,6 +342,20 @@ the Ryzen AI Max's Radeon 8060S (gfx1151).
   `STRATA_DS4_IDX=1` keeps the older indexer kernels, and `STRATA_DS4_ATTN=1` the older attention.
 - **Limits:** mixing it with NVIDIA in one process (CUDA and HIP together) is not supported.
 
+### Tuning for your GPU (`./abyss.sh --gpu-tune`)
+
+Some kernel choices depend on the GPU; the engine picks them per GPU architecture (it logs `glm fast: dense GEMV
+tune`), from measurements on the GPUs we have (an AI PRO R9700, an RTX 5090). `./abyss.sh --gpu-tune` (v1.3.51)
+measures them on your GPU(s) without a model, in under a minute each, with the model server stopped:
+
+- what the GPU is (architecture, compute units, VRAM) and a memory copy's bandwidth;
+- the Q6_K dense GEMV, 4 warps a row or one, over the models' row counts (an R9700: one warp, 560 -> 510 us).
+
+A choice clearly faster than the engine's own (2% or more) goes into the installed configs' `env`
+(`STRATA_GLM_MV_Q6K_SPLIT`) and applies at the next start. `abyss-gpu-tune.txt` gets a report: for a GPU other than
+those two, please paste it into an [issue](https://github.com/zephel01/Abyss/issues/new?template=gpu-tune.md) - the
+engine's defaults for that GPU come from such reports.
+
 ## DeepSeek V4.1 Flash
 
 From v1.3.29 the same engine runs DeepSeek-V4.1-Flash-1017. It is set up by hand (the one-command setup installs V4
@@ -547,6 +561,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_IGPU_XQ` | on | the lane takes the token's input already quantized (q8_1) by the GPU from the request instead of quantizing it again (v1.3.36, bit-identical); `0`: quantized on the iGPU |
 | `STRATA_GLM_PREFILL_IGPU` | on | the prompt's RAM-tier experts on the iGPU; `0`: the CPU threads |
 | `STRATA_GLM_IGPU_FUSED` | on | the prompt's iGPU experts through the fused int8 tensor-core pass (gfx1151, IQ2_XS / IQ3_XXS experts at 4096 / 2048; v1.3.18); `0`: the one-row kernels. `ABYSS_IGPU_FUSED_CHECK=<n>` compares the first n calls against them (stderr) |
+| `STRATA_GLM_MV_Q6K_SPLIT` | per GPU | `1`: Q6_K GEMVs of up to 4,096 blocks 4 warps a row, `0`: one warp a row. Unset: the engine's per-GPU choice (gfx12 one warp - an R9700 7.5 instead of 8.8 ms a DeepSeek V4.1 token -, others 4 warps); `./abyss.sh --gpu-tune` measures it (v1.3.51) |
 | `STRATA_GLM_MV_SPLIT` | auto | dense GEMVs with a row over 4 warps: unset = under 256 blocks, and Q6_K up to 4,096 blocks (v1.3.18); `0` one warp a row always, `2` / `4` that split always. Not bit-identical to one warp a row |
 | `STRATA_GLM_MV_FUSE` | on (HIP) | a small GEMV call of several types (DeepSeek V4's projections of x) in one launch, 4 waves a row (v1.3.40; a small GEMV costs 15-29 us on an AI PRO R9700 whatever its size); `0`: a launch per type. Not bit-identical to the typed kernels |
 | `STRATA_GLM_GRID_PAD` | on (HIP) | launches whose waves land at or just below a multiple of the GPU's wave slots get a few empty blocks (v1.3.40): on gfx1201 such a dispatch delays the next one by 8-14 us (ROCm/TheRock#9300), and DeepSeek V4's 4096-row GEMVs and expert down hit it ~275 times a token (AI PRO R9700: 22.2 -> 20.2 ms a token). Bit-identical; `0` off |

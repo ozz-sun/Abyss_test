@@ -338,6 +338,20 @@ Radeon 8060S（gfx1151）。
   `STRATA_DS4_IDX=1` で indexer を、`STRATA_DS4_ATTN=1` で attention を従来のカーネルに戻せる。
 - **制限:** NVIDIA との組み合わせ（1 つのプロセスで CUDA と HIP の両方）には対応していない。
 
+### GPU に合わせた調整（`./abyss.sh --gpu-tune`）
+
+カーネルの選び方には GPU によって速さが変わるものがある。エンジンは手元で実測した GPU（AI PRO R9700、RTX 5090）の
+結果から、GPU のアーキテクチャごとに選ぶ（ログに `glm fast: dense GEMV tune` と出る）。`./abyss.sh --gpu-tune`
+（v1.3.51）は、モデルなしで、その PC の GPU で 1 台 1 分以内に測る（モデルのサーバーは止めておく）:
+
+- GPU の種類（アーキテクチャ、CU 数、VRAM）と、メモリコピーの帯域
+- Q6_K の dense GEMV を 1 行 4 warp と 1 warp で比べる（モデルの行数で。R9700 は 1 warp が速い: 560 -> 510 us）
+
+エンジンの選択より 2% 以上速いものがあれば、インストール済みの設定の `env`（`STRATA_GLM_MV_Q6K_SPLIT`）に書き込み、
+次の起動から使う。結果は `abyss-gpu-tune.txt` にも保存する。この 2 機種以外の GPU なら、
+[issue](https://github.com/zephel01/Abyss/issues/new?template=gpu-tune.md) に貼ってほしい。その GPU の既定値は、
+こうした報告をもとに決める。
+
 ## DeepSeek V4.1 Flash
 
 v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。準備は手作業（まとめてセットアップが入れるのは V4 だけ）。
@@ -536,6 +550,7 @@ swe-bench の問題ごとに +16〜32%。これらの問題では下書きの 68
 | `STRATA_GLM_IGPU_XQ` | オン | トークンの入力を、GPU が量子化した q8_1 のまま request で受け取り、iGPU で量子化し直さない（v1.3.36、ビット同一）。`0`: iGPU で量子化 |
 | `STRATA_GLM_PREFILL_IGPU` | オン | prompt の RAM 層エキスパートを iGPU で計算する。`0`: CPU のスレッド |
 | `STRATA_GLM_IGPU_FUSED` | オン | prompt の iGPU エキスパートを fused な int8 tensor core カーネルで計算する（gfx1151、IQ2_XS / IQ3_XXS の 4096 / 2048 エキスパート。v1.3.18）。`0`: 1 行ずつのカーネル。`ABYSS_IGPU_FUSED_CHECK=<n>` で最初の n 回を 1 行カーネルと比べる（stderr） |
+| `STRATA_GLM_MV_Q6K_SPLIT` | GPU ごと | `1`: 4,096 block までの Q6_K GEMV を 1 行 4 warp、`0`: 1 warp。未設定: エンジンが GPU ごとに選ぶ（gfx12 は 1 warp。R9700 で DeepSeek V4.1 の 1 トークンあたり 8.8 -> 7.5 ms。ほかは 4 warp）。`./abyss.sh --gpu-tune` が測る（v1.3.51） |
 | `STRATA_GLM_MV_SPLIT` | auto | dense GEMV の 1 行を 4 warp で分担する: 未設定 = 256 block 未満と、Q6_K は 4,096 block まで（v1.3.18）。`0` 常に 1 warp、`2` / `4` 常にその分担。1 warp のときとビットは一致しない |
 | `STRATA_GLM_MV_FUSE` | on（HIP） | 型の違う小さな GEMV の組（DeepSeek V4 の x の射影）を 1 回の起動で、1 行 4 wave で計算する（v1.3.40。AI PRO R9700 では小さな GEMV が大きさによらず 1 回 15〜29 µs かかる）。`0`: 型ごとに起動。型ごとのカーネルとはビットが一致しない |
 | `STRATA_GLM_GRID_PAD` | on（HIP） | wave 数が GPU の wave スロット数の倍数ちょうどかその直前になる起動に、空のブロックを足す（v1.3.40）。gfx1201 ではそういう起動の次の起動が 8〜14 µs 遅れ（ROCm/TheRock#9300）、DeepSeek V4 の 4096 行の GEMV と expert の down が 1 token に約 275 回当たっていた（AI PRO R9700: 22.2 → 20.2 ms/token）。ビット一致。`0` で切る |
