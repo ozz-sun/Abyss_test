@@ -1053,7 +1053,7 @@ int main() {
     test_batch();
     for (int K : {2, 3, 4}) test_moe(K, 2);
     test_moe(3, 1);
-    test_moe(2, 3);   // exlr8's mcg + E4M3
+    for (int K : {2, 3, 4}) test_moe(K, 3);   // exlr8's mcg + E4M3
     for (int K : {2, 5}) test_recon(256, 384, K, 2);
     test_recon(256, 256, 3, 0);
     for (int K = 1; K <= 8; ++K) test_rot_rows(256, 384, K, 2);
@@ -1062,7 +1062,7 @@ int main() {
     test_gemm_rows(4096, 256, 3, 1, 100);
     test_gemm_rows(1024, 128, 4, 0, 7);
     for (int K : {2, 3, 4}) test_set(K, 2);
-    test_set(2, 3);
+    for (int K : {2, 3}) test_set(K, 3);
     for (int K = 1; K <= 8; ++K) test_cpu(512, 256, K);
     test_cpu(4096, 2048, 3);
     test_cpu(2048, 4096, 3);
@@ -1076,7 +1076,7 @@ int main() {
     test_mv_n(2048, 4096, 5, 2, true, 8);                                   // q8_1 input
     for (int K : {2, 3, 4, 8}) test_win(K, 2, 7);
     test_win(3, 1, 2);
-    test_win(2, 3, 7);
+    for (int K : {2, 3}) test_win(K, 3, 7);
     test_win(3, 2, 16);
     for (int K : {1, 3, 6, 8}) test_cpu_n(512, 256, K);
     for (int K : {2, 3, 4, 5, 8}) test_cpu_rows(512, 384, K);

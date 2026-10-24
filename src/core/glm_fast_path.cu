@@ -4016,21 +4016,21 @@ void Glm5Model::fast_read_part(int il, int e, int role, uint8_t* blob, int chunk
     const auto& Ly = fast_->L[(size_t) il];
     const auto& nl = pack_layers_[(size_t) il];
     if (nl.x_cb >= 0) {
-        // EXL3: the part's three pieces (trellis, suh, svh) from wherever the safetensors keep them; the chunks split
-        // the trellis, the scales come with the first
-        size_t at = role == 0 ? 0 : role == 1 ? Ly.gu_bytes : Ly.down_off;
+        // EXL3: the part's three pieces (trellis, suh, svh) from wherever the safetensors keep them; a chunk is the
+        // same byte range of the part [trellis | suh | svh] as a GGUF part's - the streamed fetch kernel copies a
+        // chunk's range once its bit is set (chunks of the trellis alone, the scales with the first, had the last
+        // chunk's range copied before its scales landed: SSD-read experts were wrong)
+        const size_t base = role == 0 ? 0 : role == 1 ? Ly.gu_bytes : Ly.down_off;
+        const size_t len = nl.x_part(role);
+        const size_t piece = ((len + (size_t) n_chunks - 1) / (size_t) n_chunks + 4095) & ~(size_t) 4095;
+        const size_t c0 = std::min(len, (size_t) chunk * piece), c1 = std::min(len, c0 + piece);
+        size_t at = 0;
         for (int j = 0; j < 3; ++j) {
             const size_t i = (size_t) e * 9 + (size_t) role * 3 + (size_t) j;
-            const size_t len = nl.x_piece(role, j);
-            const Shard& xs = pack_shards_[(size_t) nl.x_shard[i]];
-            if (j == 0) {
-                const size_t piece = ((len + (size_t) n_chunks - 1) / (size_t) n_chunks + 4095) & ~(size_t) 4095;
-                const size_t c0 = std::min(len, (size_t) chunk * piece), c1 = std::min(len, c0 + piece);
-                if (c1 > c0) read_slice(xs, nl.x_off[i] + c0, c1 - c0, blob + at + c0);
-            } else if (chunk == 0) {
-                read_slice(xs, nl.x_off[i], len, blob + at);
-            }
-            at += len;
+            const size_t pl = nl.x_piece(role, j);
+            const size_t a = std::max(c0, at), b = std::min(c1, at + pl);
+            if (b > a) read_slice(pack_shards_[(size_t) nl.x_shard[i]], nl.x_off[i] + (a - at), b - a, blob + base + a);
+            at += pl;
         }
         return;
     }
