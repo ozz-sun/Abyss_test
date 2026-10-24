@@ -65,6 +65,7 @@ int block_bytes(int t) {
         case 17: return sizeof(block_iq2_xs);
         case 18: return sizeof(block_iq3_xxs);
         case 22: return sizeof(block_iq2_s);
+        case 29: return sizeof(block_iq1_m);
         default: std::abort();
     }
 }
@@ -75,6 +76,13 @@ void weights(uint8_t* dst, size_t bytes, int t, std::mt19937& rng) {
         // Finite, signed scales; all other block bits are valid grid/scale/sign indices.
         const float magnitude = (1 + (rng() % 1024)) / 65536.f;
         const uint16_t d = half_bits((rng() & 1) ? magnitude : -magnitude);
+        if (t == 29) {   // IQ1_M's scale: the top nibbles of its four scale words
+            uint16_t sc[4];
+            std::memcpy(sc, dst + i + bs - 8, 8);
+            for (int k = 0; k < 4; ++k) sc[k] = uint16_t((sc[k] & 0x0FFF) | (((d >> (4 * k)) & 0xF) << 12));
+            std::memcpy(dst + i + bs - 8, sc, 8);
+            continue;
+        }
         std::memcpy(dst + i + (t == 14 ? bs - 2 : t == 10 ? bs - 4 : 0), &d, 2);
         if (t == 10) {   // Q2_K's dmin, finite too
             const uint16_t m = half_bits((1 + (rng() % 1024)) / 65536.f);
