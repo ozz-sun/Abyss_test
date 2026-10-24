@@ -210,7 +210,8 @@ __global__ void __launch_bounds__(512) engram_kernel(float* __restrict__ R, cons
 // ---------------------------------------------------------------- the head's collapse
 __global__ void __launch_bounds__(1024) head_kernel(const float* __restrict__ R, const float* __restrict__ pre,
                                                     const float* __restrict__ norm_w, float eps, int n_embd,
-                                                    float* __restrict__ x, block_q8_1* __restrict__ xq) {
+                                                    float* __restrict__ x, block_q8_1* __restrict__ xq,
+                                                    float* __restrict__ hout) {
     __shared__ float sh[32];
     __shared__ float sm[5120];
     const int tid = threadIdx.x;
@@ -219,6 +220,7 @@ __global__ void __launch_bounds__(1024) head_kernel(const float* __restrict__ R,
     for (int e = tid; e < n_embd; e += blockDim.x) {
         const float v = p0 * R[e] + p1 * R[e + n_embd] + p2 * R[e + 2 * (size_t) n_embd] + p3 * R[e + 3 * (size_t) n_embd];
         sm[e] = v;
+        if (hout != nullptr) hout[e] = v;
         ss += v * v;
     }
     const float inv = rsqrtf(block_sum(ss, sh) / (float) n_embd + eps);
@@ -226,6 +228,23 @@ __global__ void __launch_bounds__(1024) head_kernel(const float* __restrict__ R,
         const float v = sm[e] * inv * norm_w[e];
         x[e] = v;
         q8_1_store_warp(v, xq + e / 32, tid & 31);
+    }
+}
+
+// ---------------------------------------------------------------- rows of rms(x) * w (the DSpark drafter's context)
+__global__ void __launch_bounds__(1024) rms_rows_kernel(const float* __restrict__ in, const float* __restrict__ w,
+                                                        float eps, int n, float* __restrict__ x,
+                                                        block_q8_1* __restrict__ xq) {
+    __shared__ float sh[32];
+    const int tid = threadIdx.x;
+    const size_t r0 = (size_t) blockIdx.x * n;
+    float ss = 0.0f;
+    for (int e = tid; e < n; e += blockDim.x) ss += in[r0 + e] * in[r0 + e];
+    const float inv = rsqrtf(block_sum(ss, sh) / (float) n + eps);
+    for (int e = tid; e < n; e += blockDim.x) {   // blockDim 1024, n % 32 == 0: whole warps over 32 consecutive e
+        const float v = in[r0 + e] * inv * w[e];
+        x[r0 + e] = v;
+        q8_1_store_warp(v, xq + (r0 + e) / 32, tid & 31);
     }
 }
 
@@ -292,9 +311,15 @@ void engram_add(float* R, const float* kv, const float* qn, const float* kn, int
 }
 
 void head_prep(const float* R, const float* pre, const float* norm_w, float eps, int n_embd, float* x, void* xq,
-               cudaStream_t s) {
-    head_kernel<<<1, 1024, 0, s>>>(R, pre, norm_w, eps, n_embd, x, (block_q8_1*) xq);
+               cudaStream_t s, float* h) {
+    head_kernel<<<1, 1024, 0, s>>>(R, pre, norm_w, eps, n_embd, x, (block_q8_1*) xq, h);
     check("head");
+}
+
+void rms_rows(const float* in, int rows, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s) {
+    if (rows <= 0) return;
+    rms_rows_kernel<<<rows, 1024, 0, s>>>(in, w, eps, n, x, (block_q8_1*) xq);
+    check("rms_rows");
 }
 
 }  // namespace strata::kernels::dsv41

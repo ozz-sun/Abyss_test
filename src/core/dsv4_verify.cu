@@ -1219,6 +1219,8 @@ bool Glm5Model::verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, st
         mark(0);
         if (!verify_attn_v41(il, p0, 0, T, s, err)) return false;
         mark(1);
+        if (dsp_ != nullptr && il > l0_)   // DSpark's features: the layer before's output, each column's
+            for (int t = 0; t < T; ++t) dspark_capture(il - 1, Rc[(size_t) t], t, s);
         for (int t = 0; t < T; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false);
         mark(2);
         if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;

@@ -164,5 +164,9 @@ void dspark_head(const float* R, const uint16_t* fn, const float* scale, const f
 /// *conf = sigmoid(cp . [h; m]) (cp: n_embd + 256 floats).
 void dspark_markov(const float* logits, const void* w2, const uint16_t* w1, int n_vocab, const int* prev,
                    const float* cp, const float* h, int n_embd, float* out, float* conf, cudaStream_t s);
+/// dspark_markov for DeepSeek V4.1's drafter: w2 F16 rows (V x 256), *conf = sigmoid(cp . [h; m] + *cb).
+void dspark_markov_f16(const float* logits, const uint16_t* w2, const uint16_t* w1, int n_vocab, const int* prev,
+                       const float* cp, const float* cb, const float* h, int n_embd, float* out, float* conf,
+                       cudaStream_t s);
 
 }  // namespace strata::kernels::dsv4

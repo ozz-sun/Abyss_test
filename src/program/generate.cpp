@@ -1660,12 +1660,30 @@ static int glm_pack_generate(const Options& o) {
             double ng_pp[5] = {0.8, 0.8, 0.8, 0.8, 0.8};   // the repeats' drafts: the share right at each position
                                                             // (running means, the positions before right)
             int64_t n_ngw = 0, n_ngd = 0, n_nga = 0;   // the repeats' windows, drafts, accepted
+            // STRATA_DS4_DSPARK_FORCE=<ids file> (debug, the drafter against bench/v41dsp/v41_probe.py --compare): the
+            // single tokens are the file's (comma-separated, prompt included) at their positions - a teacher-forced
+            // decode, so the drafter sees the recorded sequence (use with a threshold > 1: no windows)
+            static const std::vector<int32_t> d_force = [] {
+                std::vector<int32_t> v;
+                const char* f = std::getenv("STRATA_DS4_DSPARK_FORCE");
+                if (f == nullptr || !f[0]) return v;
+                if (FILE* fp = std::fopen(f, "r")) {
+                    long x = 0;
+                    while (std::fscanf(fp, " %ld ,", &x) == 1) v.push_back((int32_t) x);
+                    std::fclose(fp);
+                }
+                return v;
+            }();
+            const auto force_at = [&](int t) {
+                const int64_t at = model.position();
+                return at >= 0 && at < (int64_t) d_force.size() ? d_force[(size_t) at] : t;
+            };
             int tok = model.sample_token(sp, err);
             if (tok < 0) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-            tok = model.forced(tok);
+            tok = force_at(model.forced(tok));
             sp.counter += 1;
             std::vector<int32_t> win;
             int64_t n_win = 0, n_one = 0, n_draft = 0, n_acc = 0;
@@ -1811,7 +1829,7 @@ static int glm_pack_generate(const Options& o) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
-                    tok = model.forced(tok);
+                    tok = force_at(model.forced(tok));
                     sp.counter += 1;
                     const double m1 = ms_since(tw);
                     ms_one += m1;
