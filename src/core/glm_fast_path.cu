@@ -1708,6 +1708,7 @@ strata::kernels::cpu::Exl3Part x3_part(const uint8_t* blob, const strata::kernel
     p.k = r < 2 ? E : FF;
     p.n = r < 2 ? FF : E;
     p.K = xl.K[r];
+    p.cb = xl.cb;
     return p;
 }
 
@@ -2328,8 +2329,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.moe || Ly.mtp) continue;
         if (Ly.exl3) {
-            // EXL3: the CPU kernel takes the mul1 codebook (the others stay on the PCIe lane); n_ff marks the layer
-            if (Ly.xl.cb == 2) {
+            // EXL3: the CPU kernel takes mul1 and mcg (+ E4M3: exlr8) - 3inst stays on the PCIe lane; n_ff marks the
+            // layer
+            if (Ly.xl.cb >= 1 && Ly.xl.cb <= 3) {
                 auto& f = F->cpu_fmt[(size_t) il];
                 f.gu_type = f.d_type = strata::kernels::exl3::kTypeEXL3;
                 f.n_embd = g.n_embd;

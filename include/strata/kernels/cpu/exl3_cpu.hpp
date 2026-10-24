@@ -14,12 +14,15 @@
 
 namespace strata::kernels::cpu {
 
-/// One EXL3 matrix (mul1 codebook): k inputs, n outputs, K bits (1..8), tiles in exllamav3's natural layout.
+/// One EXL3 matrix: k inputs, n outputs, K bits (1..8), tiles in exllamav3's natural layout; cb the codebook (2 mul1,
+/// the byte sums above; 1 mcg and 3 mcg + E4M3 - kindlingai's exlr8 -, the decoded values, band_out's affine form the
+/// identity; 0, 3inst, not taken).
 struct Exl3Part {
     const uint32_t* trellis = nullptr;
     const uint16_t* suh = nullptr;   // FP16 bits [k]
     const uint16_t* svh = nullptr;   // FP16 bits [n]
     int k = 0, n = 0, K = 0;
+    int cb = 2;
 };
 /// Whether a vector kernel runs here (AVX-512F/BW or AVX2 + FMA); the scalar one otherwise.
 bool exl3_cpu_vector();

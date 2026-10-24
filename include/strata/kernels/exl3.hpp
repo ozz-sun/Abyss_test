@@ -8,6 +8,7 @@
 //              mul1 (cb 2):  fp16(1024 + bytesum(state * 0x83DCD12D)) * fp16(0x1eee) + fp16(0xc931), one FP16 FMA
 //              mcg (cb 1):   x = state * 0xCBAC1FED, 3inst (cb 0): x = state * 89226354 + 64248484; then
 //                            x = (x & 0x8fff8fff) ^ 0x3b603b60 and the value is the FP16 sum of x's two halves.
+//              mcg + E4M3 (cb 3): mcg's value rounded to FP8 E4M3, nearest even, saturating (kindlingai's exlr8 v2)
 //            Step p sits at tile row (p/8 % 4) * 2 + (p & 1) + 8 (p/2 & 1), column p/32 + 8 (p/4 & 1) (the tensor-
 //            core fragment order).
 //   suh, svh FP16 [k], [n]: the input and output channel scales (signs and magnitudes).

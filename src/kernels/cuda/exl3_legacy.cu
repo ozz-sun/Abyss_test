@@ -62,6 +62,44 @@ __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
 #endif
 }
 
+// exlr8 (cb 3, kindlingai's exlr8 v2): the mcg value rounded to OCP FP8 E4M3 (nearest even, saturating at 448) -
+// part of that format: its encoder searched over the rounded values.  Every E4M3 value is an FP16 one, so the
+// rounded value stays exact in the half2 the kernels carry
+__device__ __forceinline__ float e4m3_round(float v) {
+    const float a = fabsf(v);
+    float r;
+    if (a < 0.015625f) {   // E4M3 subnormals: steps of 2^-9
+        r = rintf(a * 512.0f) * (1.0f / 512.0f);
+    } else {               // 3 mantissa bits: round the F32 mantissa to nearest even
+        uint32_t u = __float_as_uint(a);
+        u += 0x7ffffu + ((u >> 20) & 1u);
+        r = __uint_as_float(u & 0xfff00000u);
+    }
+    return copysignf(fminf(r, 448.0f), v);
+}
+// e4m3_round of both halves in FP16 bits (the decode's ALU budget: the F32 form made the iGPU lane's experts 2x mul1's
+// time): from 2^-6 up, the 10-bit mantissa rounded to 3 bits by an integer add (no carry leaves a 15-bit magnitude);
+// below, steps of 2^-9 - |h| 512 (exact) rounded to an integer by the FP16 sum with 1024 (ulp 1 there; ties to even).
+// The mcg values stay far below E4M3's 448, so nothing saturates
+__device__ __forceinline__ __half2 e4m3_round2(__half2 h) {
+    uint32_t u;
+    __builtin_memcpy(&u, &h, 4);
+    const uint32_t sg = u & 0x80008000u, a = u & 0x7fff7fffu;
+    const uint32_t nrm = (a + 0x003f003fu + ((a >> 7) & 0x00010001u)) & 0xff80ff80u;
+    __half2 ah;
+    __builtin_memcpy(&ah, &a, 4);
+    const __half2 big = __half2half2(__ushort_as_half(0x6400));   // 1024
+    const __half2 q = __hsub2(__hadd2(__hmul2(ah, __half2half2(__ushort_as_half(0x6000))), big), big);   // x 512
+    const __half2 sub = __hmul2(q, __half2half2(__ushort_as_half(0x1800)));                              // x 2^-9
+    uint32_t sb;
+    __builtin_memcpy(&sb, &sub, 4);
+    const uint32_t m = ((a & 0xffffu) < 0x2400u ? 0x0000ffffu : 0u) | ((a >> 16) < 0x2400u ? 0xffff0000u : 0u);
+    const uint32_t r = ((sb & m) | (nrm & ~m)) | sg;
+    __half2 o;
+    __builtin_memcpy(&o, &r, 4);
+    return o;
+}
+
 // two states -> two values, FP16 arithmetic as exllamav3's decode_3inst_2 (the tensor-core kernels take the half2)
 template <int cb>
 __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
@@ -71,14 +109,15 @@ __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
         const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
         return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
     } else {
-        uint32_t x0 = cb == 1 ? s0 * 0xCBAC1FEDu : s0 * 89226354u + 64248484u;
-        uint32_t x1 = cb == 1 ? s1 * 0xCBAC1FEDu : s1 * 89226354u + 64248484u;
+        uint32_t x0 = cb == 1 || cb == 3 ? s0 * 0xCBAC1FEDu : s0 * 89226354u + 64248484u;
+        uint32_t x1 = cb == 1 || cb == 3 ? s1 * 0xCBAC1FEDu : s1 * 89226354u + 64248484u;
         x0 = (x0 & 0x8fff8fffu) ^ 0x3b603b60u;
         x1 = (x1 & 0x8fff8fffu) ^ 0x3b603b60u;
         const __half2 lo = __halves2half2(__ushort_as_half((unsigned short) (x0 & 0xffffu)),
                                           __ushort_as_half((unsigned short) (x1 & 0xffffu)));
         const __half2 hi = __halves2half2(__ushort_as_half((unsigned short) (x0 >> 16)),
                                           __ushort_as_half((unsigned short) (x1 >> 16)));
+        if constexpr (cb == 3) return e4m3_round2(__hadd2(lo, hi));
         return __hadd2(lo, hi);
     }
 }
@@ -647,6 +686,7 @@ bool dispatch(int K, int cb, A&&... args) {
 #define EXL3_CASE(KK)                                                    \
     case KK:                                                             \
         if (cb == 2) F<KK, 2>::run(std::forward<A>(args)...);            \
+        else if (cb == 3) F<KK, 3>::run(std::forward<A>(args)...);       \
         else if (cb == 1) F<KK, 1>::run(std::forward<A>(args)...);       \
         else F<KK, 0>::run(std::forward<A>(args)...);                    \
         return true;
@@ -754,7 +794,7 @@ bool allow_smem_n() {
     bool ok = (size_t) optin >= smem_n_bytes(8);
     if (ok) {
         for (int K = 1; K <= 8; ++K)
-            for (int cb = 0; cb <= 2; ++cb) dispatch<AllowSmemN>(K, cb);
+            for (int cb = 0; cb <= 3; ++cb) dispatch<AllowSmemN>(K, cb);
         ok = cudaGetLastError() == cudaSuccess;
     }
     if (!ok)

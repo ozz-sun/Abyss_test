@@ -4,6 +4,7 @@
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace strata::kernels::cpu {
@@ -18,10 +19,24 @@ float exl3_decode(uint32_t state, int cb) {
         const float h = (float) (1024u + (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + (x >> 24));
         return f32_from_f16(f16_from_f32(std::fma(h, f32_from_f16(0x1eee), f32_from_f16(0xc931))));
     }
-    uint32_t x = cb == 1 ? state * 0xCBAC1FEDu : state * 89226354u + 64248484u;
+    uint32_t x = cb == 1 || cb == 3 ? state * 0xCBAC1FEDu : state * 89226354u + 64248484u;
     x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
     // two FP16 values within a factor of 8 of each other: their F32 sum is exact, rounded once
-    return f32_from_f16(f16_from_f32(f32_from_f16((uint16_t) (x & 0xffffu)) + f32_from_f16((uint16_t) (x >> 16))));
+    const float v = f32_from_f16(f16_from_f32(f32_from_f16((uint16_t) (x & 0xffffu)) + f32_from_f16((uint16_t) (x >> 16))));
+    if (cb != 3) return v;
+    // exlr8: rounded to FP8 E4M3 (nearest even, saturating at 448), as the device's e4m3_round
+    const float a = std::fabs(v);
+    float r;
+    if (a < 0.015625f) {
+        r = std::nearbyint(a * 512.0f) / 512.0f;
+    } else {
+        uint32_t u;
+        std::memcpy(&u, &a, 4);
+        u += 0x7ffffu + ((u >> 20) & 1u);
+        u &= 0xfff00000u;
+        std::memcpy(&r, &u, 4);
+    }
+    return std::copysign(std::fmin(r, 448.0f), v);
 }
 
 void exl3_inner(const uint32_t* trellis, int ld, int k, int n, int K, int cb, float* w) {

@@ -1478,11 +1478,14 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
             mtp_dense = (double) b;
             mtp = true;
-        } else if (g.nextn > 0 && xtab.mats.count(P + "nextn.eh_proj.weight") && xtab.layers.count(L)) {
-            // an EXL3 pack: the block's matrices and experts from exl3.txt, its floats from the GGUF (as load_mtp)
+        } else if (g.nextn > 0 && (xtab.mats.count(P + "nextn.eh_proj.weight") || find(P + "nextn.eh_proj.weight")) &&
+                   xtab.layers.count(L)) {
+            // an EXL3 pack: the block's matrices and experts from exl3.txt, its floats from the GGUF (as load_mtp;
+            // exlr8's FP8 projections Q8_0 there)
             double d = 0;
             for (const char* nm : kMtpRaw)
                 if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
+                else if (const strata::TensorInfo* t = find(P + nm)) d += (double) tensor_bytes(t);
             for (const char* nm : kMtpB16) {
                 if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
                 else if (const strata::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 2;
@@ -3437,7 +3440,8 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             err = "mtp: " + (xe.empty() ? std::string("exl3.txt is gone") : xe);
             return false;
         }
-        if (xt.mats.count(P + "nextn.eh_proj.weight") == 0) return true;   // packed without the draft block
+        if (xt.mats.count(P + "nextn.eh_proj.weight") == 0 && find(P + "nextn.eh_proj.weight", si) == nullptr)
+            return true;   // packed without the draft block
     } else if (find(P + "nextn.eh_proj.weight", si) == nullptr) {
         return true;   // a GGUF without the draft block
     }
@@ -3451,8 +3455,15 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     uint64_t bytes = 0;
     if (exl3_) {
         for (const char* n : raw_names) {
-            if (!x3(P + n)) { err = "mtp: " + P + n + " is not in exl3.txt"; return false; }
-            bytes += xt.mats.at(P + n).vram();
+            if (x3(P + n)) {
+                bytes += xt.mats.at(P + n).vram();
+                continue;
+            }
+            // (a matrix the checkpoint kept as floats - exlr8's FP8 ones: Q8_0 in the GGUF, served natively)
+            const strata::TensorInfo* t = find(P + n, si);
+            if (t == nullptr) { err = "mtp: " + P + n + " is neither in exl3.txt nor in the GGUF"; return false; }
+            bytes += (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], native_rows(t)) + 255u) &
+                     ~(uint64_t) 255u;
         }
         for (const char* n : b16_names) {
             if (x3(P + n)) { bytes += xt.mats.at(P + n).vram(); continue; }
@@ -3517,7 +3528,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return true;
     };
     for (const char* n : raw_names) {
-        if (exl3_) {
+        if (x3(P + n)) {
             if (!up_x3(P + n)) return false;
             continue;
         }

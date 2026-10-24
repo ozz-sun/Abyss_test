@@ -994,10 +994,10 @@ void test_cpu_exact(int k, int n, int K) {
 }
 
 // the CPU lane's kernel (mul1) against the reference: every band of a k x n matrix
-void test_cpu(int k, int n, int K) {
-    HostMat h = make_mat(k, n, K, 2);
+void test_cpu(int k, int n, int K, int cb = 2) {
+    HostMat h = make_mat(k, n, K, cb);
     std::vector<float> x = rand_x(k, 2.0f), w((size_t) k * n), ref((size_t) n), got((size_t) n), xh((size_t) k);
-    cpu::exl3_inner(h.tr.data(), n / 16, k, n, K, 2, w.data());
+    cpu::exl3_inner(h.tr.data(), n / 16, k, n, K, cb, w.data());
     cpu::exl3_mv(w.data(), h.suh.data(), h.svh.data(), k, n, x.data(), ref.data());
     cpu::Exl3Part m;
     m.trellis = h.tr.data();
@@ -1006,10 +1006,33 @@ void test_cpu(int k, int n, int K) {
     m.k = k;
     m.n = n;
     m.K = K;
+    m.cb = cb;
     const float xs = cpu::exl3_cpu_prepare(m, x.data(), xh.data());
     for (int c0 = 0; c0 < n; c0 += 128) cpu::exl3_cpu_band(m, xh.data(), xs, c0, got.data() + c0);
     close(("cpu " + std::string(cpu_tier_name(cpu::exl3_cpu_tier())) + " k" + std::to_string(k) + " n" +
-           std::to_string(n) + " K" + std::to_string(K)).c_str(), got, ref, 2e-3);
+           std::to_string(n) + " K" + std::to_string(K) + " cb" + std::to_string(cb)).c_str(), got, ref, 2e-3);
+    // mcg (+ E4M3): every tier this CPU runs, the same bits as the scalar one (the values are exact FP16 / E4M3 ones)
+    if (cb != 2) {
+        std::vector<float> a0((size_t) 128), a1((size_t) 128);
+        size_t diff = 0;
+        int tiers = 0;
+        for (int t = 1; t <= 2; ++t) {
+            float* p0 = a0.data();
+            float* p1 = a1.data();
+            const float* xp = xh.data();
+            for (int c0 = 0; c0 < n; c0 += 128) {
+                if (!cpu::exl3_cpu_band_acc_on(0, m, &xp, 1, c0, 0, k / 16, &p0) ||
+                    !cpu::exl3_cpu_band_acc_on(t, m, &xp, 1, c0, 0, k / 16, &p1))
+                    break;
+                if (c0 == 0) ++tiers;
+                for (int i = 0; i < 128; ++i) diff += std::fabs(a0[(size_t) i] - a1[(size_t) i]) > 1e-4f * (1.0f + std::fabs(a0[(size_t) i]));
+            }
+        }
+        std::printf("  %-44s %zu differ from the scalar tier (%d vector tiers)  %s\n",
+                    ("cpu tiers K" + std::to_string(K) + " cb" + std::to_string(cb)).c_str(), diff, tiers,
+                    diff == 0 ? "ok" : "FAIL");
+        if (diff != 0) ++g_fail;
+    }
 }
 
 }  // namespace
@@ -1022,7 +1045,7 @@ int main() {
     std::printf("exl3_test on %s (%.1f GB)\n", p.name, (double) p.totalGlobalMem / 1e9);
     test_decode_table();
     for (int K = 1; K <= 8; ++K)
-        for (int cb = 0; cb <= 2; ++cb) test_mv(256, 256, K, cb, false);
+        for (int cb = 0; cb <= 3; ++cb) test_mv(256, 256, K, cb, false);
     test_mv(4096, 512, 3, 2, false);        // occupancy split
     test_mv(12288, 256, 4, 2, false);       // k > 4096
     test_mv(2048, 4096, 5, 2, true);        // q8_1 input
@@ -1030,6 +1053,7 @@ int main() {
     test_batch();
     for (int K : {2, 3, 4}) test_moe(K, 2);
     test_moe(3, 1);
+    test_moe(2, 3);   // exlr8's mcg + E4M3
     for (int K : {2, 5}) test_recon(256, 384, K, 2);
     test_recon(256, 256, 3, 0);
     for (int K = 1; K <= 8; ++K) test_rot_rows(256, 384, K, 2);
@@ -1038,9 +1062,12 @@ int main() {
     test_gemm_rows(4096, 256, 3, 1, 100);
     test_gemm_rows(1024, 128, 4, 0, 7);
     for (int K : {2, 3, 4}) test_set(K, 2);
+    test_set(2, 3);
     for (int K = 1; K <= 8; ++K) test_cpu(512, 256, K);
     test_cpu(4096, 2048, 3);
     test_cpu(2048, 4096, 3);
+    for (int K : {2, 3, 4}) test_cpu(512, 256, K, 3);
+    test_cpu(512, 256, 3, 1);
     // several activations at once (a verify window): the same bits as one at a time
     for (int K = 1; K <= 8; ++K) test_mv_n(512, 256, K, 2, false, 3);
     for (int cb = 0; cb <= 1; ++cb) test_mv_n(256, 384, 4, cb, false, 5);
@@ -1049,6 +1076,7 @@ int main() {
     test_mv_n(2048, 4096, 5, 2, true, 8);                                   // q8_1 input
     for (int K : {2, 3, 4, 8}) test_win(K, 2, 7);
     test_win(3, 1, 2);
+    test_win(2, 3, 7);
     test_win(3, 2, 16);
     for (int K : {1, 3, 6, 8}) test_cpu_n(512, 256, K);
     for (int K : {2, 3, 4, 5, 8}) test_cpu_rows(512, 384, K);

@@ -52,7 +52,12 @@ GGUF_NAME = "maya-exl3.gguf"
 KIND_EXL3 = "x"
 TYPE_EXL3 = 200          # the engine's kTypeEXL3
 ROLES = ("gate", "up", "down")
-GGUF_TYPE = {"F32": 0, "F16": 1, "BF16": 30}
+GGUF_TYPE = {"F32": 0, "F16": 1, "Q8_0": 8, "BF16": 30}
+# matrices the engine reads only as a quant type (the fast path's q()): a float-kept one goes in as Q8_0
+Q8_ONLY = ("attn_q.weight", "attn_k.weight", "attn_v.weight")
+# ... and the NextN block's projections load_mtp serves natively (glm_model.cu's kMtpRaw)
+MTP_NATIVE = ("attn_q_a.weight", "attn_kv_a_mqa.weight", "nextn.eh_proj.weight", "attn_q_b.weight",
+              "attn_output.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")
 
 
 # ------------------------------------------------------------------ safetensors, read in place
@@ -107,6 +112,19 @@ class SafeTensors:
         return a.reshape(shape)
 
 
+def to_q8_0(a: np.ndarray) -> bytes:
+    """float32 rows -> GGML Q8_0 blocks (FP16 d = amax / 127, int8 round(x / d)), as llama.cpp's quantize_row_q8_0."""
+    x = np.ascontiguousarray(a, dtype=np.float32).reshape(-1, 32)
+    amax = np.abs(x).max(axis=1)
+    d = amax / 127.0
+    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0).astype(np.float32)
+    q = np.rint(x * inv[:, None]).clip(-127, 127).astype(np.int8)
+    out = np.empty((x.shape[0], 34), dtype=np.uint8)
+    out[:, :2] = d.astype(np.float16).view(np.uint8).reshape(-1, 2)
+    out[:, 2:] = q.view(np.uint8)
+    return out.tobytes()
+
+
 def to_bf16(a: np.ndarray) -> tuple[np.ndarray, int]:
     """float32 -> BF16 bits, round to nearest even; also the count of values that did not survive exactly."""
     u = np.ascontiguousarray(a, dtype=np.float32).view(np.uint32)
@@ -146,13 +164,29 @@ def exl3_values(st: np.ndarray, cb: int) -> np.ndarray:
         bs = (x & 0xFF) + (x >> 8 & 0xFF) + (x >> 16 & 0xFF) + (x >> 24 & 0xFF)
         v = (1024.0 + bs.astype(np.float64)) * f16(0x1EEE) + f16(0xC931)
         return v.astype(np.float16).astype(np.float32)
-    x = st.astype(np.uint64) * (0xCBAC1FED if cb == 1 else 89226354)
+    x = st.astype(np.uint64) * (0xCBAC1FED if cb in (1, 3) else 89226354)
     if cb == 0:
         x += 64248484
     x = ((x & 0xFFFFFFFF) & 0x8FFF8FFF) ^ 0x3B603B60
     lo = (x & 0xFFFF).astype(np.uint16).view(np.float16).astype(np.float64)
     hi = (x >> 16).astype(np.uint16).view(np.float16).astype(np.float64)
-    return (lo + hi).astype(np.float16).astype(np.float32)
+    v = (lo + hi).astype(np.float16).astype(np.float32)
+    return e4m3_round(v) if cb == 3 else v
+
+
+def e4m3_round(v: np.ndarray) -> np.ndarray:
+    """float32 -> the nearest OCP FP8 E4M3 value (ties to even, saturating at 448), as float32: exlr8's codebook
+    (cb 3) rounds every mcg value so."""
+    a = np.abs(v).astype(np.float32)
+    u = a.view(np.uint32).astype(np.uint64)
+    u = ((u + 0x7FFFF + ((u >> 20) & 1)) & 0xFFF00000).astype(np.uint32)
+    r = np.where(a < 0.015625, np.rint(a * 512.0) / 512.0, u.view(np.float32)).astype(np.float32)
+    return np.copysign(np.minimum(r, 448.0), v).astype(np.float32)
+
+
+def codebook_of(st, p: str) -> int:
+    """The codebook a matrix's marker tensors name: mul1 2, mcg 1, mcg + E4M3 (tools/exlr8_convert.py) 3, else 3inst 0."""
+    return 3 if st.has(p + "mcg_e4m3") else 2 if st.has(p + "mul1") else 1 if st.has(p + "mcg") else 0
 
 
 def exl3_rows(trellis: np.ndarray, suh: np.ndarray, svh: np.ndarray, K: int, cb: int, c0: int = 0,
@@ -188,6 +222,10 @@ class Plan:
     def bf16(self, gname, shape, fn):
         self.floats.append((gname, shape, "BF16", fn))
 
+    def q8(self, gname, shape, fn):
+        """A matrix as Q8_0 in maya-exl3.gguf (the index row names it there, as a GGUF pack's quant rows)."""
+        self.floats.append((gname, shape, "Q8_0", fn))
+
     def gguf_only(self, n0: int):
         """The floats added since index n0 go into maya-exl3.gguf but not into index.txt / dense.bin."""
         self.floats[n0:] = [(n, sh, ty + ":gguf", fn) for n, sh, ty, fn in self.floats[n0:]]
@@ -196,7 +234,16 @@ class Plan:
         st = self.st
         if not st.has(hf + ".trellis"):
             if st.has(hf + ".weight"):
-                raise SystemExit("%s is stored unquantized; the packer expects it as EXL3" % hf)
+                # a matrix the checkpoint keeps as floats (exlr8's FP8 / MXFP8 ones, converted to BF16 by
+                # tools/exlr8_convert.py): a BF16 dense row where the engine takes one, else Q8_0 (E4M3 -> int8 over
+                # 32 values, the KDA q / k / v and the head)
+                fn = lambda hf=hf: st.f32(hf + ".weight")  # noqa: E731
+                nextn = gname.startswith("blk.%d." % self.cfg["num_hidden_layers"])
+                if gname == "output.weight" or gname.endswith(Q8_ONLY) or (nextn and gname.endswith(MTP_NATIVE)):
+                    self.q8(gname, None, fn)
+                else:
+                    self.bf16(gname, None, fn)
+                return
             raise SystemExit("%s: no tensor %s.trellis" % (gname, hf))
         if not st.has(hf + ".suh") or not st.has(hf + ".svh"):
             raise SystemExit("%s: EXL3 without suh/svh (an old packed-sign checkpoint); not supported" % hf)
@@ -204,7 +251,7 @@ class Plan:
         if w % 16:
             raise SystemExit("%s: half-integer bitrate (%d words a tile); not supported yet" % (hf, w))
         K = w // 16
-        cb = 2 if st.has(hf + ".mul1") else 1 if st.has(hf + ".mcg") else 0
+        cb = codebook_of(st, hf + ".")
         if st.t[hf + ".suh"][1] != "F16" or st.t[hf + ".svh"][1] != "F16":
             raise SystemExit("%s: suh/svh are not F16" % hf)
         self.mats.append((gname, hf, kt * 16, nt * 16, K, cb))
@@ -233,7 +280,11 @@ class Plan:
                 self.f32(P + "hc_%s_base.weight" % s, None, g(H + "hc_%s_base" % s))
                 self.f32(P + "hc_%s_scale.weight" % s, None, g(H + "hc_%s_scale" % s))
             if il < n_layers and t["layer_types"][il] == "linear_attention":
-                self.mat(P + "attn_qkv.weight", A + "qkv_proj")
+                if st.has(A + "qkv_proj.trellis") or not st.has(A + "q_proj.weight"):
+                    self.mat(P + "attn_qkv.weight", A + "qkv_proj")
+                else:   # q, k and v apart (exlr8: MXFP8 each, BF16 after tools/exlr8_convert.py)
+                    for q in "qkv":
+                        self.mat(P + "attn_%s.weight" % q, A + "%s_proj" % q)
                 self.mat(P + "attn_output.weight", A + "o_proj")
                 self.f32(P + "ssm_a", None, lambda A=A: -np.exp(st.f32(A + "A_log").reshape(-1)[:n_head]))
                 self.f32(P + "ssm_dt.bias", None, g(A + "dt_bias"))
@@ -311,7 +362,7 @@ class Plan:
                     raise SystemExit("layer %d expert %d %s: half-integer bitrate; not supported yet" % (il, e, r))
                 if st.t[p + "suh"][1] != "F16" or st.t[p + "svh"][1] != "F16":
                     raise SystemExit("layer %d expert %d %s: suh / svh are not F16" % (il, e, r))
-                cb = 2 if st.has(p + "mul1") else 1 if st.has(p + "mcg") else 0
+                cb = codebook_of(st, p)
                 shape.append((kt * 16, nt * 16, w // 16, cb))
                 parts.append((self.st.files.index(st.t[p + "trellis"][0]), st.t[p + "trellis"][3],
                               self.st.files.index(st.t[p + "suh"][0]), st.t[p + "suh"][3],
@@ -503,6 +554,11 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
         ty = ty.split(":")[0]
         a = np.ascontiguousarray(fn(), dtype=np.float32)
         gs = gguf_shape(a.shape, shape)
+        if ty == "Q8_0":
+            tensors.append((name, gs, ty, to_q8_0(a)))
+            if not gguf_only:
+                rows.append([name, "0", "0", "0", "0", "0", "0", str(gs[0]), str(gs[1]), "8", "0", "32"] + ["0"] * 7)
+            continue
         if ty == "BF16":
             b, lost = to_bf16(a)
             lost_total += lost
@@ -721,7 +777,8 @@ def main() -> int:
     st = SafeTensors(d)
     plan = Plan(st, t)
     nextn = int(t.get("num_nextn_predict_layers", 0) or 0)
-    mtp = nextn > 0 and not a.no_mtp and st.has("model.language_model.layers.%d.eh_proj.trellis" % t["num_hidden_layers"])
+    eh = "model.language_model.layers.%d.eh_proj." % t["num_hidden_layers"]
+    mtp = nextn > 0 and not a.no_mtp and (st.has(eh + "trellis") or st.has(eh + "weight"))
     if nextn > 0 and not mtp and not a.no_mtp:
         print("note: the config names a NextN block but the files do not carry it - packed without MTP")
     plan.build(mtp=mtp)
