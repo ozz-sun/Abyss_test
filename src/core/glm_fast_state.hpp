@@ -75,7 +75,15 @@ inline void pin_thread(std::thread::native_handle_type h, const std::vector<int>
     DWORD_PTR mask = 0;
     for (int c : cpus)
         if (c >= 0 && c < 64) mask |= (DWORD_PTR) 1 << c;
-    if (mask != 0) SetThreadAffinityMask((HANDLE) h, mask);
+    if (mask != 0) {
+        SetThreadAffinityMask((HANDLE) h, mask);
+        THREAD_POWER_THROTTLING_STATE throttling{};
+        throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+        throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        throttling.StateMask = 0;
+        SetThreadInformation((HANDLE) h, ThreadPowerThrottling, &throttling, sizeof(throttling));
+        SetThreadPriority((HANDLE) h, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
 #else
     (void) h;
     (void) cpus;
