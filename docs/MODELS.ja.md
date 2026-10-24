@@ -1,0 +1,157 @@
+# モデル評価と GPU 別の参考ベンチマーク
+
+どのモデルファイルを選ぶか、手元の PC でどのくらいの速さが出るかの目安です。数値はすべて Abyss で測ったもので、
+行ごとに Abyss のバージョンか日付を書いています。速さは tok/s（ms/token からの換算は 1000 ÷ ms）。
+「未計測」は測っていない、「–」は該当なしです。答えが変わる（lossy な）設定には、その KL を横に書いています。
+
+English: [MODELS.md](MODELS.md)
+
+## 測り方
+
+| 項目 | 内容 |
+| --- | --- |
+| V4.1 の KL / top-1 / ppl | 量子化前の DeepSeek-V4.1-Flash-1017 の top-256 log-prob に対する KL。Lucebox の held-out 8 系列（8 × 1,023 位置、[Lucebox/...-ROCMFP-GGUF](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF) の `eval/`）。小さいほど元のモデルに近い |
+| V4 0731 の KL | 同じファイルを llama.cpp で動かした出力に対する KL（3,000 トークン）、またはエンジン自身の参照出力に対する KL（1,000〜3,000 トークン）。量子化そのものの損失ではなく、エンジンの正しさと設定の影響を見る値 |
+| GLM の nll | `glm_ids4k` の 3,000 トークンを流し、後半 1,000 トークンの nll（小さいほど良い）。KL（`ref4k_glm` 基準）は別の量子化の出力との差で、品質の値ではない |
+| Ornith の KL | 同じ GGUF の llama.cpp（CPU バックエンド）に対する KL。llama.cpp 自身の CPU と HIP の差が 0.027〜0.029 |
+| swe-bench | 自前のコーディング問題（llmbench）。**60 問 × 5 回**（解決率と pass@1）、**L7 = 難問 16 問**（× 3 または × 1）、速さを見る **6 問**（t003 / t010 / t018 / t025 / t030 / t036、サンプリングあり、±5% 揺れる）、V4.1 用の **8 問**（2026-10-23〜、greedy）。tok/s はサーバー経由の通しの値 |
+| 1 トークンずつ | ドラフトなし（または n-gram のみ）の生成の速さ。swe-bench より遅く出る |
+
+試験機: Ryzen AI Max+ 395（Radeon 8060S、RAM 94 GB）に、OCuLink（PCIe Gen4 x4）で RTX 5090 32 GB か AI PRO R9700 32 GB を
+つないだもの。モデルの SSD は 2026-10-23 夜に ORICO（約 3.4 GB/s）から Lexar NM790（約 6.7 GB/s）に替えた。V4.1 は SSD の速さで
+数値が変わるので、どちらの SSD かを書いています。
+
+## 1. モデル評価
+
+### DeepSeek V4 Flash 0731
+
+人気（Hugging Face の過去 30 日、2026-10-24 時点）: huihui-ai の 0731 abliterated Q2（月 32 万）、huihui-ai の 0422 ds4（23 万）、
+unsloth の 0731（12 万）、0xSero の EXL3（11 万）。この大きさ（約 87〜100 GB）は 32 GB の GPU + 約 92 GB の RAM に収まり、SSD を読まない。
+
+| ファイル（入手先） | サイズ | 品質 | 速さ | 必要なメモリの目安 | おすすめ |
+| --- | ---: | --- | --- | --- | --- |
+| `DeepSeek-V4-Flash-Q2-0731.gguf`（[huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF)、`--compat-bf16` で pack） | 86.8 GB | llama.cpp との KL 0.0075、ppl 6.32（v1.2.2）。swe-bench 解決率は未計測 | 5090: swe 6 問 91.1 tok/s（v1.3.27）。R9700 + iGPU レーン: swe 6 問 38.1（v1.3.39） | VRAM 32 GB + RAM 約 70 GB | 制限解除版が要るとき。セットアップは手作業 |
+| huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF（0422） | 約 87〜100 GB | 未計測 | 未計測 | – | 動くか未確認 |
+| `UD-Q2_K_XL`（[unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)、セットアップの既定。attention を Q5_K にした pack が既定、KL 0.0055 → 0.0119） | 96.8 GB | llama.cpp との KL 0.0096。swe-bench 60 問 × 5: 59/60 解決、pass@1 95.8%（v1.3.27） | 5090: swe 60 問 106.7 tok/s（v1.3.27）、1 トークンずつ 92〜95。R9700 + レーン + DSpark: swe 60 問 70.2（v1.3.43 直前のビルド） | VRAM 32 GB + RAM 約 70 GB で全エキスパートが載る | **既定。まずこれ** |
+| 0xSero の DGX-Spark 向け EXL3 | – | 未計測 | – | – | DeepSeek の EXL3 はまだ読めない |
+| DSpark ドラフトモデル `DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf`（[bleysg](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)、`--dspark`） | 6.94 GB | 答えは変わらない（受理するのは本体のサンプルと一致したものだけ） | R9700、swe 6 問: レーンなし 48.4 → 61.9、レーンあり 51.7 → 67.3 tok/s（v1.3.43） | VRAM 6.5 GB 追加（その分のエキスパートは SSD へ） | R9700 で速さが欲しいとき。NVIDIA では未計測 |
+
+lossy な設定（V4 0731、5090、v1.2.1 / v1.3.2x）: `STRATA_GLM_TAIL_SKIP=4` は 1 トークンずつ +7%（iGPU レーン）、KL 0.0226。
+`STRATA_GLM_DEFER=1` は +12〜15%、KL 0.08（オフ 0.012）、L7 の解決 14 → 13 問。`TAIL_SKIP=1` / `=2` の KL は未計測。
+
+### DeepSeek V4.1 Flash 1017
+
+人気（同じく 2026-10-24 時点）: V4.1 は 9 月版のほうがまだ多い（月 148 万、1017 は最初の 1 週間で 5.8 万）。Abyss が動かすのは 1017 です。
+antirez/deepseek-v4.1-flash-gguf（134 万）は 9 月版と 1017 のファイルが混在。1017 だけの量子化では nazeshinjite が 1 位。
+
+V4.1 はエキスパートが RAM に収まらず、一部を毎トークン SSD から読む。小さいファイルほど SSD の読みが減って速い。
+下の「1 トークンずつ」は 8 系列の平均。
+
+| ファイル（入手先） | サイズ | 品質: KL / top-1 / ppl（8 系列） | 速さ | おすすめ |
+| --- | ---: | --- | --- | --- |
+| `Q2`（[nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)） | 366 GB | 0.229 / 79.2% / 9.69（ルーティングどおり）、`TAIL_SKIP` ありで 0.241 / 78.9% / 9.75。swe-bench 60 問 × 5: 60/60 解決、pass@1 98.4%（v1.3.33） | 5090: swe 60 問 50.6 tok/s（v1.3.33、TAIL_SKIP あり、ORICO）、1 トークンずつ 27.9（あり）/ 17.7（なし）（v1.3.31）。R9700 + レーン: 19.7（あり、v1.3.46、ORICO） | 品質の実績が最も多い。速さは UD-IQ2_XXS と同じで SSD を 66 GB 多く使う |
+| antirez/deepseek-v4.1-flash-gguf の 1017 ファイル | – | 未計測 | 未計測 | 動くか未確認（9 月版は対象外） |
+| `UD-IQ2_XXS`（[unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)） | 300 GB | 0.186（なし）/ 0.209（TAIL_SKIP あり）。top-1 / ppl / swe-bench は未計測 | R9700 + レーン、1 トークンずつ: 17.3（なし）/ 24.3（あり）（v1.3.46、ORICO） | **品質重視ならこれ**（v1.3.46 からの推奨） |
+| `UD-IQ1_M`（unsloth） | 266 GB | 0.270（なし）/ 0.281（あり） | R9700 + レーン: 20.5 / 26.5（v1.3.46、ORICO） | 中間 |
+| `UD-IQ1_S`（unsloth） | 233 GB | 0.355 / 75.0% / 10.80（なし）、0.359（あり） | 5090: 45.6（あり、v1.3.38、ORICO）。R9700 + レーン: 27.2 / 31.9（v1.3.46、ORICO）、swe 8 問 43.7、+ DSpark 54.4（2026-10-24、NM790、下の注） | **速さ重視ならこれ**。品質ははっきり下がる |
+| `GSQ-RCO-IQ2_XXS`（[ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)、Engram は別ファイル） | 248.8 GB（本体 138.2 + Engram 110.6） | 0.3137（なし）/ 0.3266（TAIL_SKIP あり） | R9700 + レーン、swe 8 問: 30.7 / 30.9（なし）、42.2 / 41.3（あり）、48.3 / 47.3（あり + DSpark）。8K prompt 109 秒（約 75 tok/s）（2026-10-24、NM790） | 小さい本体で UD-IQ1_S より KL が低い。40 tok/s には TAIL_SKIP が要る |
+| `GSQ-RCO-IQ1_M`（ISTA-DASLab） | 231.3 GB | 0.3845（2026-10-24） | 未計測 | KL が UD-IQ1_S より高いので勧めない |
+| `Q2_K`（[mrfakename/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF)） | 247 GB | 教師 KL 0.64（dense と Engram も Q2_K） | 5090: 約 9.7 tok/s（2026-10-18） | 単体では勧めない |
+| ハイブリッド: Lucebox の Q8_0 dense + 8 bit Engram と mrfakename のエキスパート | 201 GB | 0.168 / 83.4% / 9.25 | 5090: 8.5 tok/s（2026-10-18） | 最も正確だが遅い |
+
+V4.1 のオーバーレイと実行時の書き換え（UD-IQ1_S、R9700 + レーン、v1.3.52）:
+
+| 方法 | 追加するもの | KL（基準 0.3557） | 速さ | 用途 |
+| --- | --- | --- | --- | --- |
+| Q5_K dense オーバーレイ（`tools/dense_overlay.py`、opt-in、lossy） | 3.2 GB | 0.3652、ppl 10.79 → 10.93 | swe 8 問 40.1 → 43.0 tok/s（n-gram 窓） | 少しでも速く |
+| 拒否の書き換え `--abl`（mrfakename の `abliteration-edit.npz`） | 1.4 GB | 0.3563、ppl 10.76。拒否 16 問中 14 → 0 | 変わらない | 制限解除 |
+| 上の 2 つを一緒に | – | 0.3738 | 未計測 | – |
+| `STRATA_GLM_ABL=<file>`（実行時に同じ書き換え、再量子化なし、v1.3.53） | 43 KB | UD-IQ1_S に掛けて KL 0.3557 → 0.3577、拒否 16 問中 12 → 0 | 未計測 | ファイルを作らずに制限解除 |
+
+V4.1 の lossy な設定（KL は nazeshinjite Q2、8 系列）: `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1` は 0.229 → 0.240〜0.241
+（5090 で 17.7 → 約 28〜29 tok/s）。`=4` は 0.235。`STRATA_GLM_ROUTE_AFFINITY_RAM=0.08` は 0.2406 → 0.2438（-8〜12% / トークン）。
+`STRATA_GLM_DEFER=1` は 1 系列で 0.15 → 0.28（不採用）。
+
+V4.1 の DSpark ドラフトモデル（Lucebox の `deepseek41-dflash-draft`、DSpark-draft-Q2K-Q4K、4.92 GB、VRAM 約 1.67 GB、opt-in、v1.3.53）:
+答えは変わらない。NM790 の R9700 で swe 8 問 +16〜19%（UD-IQ1_S: 40.0 → 47.5、2026-10-24）。ORICO クラスの SSD では効果なし（2026-10-23）。
+
+### GLM-5.3-Flash
+
+ダウンロード数は未調査。どれも VRAM 32 GB + RAM 約 60〜78 GB で全エキスパートが載る。
+
+| ファイル（入手先） | サイズ | 品質: nll（小さいほど良い） | 速さ | おすすめ |
+| --- | ---: | --- | --- | --- |
+| Maya-S-v2-IQ2_XXS（Project Maya） | 96.5 GB | 1.634、top-1 62.3%。swe-bench L7: 13/16 解決（Abyss 1.1.2、2026-10-11） | 5090: 1 トークンずつ 約 67（14.8 ms、2026-10-19）、swe 6 問 64.1（v1.3.27）。R9700 + レーン: 34.3〜38.3（v1.3.40）、swe 6 問 35.8（v1.3.39） | **既定** |
+| Maya-S24 | 94.7 GB | 未計測（本ページの尺度では） | 5090: swe 6 問 70.7（v1.3.27）。R9700 + レーン: swe 6 問 41.2（v1.3.39） | VRAM 24 GB 以下のカード向け |
+| EXL3 `sc_2.10bpw`（[turboderp/GLM-5.3-Flash-exl3](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/sc_2.10bpw)、試験的） | 88.3 GB | 1.591〜1.598、top-1 63.3〜63.7%。KL 0.168（Maya-S-v2 との差） | 5090: 約 53 tok/s（18.8 ms、v1.3.36） | 小さくて文章の予測が良い。速さは約 8 割 |
+| EXL3 `3.05bpw`（turboderp） | 125.3 GB | 未計測 | 未計測 | インストーラに載っているが未計測 |
+| exlr8 K2（kindlingai、`tools/exlr8_convert.py --width 2` → `tools/exl3_pack.py`、v1.3.53） | 86 GB | nll 1.608〜1.613（KL 0.208 は `ref4k_glm` 基準） | R9700 + 8060S レーン、RAM 層 60 GB: 約 22.9 tok/s（43.7 ms、2026-10-24） | いちばん小さい。速さは今後 |
+| exlr8 K3（kindlingai、`--width 3`、v1.3.53） | 125 GB | nll 1.548（KL 0.212 は `ref4k_glm` 基準） | R9700 + 8060S レーン、RAM 層 60 GB: 約 11.2 tok/s（89.1 ms、エキスパートの 3 分の 1 を SSD から、2026-10-24） | 測った GLM で品質が最も高い。94 GB の PC では遅い |
+| exlr8 K4（kindlingai） | 164 GB | – | – | 未試験 |
+
+lossy な設定（Maya-S-v2、5090）: `STRATA_GLM_DEFER=1` は -19% / トークン、nll +0.063。
+
+### Ornith-1.5-122B（Qwen3.5-MoE）
+
+ダウンロード数は未調査。UD-Q4_K_XL は VRAM 32 GB + RAM 層 60 GB で全エキスパートが載り、SSD を読まない。
+
+| ファイル（入手先） | サイズ | 品質 | 速さ | おすすめ |
+| --- | ---: | --- | --- | --- |
+| `UD-Q4_K_XL`（[unsloth/Ornith-1.5-122B-GGUF](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF)） + NextN ドラフト（`tools/nextn_pack.py`） | 79.7 GB + 1.5 GB | llama.cpp との KL 0.024（v1.3.46）。swe-bench L7: 11/16 解決（v1.3.49） | R9700 + レーン: 1 トークンずつ 41〜43、NextN でコード 59 / 文章 50（v1.3.46）、19K の後 51.0（v1.3.49）、swe L7 54.9 tok/s（v1.3.49）。レーンなし: コード 42 / 文章 39（v1.3.46） | 40〜50 tok/s を SSD なしで |
+| `UD-IQ3_XXS`（unsloth） | 49.5 GB | 未計測 | ユーザー報告のみ（下の #8） | 16 GB のカード向け |
+
+## 2. GPU 別の参考ベンチマーク（作者の環境）
+
+RTX 5090 の値はすべて **2026-10-23 の SSD 交換より前**（ORICO 約 3.4 GB/s）。5090 は今は外していて、交換後の SSD・ISTA・UD-IQ1_S・
+V4.1 DSpark の 5090 での値は次に付けたときにまとめて測ります。
+
+| モデル / ファイル | 項目 | RTX 5090 + 8060S レーン | AI PRO R9700 単体（CPU レーン） | R9700 + 8060S レーン | RTX 3090（USB4）+ レーン |
+| --- | --- | --- | --- | --- | --- |
+| V4 0731 UD-Q2_K_XL | 1 トークンずつ | 92〜95（v1.3.21〜27） | 46.1〜46.5（v1.3.41） | 52.2〜52.9（v1.3.40） | 54.4〜56.5（v1.3.27） |
+| | swe 6 問 | 104.8（v1.3.27） | 48.4、DSpark 61.9（v1.3.43） | 51.7、DSpark 67.3（v1.3.43） | 57.9（v1.3.27） |
+| | swe 60 問 × 5 | 106.7（v1.3.27） | 未計測 | DSpark 70.2（v1.3.43 直前） | 未計測 |
+| | prompt 8K | 1,630〜1,760（v1.3.16〜18） | 844（v1.3.41） | 866〜995（v1.3.40） | 765〜864（v1.3.27） |
+| V4 0731 huihui Q2 | swe 6 問 | 91.1（v1.3.27） | 33.9（v1.3.39） | 38.1（v1.3.39） | 49.1（v1.3.27） |
+| V4.1 nazeshinjite Q2 + TAIL_SKIP（KL 0.241） | 1 トークンずつ | 27.9（v1.3.31） | 未計測 | 19.7（v1.3.46） | 未計測 |
+| | swe 60 問 × 5 | 50.6（v1.3.33） | 未計測 | 未計測 | 未計測 |
+| V4.1 UD-IQ1_S + TAIL_SKIP（KL 0.359） | 1 トークンずつ | 45.6（v1.3.38） | 未計測 | 31.9（v1.3.46） | 未計測 |
+| | swe 8 問（NM790） | 未計測 | 未計測 | 43.7（+ affinity、KL 0.3573）、DSpark 54.4（2026-10-24） | 未計測 |
+| V4.1 ISTA IQ2_XXS + TAIL_SKIP（KL 0.3266） | swe 8 問（NM790） | 未計測 | 未計測 | 42.2 / 41.3、DSpark 48.3 / 47.3（2026-10-24） | 未計測 |
+| GLM Maya-S-v2 | 1 トークンずつ | 64.7〜75.4（v1.3.27） | 未計測 | 34.3〜38.3（v1.3.40） | 40.5〜42.4（v1.3.27） |
+| | swe 6 問 | 64.1（v1.3.27） | 25.8（v1.3.39） | 35.8（v1.3.39） | 39.7（v1.3.27） |
+| GLM EXL3 sc_2.10bpw | 1 トークンずつ | 約 53（v1.3.36） | 未計測 | 未計測 | 未計測 |
+| GLM exlr8 K2 | 1 トークンずつ | 未計測 | 未計測 | 約 22.9（2026-10-24） | 未計測 |
+| GLM exlr8 K3 | 1 トークンずつ | 未計測 | 未計測 | 約 11.2（2026-10-24） | 未計測 |
+| Ornith UD-Q4_K_XL + NextN | コード / 文章 | 未計測 | 42 / 39（v1.3.46） | 59 / 50（v1.3.46） | 未計測 |
+| | swe L7 | 未計測 | 未計測 | 54.9（v1.3.49） | 未計測 |
+
+V4.1 の R9700 の 1 トークンずつの値は 8 系列の平均で、ORICO の SSD（2026-10-22）。swe 8 問は NM790 に替えた後。
+R9700 単体の UD-IQ1_S は 1 トークンずつ約 22.7 tok/s（44.0 ms、v1.3.46。TAIL_SKIP の有無は記載なし）。
+5090 + 3090 で層を分けると 5090 1 枚より遅い（87〜90 tok/s、v1.3.25 前後）。
+
+## 3. ユーザー報告（参考）
+
+GitHub の issue で利用者が報告した値です。**利用者が測ったもので、作者は再現していません。** 測り方（プロンプトの長さ、
+`glm stat` の値か通しの値か）は報告ごとに違うので、上の表とは直接比べられません。
+
+| issue | PC | Abyss | モデル / ファイル | 設定 | 生成 tok/s |
+| --- | --- | --- | --- | --- | --- |
+| #8 | RX 9070 XT 16 GB + Ryzen 7 7800X3D + DDR5 64 GB、PCIe 4.0 NVMe、Linux（Docker、ROCm 10） | v1.3.44 | V4 0731 UD-Q2_K_XL | TAIL_SKIP なし、DSpark なし | 18.3〜18.4（温まった後）、8.8K prompt の後 16.7。prompt 133〜148 |
+| #8 | 同上 | v1.3.44 / v1.3.46 | 同上 | `TAIL_SKIP=3` + `_DISK=1`（V4 での KL は未計測。V4.1 では 0.229 → 0.241） | 23.7〜24.1。同じ話題が続くと 29〜31（v1.3.46 の RAM fill で省く数 -40%、速さは同じ） |
+| #8 | 同上 | v1.3.44 | GLM Maya-S-v2 IQ2_XXS | 既定 | 10.3〜10.6 |
+| #8 | 同上 | v1.3.46 | Ornith UD-Q4_K_XL / UD-IQ3_XXS | `TAIL_SKIP=3` + `_DISK=1`（KL 未計測）、NextN（v1.3.49 で直したバグのある版）、iGPU なし | 文章 20.8 / 21.9、コード 25〜29 / 34〜39 |
+| #5 | RX 7900 XT 20 GB + i7-14700K + DDR4 128 GB、Windows 11（TheRock 7.14.1） | v1.3.30 → v1.3.46 | V4 0731 UD-Q2_K_XL、64K | `TAIL_SKIP=0` | 13.71 → 12.56 |
+| #5 | 同上 | v1.3.30 → v1.3.46 | 同上 | `TAIL_SKIP=1`、`LANE=8`、`PIN=0-15`（KL 未計測、品質の変化は大きい） | 28.20 → 32.86 |
+| #5 | 同上 | v1.3.30 → v1.3.46 | 同上、256K | `TAIL_SKIP=4`（KL 0.0226、5090 で計測） | 17.77 → 16.40 |
+| #5 | 同上 | v1.3.30 → v1.3.46 | V4.1 nazeshinjite Q2、RAM 層 85 GB | `TAIL_SKIP=4` + `_DISK=1`（KL 0.235） | 10.55 → 10.12 |
+| #9 | 同上 | v1.3.46 + 利用者自身のパッチ（本家に入っていない） | V4 0731 UD-Q2_K_XL | `TAIL_SKIP=1` / `=4` / `=0`（=1 の KL 未計測、=4 は 0.0226） | 約 53〜55 / 約 35 / 約 18（パッチ前 約 36.8 / 16.5 / 10.7） |
+| #9 | 同上 | 同上 | V4.1 nazeshinjite Q2 | `TAIL_SKIP=2` + `_DISK=1`（KL 未計測）/ `TAIL_SKIP=0` | 約 44.0 / 約 35.8 |
+| #1 | AI PRO R9700 + i5-14400F + RAM 128 GB、Ubuntu（ROCm 7.0、v1.3.42 から ROCm 10） | v1.3.20 | V4 0731 UD-Q2_K_XL | 既定 | 28.4〜31.1、温まると 36.6 |
+| #1 | 同上 | v1.3.31 | 同上、393K コンテキスト | 既定 | 291K の prompt を 279 tok/s で読み、生成 19.5 |
+| #1 | 同上 | v1.3.35 / v1.3.37 / v1.3.42 | V4.1 nazeshinjite Q2、RAM 層 80 GB | `TAIL_SKIP=3` + `_DISK=1`（KL 0.241） | 24〜28 / 30.5 / 22〜25。8K prompt 42〜48 → 60（v1.3.42） |
+
+### 報告から言えること
+
+- 16 GB のカードと 64 GB の RAM（#8）でも、V4 0731 は TAIL_SKIP なしで約 18 tok/s。V4.1 はこの構成ではまだ報告がない。
+- 128 GB の RAM（#1、#5）なら V4.1 の Q2 も動く。速さは SSD と RAM 層の大きさで決まる。
+- `TAIL_SKIP=1` / `=2` の速さは KL を測っていない設定の値です。品質を比べるときは `=3`（V4.1、`_DISK=1` と一緒）か `=4` 以上を。

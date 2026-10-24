@@ -66,6 +66,29 @@ the EXL3 matrices stay in the safetensors. Then start the engine on `--glm-pack 
 engine sees `pack/exl3.txt` and reads the model as EXL3 - no switch). `--check <a GGUF of the same model, shard 1>`
 compares the decoded weights with that GGUF's (cosine ~0.95+ between two quants; a layout mistake shows as ~0).
 
+## kindlingai's exlr8 (v1.3.53)
+
+kindlingai's [glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) stores
+the experts at three trellis widths in its own layout (halves of 128 channels, block scales). Its codebook is mcg with
+every value rounded to FP8 E4M3 - the format requires the rounding - which the engine reads as codebook 3 on the GPU,
+the iGPU lane and the CPU lane. Convert one width, then pack as above:
+
+```sh
+hf download kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 --include "experts/*.k2.*" "experts/*.index.*" "dense/*" "*.json" "*.jinja" --local-dir <dir>
+.venv/bin/python tools/exlr8_convert.py --model <dir> --width 2      # writes <dir>-k2 (86 GB)
+.venv/bin/python tools/exl3_pack.py --model <dir>-k2
+```
+
+`--check-expert L,E --ref <kindlingai/exlr8>/loader/exlr8.py` compares one converted expert with kindlingai's reference
+loader (needs torch). The FP8 dense matrices become BF16 rows, the attention q/k/v and the head Q8_0; the NextN block
+is kept (its projections Q8_0).
+
+| width | size | on an AI PRO R9700 + 8060S lane (RAM tier 60 GB) |
+| --- | ---: | --- |
+| K2 | 86 GB | nll 1.61 on glm_ids4k (turboderp sc_2.10bpw 1.598, Maya-S-v2 IQ2_XXS 1.634; lower is better), ~23 tok/s |
+| K3 | 125 GB | nll 1.548 (the best GLM quant measured here), ~11 tok/s (a third of the experts from the SSD) |
+| K4 | 164 GB | not tried |
+
 ## How Abyss runs it
 
 - **VRAM experts and the dense weights**: Maya's EXL3 kernels (`src/kernels/cuda/exl3.cu`): on RTX 30 and newer a

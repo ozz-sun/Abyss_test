@@ -7,6 +7,45 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.53 - 2026-10-24
+
+**DeepSeek V4.1: ISTA-DASLab's GSQ-RCO GGUFs, the Lucebox DSpark drafter (opt-in), the abliteration edit at run time;
+GLM-5.3-Flash: kindlingai's exlr8 K2.**
+
+- DeepSeek V4.1 Flash 1017: ISTA-DASLab's [GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
+  load (IQ2_XXS 138 GB, IQ1_M 121 GB): the Engram hash values as tensors, the Engram table in a separate GGUF
+  (`--engram`, or `deepseek41.engram.file`), the 3-D output LoRA. Natively served tensors now upload every row past
+  the first dimension (ISTA's [4096, 1024, 8] `attn_output_a` uploaded one group in eight: KL 11). AI PRO R9700 +
+  8060S lane, RAM tier 60 GB, 8 held-out sequences: IQ2_XXS KL 0.3137 (unsloth UD-IQ1_S 0.3557), IQ1_M 0.3845.
+  swe-bench 8-task subset: IQ2_XXS 30.7 / 30.9 tok/s; with `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1`
+  (lossy, KL 0.3266) 42.2 / 41.3; with the skip and the drafter below 48.3 / 47.3.
+- Experts the MMQ prompt kernels do not read (IQ1_M - ISTA's experts) are decoded to FP16 once each and multiplied by
+  cuBLAS / hipBLAS, instead of the whole prompt running token by token: ISTA IQ2_XXS 8K prompt 281 -> 109 s (~75
+  tok/s; UD-IQ1_S 103 s). The 64 generated tokens match the token path's.
+- DeepSeek V4.1: the DSpark drafter (Lucebox's `deepseek41-dflash-draft`, DeepSeek-V4.1-Flash-1017-DSpark-draft-
+  Q2K-Q4K.gguf, 4.9 GB), opt-in: `STRATA_DS4_DSPARK=<file> STRATA_DS4_DSPARK_CHAIN=0.6`. swe-bench 8 tasks on UD-IQ1_S
+  (R9700 + lane, Lexar NM790 SSD): 40.4 -> 46.7 tok/s over 4 runs (+16%); with the disk tail skip (lossy, KL 0.3573)
+  with `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08` 43.7 -> 54.4. Drafts are verified by the model, so the drafter does not change what is sampled. On a slow SSD
+  (~3.4 GB/s) it measured no gain - the window's columns wait on the disk.
+- `STRATA_DS4_SPEC_COST=1` (opt-in, DeepSeek V4 / V4.1 with DSpark): sizes the verify window by expected kept tokens a
+  millisecond. Measured within noise of the fixed chain (46.2 vs 47.5 tok/s), so it stays off.
+- `STRATA_GLM_ABL=<file>`: a refusal-direction edit applied at run time (x - sQQ^Tx on the attention and shared-expert
+  outputs, no re-quantization, no overlay shard). `tools/abl_export.py` turns mrfakename's
+  `abliteration-edit.npz` into the file. V4.1 UD-IQ1_S: KL 0.3557 -> 0.3577 (the v1.3.52 overlay: 0.3563), 16
+  refusal-bait prompts refused 12 -> 0.
+- GLM-5.3-Flash: kindlingai's [exlr8 v2](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) checkpoints.
+  `tools/exlr8_convert.py --model <dir> --width 2` rewrites the halves as an exllamav3-style EXL3 directory, then
+  `tools/exl3_pack.py --model <out>` packs it as for turboderp's EXL3. The EXL3 kernels (device, iGPU lane, CPU lane
+  AVX-512 / AVX2 / scalar) take a third codebook: mcg rounded to FP8 E4M3, which exlr8 requires. The FP8 dense matrices
+  are BF16 / Q8_0 rows; the NextN block's projections Q8_0. Checked against kindlingai's reference loader (experts,
+  shared expert, dense trellis within 7e-8). K2 (86 GB) on the R9700 + 8060S lane: nll 1.61 on glm_ids4k (turboderp
+  EXL3 sc_2.10bpw 1.598, Maya-S-v2 IQ2_XXS 1.634; lower is better), ~23 tok/s; K3 (125 GB) nll 1.548 - the best GLM
+  quant measured here - at ~11 tok/s, a third of its experts read from the SSD. K4 not tried.
+- Fixed: an EXL3 expert read from the SSD was wrong (turboderp's EXL3 too, once its experts outgrow VRAM + RAM). The
+  streamed fetch copies each chunk's byte range of a part once its read lands, but the EXL3 reads chunked the trellis
+  alone and brought the scales with the first chunk. Reads now cover the kernel's ranges: exlr8 K2 on a 30 GB RAM tier
+  KL 1.73 -> 0.206 (as with `STRATA_GLM_STREAM_FETCH=0`), 80.2 -> 75.5 ms a token against that.
+
 ## v1.3.52 - 2026-10-24
 
 **DeepSeek V4.1: the token's embedding row read on the GPU, and overlays - changed dense tensors (Q5_K, or a

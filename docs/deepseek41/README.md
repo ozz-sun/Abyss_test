@@ -81,6 +81,35 @@ KL (0.186 against 0.228). The AMD build now carries V4.1's RDNA expert kernels, 
 windows (the n-gram drafts: a copy task 36 -> 28 ms a token with one draft, 25 with three); against v1.3.45's build
 UD-IQ1_S went 43.9 -> 36.9 ms a token with the lane (52.0 -> 44.0 without), UD-IQ2_XXS 62.7 -> 60.8 (69.6 -> 66.6).
 
+**ISTA-DASLab's GSQ-RCO GGUFs** (v1.3.53): [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
+IQ2_XXS (138 GB) and IQ1_M (121 GB) keep the Engram tables in a separate GGUF (`deepseek41.engram.file`, ~110 GB).
+unsloth's 1017 shard with `per_layer_token_embd` holds the same IQ4_NL bytes, so `--engram` can point at it instead
+of a second download. The prompt path decodes the IQ1_M experts to FP16 once each (8K prompt 281 -> 109 s). Same box
+and texts as below (AI PRO R9700 + 8060S lane, 60 GB RAM tier, Lexar NM790 SSD, v1.3.53):
+
+| | size (+ Engram) | KL, exact routing | swe-bench 8 tasks |
+| --- | ---: | :---: | :---: |
+| ISTA IQ2_XXS | 138 GB | **0.3137** | 30.7 / 30.9 tok/s |
+| ISTA IQ2_XXS + tail skip (lossy) | | 0.3266 | 42.2 / 41.3 tok/s |
+| ISTA IQ2_XXS + tail skip + DSpark drafter | | 0.3266 | **48.3 / 47.3 tok/s** |
+| ISTA IQ1_M | 121 GB | 0.3845 | – |
+| unsloth UD-IQ1_S (reference) | 233 GB | 0.3557 | 40.1 tok/s |
+
+```sh
+.venv/bin/python tools/iq_pack.py --gguf <ISTA>/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
+  --out <ISTA>/pack-iq2xxs --compat-bf16 --engram <unsloth>/UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00005-of-00005.gguf
+```
+
+**The DSpark drafter** (v1.3.53, opt-in): Lucebox's DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf
+(`deepseek41-dflash-draft`, 4.9 GB) proposes up to five tokens; the model verifies them, so it does not change what is
+sampled. `STRATA_DS4_DSPARK=<file> STRATA_DS4_DSPARK_CHAIN=0.6` in the config's `env`. swe-bench 8 tasks on UD-IQ1_S:
+40.4 -> 46.7 tok/s (+16%, 4 runs, Lexar NM790); on the old ~3.4 GB/s SSD it measured no gain, since a verify window's
+columns wait on the disk. Its 1.67 GB of VRAM (dense 0.46 GB, 48 / 40 / 24 expert slots a stage) come out of the expert pool.
+
+**The abliteration edit at run time** (v1.3.53): `tools/abl_export.py abliteration-edit.npz <out>.abl`, then
+`STRATA_GLM_ABL=<out>.abl` - the same edit as the overlay below, applied to the attention and shared-expert outputs
+as they are written (no overlay shard, no second rounding). UD-IQ1_S: KL 0.3557 -> 0.3577, refusals 12 of 16 -> 0.
+
 The `deepseek41` GGUFs from kyuz0 / antirez named "v4.1" without `1017` are the September checkpoint
 (`general.source.revision` `df42c109`); check the revision before trusting a repo name. Lucebox's ROCMFP files use
 their own expert types (107 / 104), which Abyss does not read; their dense tensors and Engram tables do (a hybrid,
@@ -236,6 +265,6 @@ but with a 3.4 GB/s SSD 37.4 ms a token still loses to 34.9 without lookahead - 
 
 ## Not yet for V4.1
 
-Speculative decoding / the verify window (the 1017 FP8 release has three MTP layers; no GGUF carries them),
+MTP drafts (the 1017 FP8 release has three MTP layers; no GGUF carries them - the DSpark drafter above is the opt-in alternative),
 conversation slots on disk, a layer split, a batched prompt attention (the prompt's attention runs a token at a time,
 ~5 ms a token), images, and the one-command setup.
