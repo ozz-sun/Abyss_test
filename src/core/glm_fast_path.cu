@@ -1602,6 +1602,20 @@ void Glm5Model::fast_igpu_setup() {
         cudaDeviceProp p{};
         if (cudaGetDeviceProperties(&p, dev_) == cudaSuccess && p.integrated) return;
     }
+    {   // no integrated GPU among the visible devices (one discrete Radeon, its APU's iGPU off or none): the library
+        // fell back to device 0, the engine's own card - the lane then ran there, its calls 27-62 ms late (issue #11)
+        int n = 0;
+        bool igpu = false;
+        cudaDeviceProp p{};
+        cudaGetDeviceCount(&n);
+        for (int i = 0; i < n && !igpu; ++i) igpu = i != dev_ && cudaGetDeviceProperties(&p, i) == cudaSuccess && p.integrated;
+        if (!igpu) {
+            if (asked)
+                std::fprintf(stderr, "glm fast: CUDA%d iGPU lane off (no integrated GPU among the visible HIP devices) "
+                                     "- the CPU lane computes\n", dev_);
+            return;
+        }
+    }
 #endif
     void* lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     const auto fail = [&](const std::string& why) {
