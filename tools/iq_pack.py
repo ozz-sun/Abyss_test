@@ -207,8 +207,14 @@ class Model:
             total = int(m.group(2))
             paths = [first.with_name(first.name[:m.start()] + "-%05d-of-%05d.gguf" % (i, total))
                      for i in range(1, total + 1)]
+        missing = [p for p in paths if not p.is_file()]
+        if missing and extra:   # (--engram: a shard left undownloaded because it holds only the Engram table)
+            print("missing shards skipped, the Engram tables from %s: %s" % (", ".join(map(str, extra)),
+                                                                          ", ".join(p.name for p in missing)))
+            paths = [p for p in paths if p.is_file()]
+            missing = []
         paths += [pathlib.Path(x) for x in extra]   # (another GGUF read after the shards: a separate Engram file)
-        missing = [str(p) for p in paths if not p.is_file()]
+        missing = [str(p) for p in missing + paths if not p.is_file()]
         if missing:
             raise FileNotFoundError("missing model shards (wait for the download): " + ", ".join(missing))
         self.paths = paths

@@ -90,9 +90,16 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
         const std::string stem = first.substr(0, sdash);
         const int total = std::atoi(first.c_str() + of + 4);
         shard_names.clear();
+        // (V4.1: a shard holding only the Engram table may be left undownloaded when engram.txt reads the table from
+        // another GGUF - iq_pack.py --engram, e.g. orcarouter's Mix-256G 00002 = unsloth's IQ4_NL table)
+        const bool engram_elsewhere = std::ifstream(pack_dir + "/engram.txt").good();
         for (int i = 1; i <= total; ++i) {
             char buf[512];
             std::snprintf(buf, sizeof(buf), "%s-%05d-of-%05d.gguf", stem.c_str(), i, total);
+            if (i > 1 && engram_elsewhere && !std::ifstream(pack_dir + "/../" + buf).good()) {
+                std::fprintf(stderr, "pack: %s is not there - the Engram table is read from engram.txt's file\n", buf);
+                continue;
+            }
             shard_names.push_back(buf);
         }
     }
