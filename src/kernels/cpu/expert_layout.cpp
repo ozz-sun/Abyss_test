@@ -117,6 +117,39 @@ bool cpu_avx2_ok() {
     return ok;
 }
 
+#if (defined(__GNUC__) && (__GNUC__ >= 11)) || (defined(__clang__) && (__clang_major__ >= 12)) || (defined(_MSC_VER) && _MSC_VER >= 1930)
+#define STRATA_HAS_AVXVNNI 1
+#else
+#define STRATA_HAS_AVXVNNI 0
+#endif
+
+bool cpu_avxvnni_ok() {
+#if !STRATA_HAS_AVXVNNI
+    return false;
+#else
+    static const bool ok = [] {
+        if (const char* f = std::getenv("STRATA_NO_AVXVNNI"); f != nullptr && f[0] == '1') return false;
+        if (const char* f = std::getenv("STRATA_FORCE_NO_VNNI"); f != nullptr && f[0] == '1') return false;
+        if (!cpu_avx2_ok()) return false;
+        unsigned r[4] = {0, 0, 0, 0};
+        auto cpuid = [&](unsigned leaf, unsigned sub) {
+#if defined(_MSC_VER)
+            int x[4];
+            __cpuidex(x, (int) leaf, (int) sub);
+            for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+            __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+        };
+        cpuid(7, 0);
+        if (r[0] < 1) return false;
+        cpuid(7, 1);
+        return ((r[0] >> 4) & 1u) != 0;                    // EAX bit 4: AVX-VNNI
+    }();
+    return ok;
+#endif
+}
+
 // A CPU without AVX2 (and without AVX-512) has no kernel for these: say so instead of an illegal instruction.
 // Run with the CPU expert lane off (STRATA_GLM_CPU_LANE=0) so the GPUs compute every expert.
 [[noreturn]] static void no_simd_kernel(const char* what) {

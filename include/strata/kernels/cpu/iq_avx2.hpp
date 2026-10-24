@@ -21,7 +21,7 @@ void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 /// See iq512_set_q5k_fused.
 void iq256_set_q5k_fused(bool fused) noexcept;
 
-/// The one-token form (a decode step's experts) for IQ3_XXS and IQ3_S: ggml-cpu's AVX2 dot with a cheaper decode,
+/// The one-token form (a decode step's experts) for IQ2_XXS, IQ3_XXS and IQ3_S: ggml-cpu's AVX2 dot with a cheaper decode (and AVX-VNNI when cpu_avxvnni_ok()),
 /// bit-identical to it; iq256_rows' arguments, each token in turn.
 bool iq256_rows1_supported(int ggml_type) noexcept;
 void iq256_rows1(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,

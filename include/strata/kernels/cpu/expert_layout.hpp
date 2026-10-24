@@ -43,6 +43,9 @@ struct ExpertLayout {
 bool cpu_avx512_ok();
 /// AVX2 + FMA, with the OS saving the YMM state (the AVX2 kernels' gate).
 bool cpu_avx2_ok();
+/// AVX-VNNI (Intel Alder Lake / Raptor Lake / Zen 4+): VEX-encoded VPDPWSSD in 256-bit lanes.
+/// STRATA_NO_AVXVNNI=1 or STRATA_FORCE_NO_VNNI=1 answers no (for tests).
+bool cpu_avxvnni_ok();
 /// AVX-512 F, BW, VL and DQ with the OS saving the state: what iq_avx512.cpp's kernels need to run (no VNNI or
 /// VBMI).  The engine still picks them only where cpu_avx512_ok() (faster than AVX-2 there); tests run them on any
 /// such CPU.  STRATA_FORCE_AVX2=1 answers no.

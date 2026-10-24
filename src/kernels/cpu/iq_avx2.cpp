@@ -13,6 +13,7 @@
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23), Q4_K (12), Q5_K (13).
 // IQ1_M stays on ggml-cpu.
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -33,6 +34,46 @@ inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si1
 inline uint32_t u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 inline uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
+
+#if (defined(__GNUC__) && (__GNUC__ >= 11)) || (defined(__clang__) && (__clang_major__ >= 12)) || (defined(_MSC_VER) && _MSC_VER >= 1930)
+#define STRATA_HAS_AVXVNNI 1
+#else
+#define STRATA_HAS_AVXVNNI 0
+#endif
+
+#if STRATA_HAS_AVXVNNI
+#if defined(__GNUC__) || defined(__clang__)
+#define TARGET_AVXVNNI __attribute__((target("avxvnni")))
+#else
+#define TARGET_AVXVNNI
+#endif
+#else
+#define TARGET_AVXVNNI
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define STRATA_UNROLL_4 _Pragma("GCC unroll 4")
+#else
+#define STRATA_UNROLL_4
+#endif
+
+template <bool VNNI> struct DotAcc;
+template <> struct DotAcc<false> {
+    static inline __m256i madd(__m256i sum, __m256i dot, __m256i sc) {
+        return _mm256_add_epi32(sum, _mm256_madd_epi16(dot, sc));
+    }
+};
+template <> struct DotAcc<true> {
+#if STRATA_HAS_AVXVNNI
+    TARGET_AVXVNNI static inline __m256i madd(__m256i sum, __m256i dot, __m256i sc) {
+        return _mm256_dpwssd_avx_epi32(sum, dot, sc);
+    }
+#else
+    static inline __m256i madd(__m256i sum, __m256i dot, __m256i sc) {
+        return _mm256_add_epi32(sum, _mm256_madd_epi16(dot, sc));
+    }
+#endif
+};
 
 // 32 sign bits -> 32 bytes of -1 (bit set) / +1: ggml's bit_selector pattern, shared by all tokens.
 inline __m256i sgn_vec(uint32_t m) {
@@ -448,131 +489,205 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
     }
 }
 
-// ---- one token (a decode step's CPU expert): ggml-cpu's own AVX2 dots for IQ3_XXS / IQ3_S with a cheaper decode -
-// IQ3_XXS's sign vectors built in registers (sgn7_vec's steps, as neg masks), IQ3_S's 9-bit grid indices
+// ---- one token (a decode step's CPU expert): ggml-cpu's own AVX2 dots for IQ2_XXS / IQ3_XXS / IQ3_S with a cheaper decode -
+// IQ2_XXS & IQ3_XXS's sign vectors built in registers (sgn7_vec's steps, as neg masks), IQ3_S's 9-bit grid indices
 // built in scalar registers (ggml builds them in vectors, stores and reloads them), the inner loop unrolled.  The
-// integer lanes and the float steps are ggml's, so every result is bit-identical to its dot.  (The multi-token rows
-// above lose to ggml's dot at one token: Maya-L's IQ3_S gate/up pair on one Xeon 6152 core 4.05 vs 3.05 ms.)
-inline float dot1_iq3_xxs(const uint8_t* row, int nb, const block_q8_K* y) {
-    const __m256i shifts = _mm256_setr_epi32(0, 0, 7, 7, 14, 14, 21, 21);
-    const __m256i spread = _mm256_setr_epi8(0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12,
-                                            0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12);
-    const __m256i bits = _mm256_set1_epi64x((long long) 0x8040201008040201ull);
-    const __m256i parity = _mm256_broadcastsi128_si256(
-        _mm_setr_epi8(0, -128, -128, 0, -128, 0, 0, -128, -128, 0, 0, -128, 0, -128, -128, 0));
-    const auto neg = [&](uint32_t w) {   // 0xFF where the value's sign bit is set
-        __m256i s = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int) w), shifts), _mm256_set1_epi32(127));
-        s = _mm256_or_si256(s, _mm256_shuffle_epi8(parity, _mm256_and_si256(_mm256_xor_si256(s, _mm256_srli_epi32(s, 4)),
-                                                                            _mm256_set1_epi8(15))));
-        s = _mm256_shuffle_epi8(s, spread);
-        return _mm256_cmpeq_epi8(_mm256_and_si256(s, bits), bits);
-    };
-    const block_iq3_xxs* x = (const block_iq3_xxs*) row;
-    __m256 accumf = _mm256_setzero_ps();
-    for (int i = 0; i < nb; ++i) {
-        const float d = h2f(x[i].d) * y[i].d;
-        const uint8_t* q3 = x[i].qs;
-        const uint8_t* gas = x[i].qs + QK_K / 4;
-        const int8_t* q8 = y[i].qs;
-        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256();
-#if defined(__GNUC__)
-#pragma GCC unroll 4
-#endif
-        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
-            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
-            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
-            const __m256i q2_1 = _mm256_set_epi32((int) iq3xxs_grid[q3[7]], (int) iq3xxs_grid[q3[6]], (int) iq3xxs_grid[q3[5]],
-                                                  (int) iq3xxs_grid[q3[4]], (int) iq3xxs_grid[q3[3]], (int) iq3xxs_grid[q3[2]],
-                                                  (int) iq3xxs_grid[q3[1]], (int) iq3xxs_grid[q3[0]]);
-            q3 += 8;
-            const __m256i q2_2 = _mm256_set_epi32((int) iq3xxs_grid[q3[7]], (int) iq3xxs_grid[q3[6]], (int) iq3xxs_grid[q3[5]],
-                                                  (int) iq3xxs_grid[q3[4]], (int) iq3xxs_grid[q3[3]], (int) iq3xxs_grid[q3[2]],
-                                                  (int) iq3xxs_grid[q3[1]], (int) iq3xxs_grid[q3[0]]);
-            q3 += 8;
-            const uint32_t a0 = u32(gas), a1 = u32(gas + 4);
-            gas += 8;
-            const __m256i n0 = neg(a0), n1 = neg(a1);
-            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(q8_1, n0), n0);
-            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(q8_2, n1), n1);
-            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
-            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
-            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16((short) (2 * (a0 >> 28) + 1)));
-            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16((short) (2 * (a1 >> 28) + 1)));
-            sumi1 = _mm256_add_epi32(sumi1, p1);
-            sumi2 = _mm256_add_epi32(sumi2, p2);
-        }
-        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
-    }
-    return 0.25f * hsum_ggml(accumf);
-}
+// integer lanes and the float steps are ggml's, so every result is bit-identical to its dot.
+// When cpu_avxvnni_ok() is true (Intel Alder Lake / Raptor Lake / Zen 4+), maddubs + madd + add is fused into
+// maddubs + dpwssd via AVX-VNNI (VPDPWSSD).
 
-inline float dot1_iq3_s(const uint8_t* row, int nb, const block_q8_K* y) {
-    const __m256i mask1 = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
-                                           2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
-    const __m256i mask2 = _mm256_set1_epi64x((long long) 0x8040201008040201ull);
-    const block_iq3_s* x = (const block_iq3_s*) row;
-    __m256 accumf = _mm256_setzero_ps();
-    for (int i = 0; i < nb; ++i) {
-        const float d = h2f(x[i].d) * y[i].d;
-        const uint8_t* qs = x[i].qs;
-        const uint8_t* qh = x[i].qh;
-        const uint8_t* signs = x[i].signs;
-        const int8_t* q8 = y[i].qs;
-        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256();
-#if defined(__GNUC__)
-#pragma GCC unroll 4
-#endif
-        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
-            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
-            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
-            const uint32_t h0 = qh[ib32], h1 = qh[ib32 + 1];
-#define G3(k, h) (int) iq3s_grid[qs[k] | ((h << (8 - (k & 7))) & 256)]
-            const __m256i q2_1 = _mm256_set_epi32(G3(7, h0), G3(6, h0), G3(5, h0), G3(4, h0),
-                                                  G3(3, h0), G3(2, h0), G3(1, h0), G3(0, h0));
-            const __m256i q2_2 = _mm256_set_epi32(G3(15, h1), G3(14, h1), G3(13, h1), G3(12, h1),
-                                                  G3(11, h1), G3(10, h1), G3(9, h1), G3(8, h1));
-#undef G3
-            qs += 16;
-            __m256i aux = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs)), mask1), mask2);
-            const __m256i s2_1 = _mm256_cmpeq_epi8(aux, mask2);
-            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
-            aux = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs + 4)), mask1), mask2);
-            const __m256i s2_2 = _mm256_cmpeq_epi8(aux, mask2);
-            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
-            signs += 8;
-            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
-            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
-            const int sc = x[i].scales[ib32 / 2];
-            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16((short) (2 * (sc & 0xf) + 1)));
-            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16((short) (2 * (sc >> 4) + 1)));
-            sumi1 = _mm256_add_epi32(sumi1, p1);
-            sumi2 = _mm256_add_epi32(sumi2, p2);
-        }
-        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
-    }
-    return hsum_ggml(accumf);
+#define DEFINE_DOT1_IQ3_XXS(NAME, VNNI_BOOL, ATTR) \
+ATTR inline float NAME(const uint8_t* row, int nb, const block_q8_K* y) { \
+    const __m256i shifts = _mm256_setr_epi32(0, 0, 7, 7, 14, 14, 21, 21); \
+    const __m256i spread = _mm256_setr_epi8(0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12, \
+                                            0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12); \
+    const __m256i bits = _mm256_set1_epi64x((long long) 0x8040201008040201ull); \
+    const __m256i parity = _mm256_broadcastsi128_si256( \
+        _mm_setr_epi8(0, -128, -128, 0, -128, 0, 0, -128, -128, 0, 0, -128, 0, -128, -128, 0)); \
+    const auto neg = [&](uint32_t w) { \
+        __m256i s = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int) w), shifts), _mm256_set1_epi32(127)); \
+        s = _mm256_or_si256(s, _mm256_shuffle_epi8(parity, _mm256_and_si256(_mm256_xor_si256(s, _mm256_srli_epi32(s, 4)), \
+                                                                            _mm256_set1_epi8(15)))); \
+        s = _mm256_shuffle_epi8(s, spread); \
+        return _mm256_cmpeq_epi8(_mm256_and_si256(s, bits), bits); \
+    }; \
+    const block_iq3_xxs* x = (const block_iq3_xxs*) row; \
+    __m256 accumf = _mm256_setzero_ps(); \
+    for (int i = 0; i < nb; ++i) { \
+        const float d = h2f(x[i].d) * y[i].d; \
+        const uint8_t* q3 = x[i].qs; \
+        const uint8_t* gas = x[i].qs + QK_K / 4; \
+        const int8_t* q8 = y[i].qs; \
+        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256(); \
+        STRATA_UNROLL_4 \
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) { \
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32; \
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32; \
+            const __m256i q2_1 = _mm256_set_epi32((int) iq3xxs_grid[q3[7]], (int) iq3xxs_grid[q3[6]], (int) iq3xxs_grid[q3[5]], \
+                                                  (int) iq3xxs_grid[q3[4]], (int) iq3xxs_grid[q3[3]], (int) iq3xxs_grid[q3[2]], \
+                                                  (int) iq3xxs_grid[q3[1]], (int) iq3xxs_grid[q3[0]]); \
+            q3 += 8; \
+            const __m256i q2_2 = _mm256_set_epi32((int) iq3xxs_grid[q3[7]], (int) iq3xxs_grid[q3[6]], (int) iq3xxs_grid[q3[5]], \
+                                                  (int) iq3xxs_grid[q3[4]], (int) iq3xxs_grid[q3[3]], (int) iq3xxs_grid[q3[2]], \
+                                                  (int) iq3xxs_grid[q3[1]], (int) iq3xxs_grid[q3[0]]); \
+            q3 += 8; \
+            const uint32_t a0 = u32(gas), a1 = u32(gas + 4); \
+            gas += 8; \
+            const __m256i n0 = neg(a0), n1 = neg(a1); \
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(q8_1, n0), n0); \
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(q8_2, n1), n1); \
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1); \
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2); \
+            sumi1 = DotAcc<VNNI_BOOL>::madd(sumi1, dot1, _mm256_set1_epi16((short) (2 * (a0 >> 28) + 1))); \
+            sumi2 = DotAcc<VNNI_BOOL>::madd(sumi2, dot2, _mm256_set1_epi16((short) (2 * (a1 >> 28) + 1))); \
+        } \
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf); \
+    } \
+    return 0.25f * hsum_ggml(accumf); \
 }
+DEFINE_DOT1_IQ3_XXS(dot1_iq3_xxs_avx2, false, )
+DEFINE_DOT1_IQ3_XXS(dot1_iq3_xxs_vnni, true, TARGET_AVXVNNI)
+#undef DEFINE_DOT1_IQ3_XXS
+
+#define DEFINE_DOT1_IQ2_XXS(NAME, VNNI_BOOL, ATTR) \
+ATTR inline float NAME(const uint8_t* row, int nb, const block_q8_K* y) { \
+    const __m256i shifts = _mm256_setr_epi32(0, 0, 7, 7, 14, 14, 21, 21); \
+    const __m256i spread = _mm256_setr_epi8(0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12, \
+                                            0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12); \
+    const __m256i bits = _mm256_set1_epi64x((long long) 0x8040201008040201ull); \
+    const __m256i parity = _mm256_broadcastsi128_si256( \
+        _mm_setr_epi8(0, -128, -128, 0, -128, 0, 0, -128, -128, 0, 0, -128, 0, -128, -128, 0)); \
+    const auto neg = [&](uint32_t w) { \
+        __m256i s = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int) w), shifts), _mm256_set1_epi32(127)); \
+        s = _mm256_or_si256(s, _mm256_shuffle_epi8(parity, _mm256_and_si256(_mm256_xor_si256(s, _mm256_srli_epi32(s, 4)), \
+                                                                            _mm256_set1_epi8(15)))); \
+        s = _mm256_shuffle_epi8(s, spread); \
+        return _mm256_cmpeq_epi8(_mm256_and_si256(s, bits), bits); \
+    }; \
+    const block_iq2_xxs* x = (const block_iq2_xxs*) row; \
+    __m256 accumf = _mm256_setzero_ps(); \
+    for (int i = 0; i < nb; ++i) { \
+        const float d = h2f(x[i].d) * y[i].d; \
+        const uint16_t* q2 = x[i].qs; \
+        const int8_t* q8 = y[i].qs; \
+        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256(); \
+        STRATA_UNROLL_4 \
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) { \
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32; \
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32; \
+            uint32_t aux32[4]; \
+            std::memcpy(aux32, q2, 16); q2 += 8; \
+            const uint8_t* aux8 = (const uint8_t*) aux32; \
+            const __m256i q2_1 = _mm256_set_epi64x((long long) iq2xxs_grid[aux8[3]], (long long) iq2xxs_grid[aux8[2]], \
+                                                  (long long) iq2xxs_grid[aux8[1]], (long long) iq2xxs_grid[aux8[0]]); \
+            const __m256i q2_2 = _mm256_set_epi64x((long long) iq2xxs_grid[aux8[11]], (long long) iq2xxs_grid[aux8[10]], \
+                                                  (long long) iq2xxs_grid[aux8[9]], (long long) iq2xxs_grid[aux8[8]]); \
+            const __m256i n0 = neg(aux32[1]), n1 = neg(aux32[3]); \
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(q8_1, n0), n0); \
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(q8_2, n1), n1); \
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1); \
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2); \
+            sumi1 = DotAcc<VNNI_BOOL>::madd(sumi1, dot1, _mm256_set1_epi16((short) (2 * (aux32[1] >> 28) + 1))); \
+            sumi2 = DotAcc<VNNI_BOOL>::madd(sumi2, dot2, _mm256_set1_epi16((short) (2 * (aux32[3] >> 28) + 1))); \
+        } \
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf); \
+    } \
+    return 0.125f * hsum_ggml(accumf); \
+}
+DEFINE_DOT1_IQ2_XXS(dot1_iq2_xxs_avx2, false, )
+DEFINE_DOT1_IQ2_XXS(dot1_iq2_xxs_vnni, true, TARGET_AVXVNNI)
+#undef DEFINE_DOT1_IQ2_XXS
+
+#define DEFINE_DOT1_IQ3_S(NAME, VNNI_BOOL, ATTR) \
+ATTR inline float NAME(const uint8_t* row, int nb, const block_q8_K* y) { \
+    const __m256i mask1 = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, \
+                                           2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3); \
+    const __m256i mask2 = _mm256_set1_epi64x((long long) 0x8040201008040201ull); \
+    const block_iq3_s* x = (const block_iq3_s*) row; \
+    __m256 accumf = _mm256_setzero_ps(); \
+    for (int i = 0; i < nb; ++i) { \
+        const float d = h2f(x[i].d) * y[i].d; \
+        const uint8_t* qs = x[i].qs; \
+        const uint8_t* qh = x[i].qh; \
+        const uint8_t* signs = x[i].signs; \
+        const int8_t* q8 = y[i].qs; \
+        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256(); \
+        STRATA_UNROLL_4 \
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) { \
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32; \
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32; \
+            const uint32_t h0 = qh[ib32], h1 = qh[ib32 + 1]; \
+            const __m256i q2_1 = _mm256_set_epi32( \
+                (int) iq3s_grid[qs[7] | ((h0 << 1) & 256)], (int) iq3s_grid[qs[6] | ((h0 << 2) & 256)], \
+                (int) iq3s_grid[qs[5] | ((h0 << 3) & 256)], (int) iq3s_grid[qs[4] | ((h0 << 4) & 256)], \
+                (int) iq3s_grid[qs[3] | ((h0 << 5) & 256)], (int) iq3s_grid[qs[2] | ((h0 << 6) & 256)], \
+                (int) iq3s_grid[qs[1] | ((h0 << 7) & 256)], (int) iq3s_grid[qs[0] | ((h0 << 8) & 256)]); \
+            const __m256i q2_2 = _mm256_set_epi32( \
+                (int) iq3s_grid[qs[15] | ((h1 << 1) & 256)], (int) iq3s_grid[qs[14] | ((h1 << 2) & 256)], \
+                (int) iq3s_grid[qs[13] | ((h1 << 3) & 256)], (int) iq3s_grid[qs[12] | ((h1 << 4) & 256)], \
+                (int) iq3s_grid[qs[11] | ((h1 << 5) & 256)], (int) iq3s_grid[qs[10] | ((h1 << 6) & 256)], \
+                (int) iq3s_grid[qs[9] | ((h1 << 7) & 256)], (int) iq3s_grid[qs[8] | ((h1 << 8) & 256)]); \
+            qs += 16; \
+            __m256i aux = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs)), mask1), mask2); \
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux, mask2); \
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1); \
+            aux = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs + 4)), mask1), mask2); \
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux, mask2); \
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2); \
+            signs += 8; \
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1); \
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2); \
+            const int sc = x[i].scales[ib32 / 2]; \
+            sumi1 = DotAcc<VNNI_BOOL>::madd(sumi1, dot1, _mm256_set1_epi16((short) (2 * (sc & 0xf) + 1))); \
+            sumi2 = DotAcc<VNNI_BOOL>::madd(sumi2, dot2, _mm256_set1_epi16((short) (2 * (sc >> 4) + 1))); \
+        } \
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf); \
+    } \
+    return hsum_ggml(accumf); \
+}
+DEFINE_DOT1_IQ3_S(dot1_iq3_s_avx2, false, )
+DEFINE_DOT1_IQ3_S(dot1_iq3_s_vnni, true, TARGET_AVXVNNI)
+#undef DEFINE_DOT1_IQ3_S
 
 template <int TY>
-void rows1(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
+void rows1_avx2(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     const int nb = n / QK_K;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
         for (int t = 0; t < nt; ++t) {
             const block_q8_K* y = (const block_q8_K*) act[t];
-            out[t][r] = TY == 18 ? dot1_iq3_xxs(row, nb, y) : dot1_iq3_s(row, nb, y);
+            out[t][r] = TY == 16 ? dot1_iq2_xxs_avx2(row, nb, y) : TY == 18 ? dot1_iq3_xxs_avx2(row, nb, y) : dot1_iq3_s_avx2(row, nb, y);
+        }
+    }
+}
+
+template <int TY>
+TARGET_AVXVNNI void rows1_vnni(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
+    const int nb = n / QK_K;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * row_bytes;
+        for (int t = 0; t < nt; ++t) {
+            const block_q8_K* y = (const block_q8_K*) act[t];
+            out[t][r] = TY == 16 ? dot1_iq2_xxs_vnni(row, nb, y) : TY == 18 ? dot1_iq3_xxs_vnni(row, nb, y) : dot1_iq3_s_vnni(row, nb, y);
         }
     }
 }
 
 }  // namespace
 
-bool iq256_rows1_supported(int type) noexcept { return type == 18 || type == 21; }
+bool iq256_rows1_supported(int type) noexcept { return type == 16 || type == 18 || type == 21; }
 
 void iq256_rows1(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                  int r0, int r1) {
-    if (type == 18) rows1<18>(w, row_bytes, n, act, nt, out, r0, r1);
-    else if (type == 21) rows1<21>(w, row_bytes, n, act, nt, out, r0, r1);
+    if (cpu_avxvnni_ok()) {
+        if (type == 16) rows1_vnni<16>(w, row_bytes, n, act, nt, out, r0, r1);
+        else if (type == 18) rows1_vnni<18>(w, row_bytes, n, act, nt, out, r0, r1);
+        else if (type == 21) rows1_vnni<21>(w, row_bytes, n, act, nt, out, r0, r1);
+    } else {
+        if (type == 16) rows1_avx2<16>(w, row_bytes, n, act, nt, out, r0, r1);
+        else if (type == 18) rows1_avx2<18>(w, row_bytes, n, act, nt, out, r0, r1);
+        else if (type == 21) rows1_avx2<21>(w, row_bytes, n, act, nt, out, r0, r1);
+    }
 }
 
 bool iq256_supported(int type) noexcept {
