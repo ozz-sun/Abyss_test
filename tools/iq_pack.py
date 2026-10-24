@@ -45,6 +45,9 @@ import gguf_reader as G  # noqa: E402
 FLOAT = {"BF16", "F32", "F16"}
 ROUTERS = ("ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight")
 NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read from its GGUF by the engine
+# deepseek41's Engram hash values stored as tensors (ISTA-DASLab's / Strata's layout): write_engram reads them into
+# engram.txt / engram_token_map.u32
+NOT_IN_PACK |= {"engram_primes.weight", "engram_offsets.weight", "engram_multipliers.weight", "engram_token_map.weight"}
 # deepseek41's Engram tables (I8 rows of 264 bytes, 2 x 94 GiB): read row by row from the GGUF by the engine
 NOT_IN_PACK_SUFFIX = ("engram_embd.weight", "exp_probs_b_vl.bias")   # (the _vl bias: image tokens only)
 
@@ -196,7 +199,7 @@ def f32_bytes(raw: np.ndarray, type_name: str) -> bytes:
 class Model:
     """All shards of one model: name -> (GGUFFile, TensorInfo, memmap, shard path)."""
 
-    def __init__(self, first: pathlib.Path, first_wins: bool = False):
+    def __init__(self, first: pathlib.Path, first_wins: bool = False, extra=()):
         import re
         m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", first.name)
         paths = [first]
@@ -204,6 +207,7 @@ class Model:
             total = int(m.group(2))
             paths = [first.with_name(first.name[:m.start()] + "-%05d-of-%05d.gguf" % (i, total))
                      for i in range(1, total + 1)]
+        paths += [pathlib.Path(x) for x in extra]   # (another GGUF read after the shards: a separate Engram file)
         missing = [str(p) for p in paths if not p.is_file()]
         if missing:
             raise FileNotFoundError("missing model shards (wait for the download): " + ", ".join(missing))
@@ -282,6 +286,11 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
             # a trailing ne3 of 1 adds no bytes: some converters write glm5-next's conv weights as
             # [4, 1, 8192, 1] instead of [4, 1, 8192], and index_shape packs both as (4, 8192)
             dims = len(t.shape) - (len(t.shape) == 4 and int(t.shape[3]) == 1)
+            if dims == 3 and arch == "deepseek41" and "exps" not in name:
+                # (ISTA-DASLab's GSQ-RCO builds keep the grouped output LoRA as [4096, 1024, 8], unsloth's as
+                # [4096, 8192]: the same bytes - rows of ne0 - so it packs as the 2-D view (ne0, ne1 * ne2))
+                t.shape = [int(t.shape[0]), int(t.shape[1]) * int(t.shape[2])]
+                dims = 2
             if dims > 2 and not (arch in ("glm5-next", "glm5next") and dims == 3):
                 print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
                 return 1
@@ -440,7 +449,25 @@ def write_engram(out, g, model: Model) -> int:
             return 1
     else:   # (Project Maya's V4.1 GGUFs name the keys engram.layers / head_dim / pad_token_id)
         layers = list(m[p + "layer_ids"] if p + "layer_ids" in m else m[p + "layers"])
-        primes, mult, tmap = list(m[p + "primes"]), list(m[p + "multipliers"]), m[p + "token_map"]
+        # (ISTA-DASLab's / Strata's layout: the primes, offsets, multipliers and token map as I64 / I32 tensors,
+        # [24, 2] / [24, 2] / [4, 2] - a table's values contiguous - and the head shape under deepseek41.engram_*)
+        def tens(name, dtype):
+            return [int(x) for x in model.bytes(name).view(dtype)] if name in model.where else None
+        primes = list(m[p + "primes"]) if p + "primes" in m else tens("engram_primes.weight", np.int64)
+        mult = list(m[p + "multipliers"]) if p + "multipliers" in m else tens("engram_multipliers.weight", np.int64)
+        tmap = m[p + "token_map"] if p + "token_map" in m else tens("engram_token_map.weight", np.int32)
+        if p + "offsets" not in m and "engram_offsets.weight" in model.where:
+            m = dict(m)
+            m[p + "offsets"] = tens("engram_offsets.weight", np.int64)
+            for k in ("head_count", "key_length", "max_ngram_size", "pad_token_id"):
+                alt = {"head_count": "deepseek41.engram_n_heads", "key_length": "deepseek41.engram_head_dim",
+                       "max_ngram_size": "deepseek41.engram_max_ngram_size",
+                       "pad_token_id": "deepseek41.engram_pad_token_id"}[k]
+                if p + k not in m and alt in m:
+                    m[p + k] = m[alt]
+        if primes is None or mult is None or tmap is None:
+            print("deepseek41: no Engram primes / multipliers / token map in the metadata or as tensors")
+            return 1
     if len(layers) != 2 or len(primes) != 48 or len(mult) != 8:
         print("deepseek41: unexpected engram metadata (layers %d, primes %d, multipliers %d)"
               % (len(layers), len(primes), len(mult)))
@@ -467,14 +494,22 @@ def write_engram(out, g, model: Model) -> int:
                     return 1
                 run += int(primes[24 * k + c])
     fmt, lines = "row264 264", []
+    # the tables as one per_layer_token_embd though the model names a table a layer (another GGUF's copy, --engram):
+    # table k's rows begin after the tables before it
+    one = not ple and llama and "blk.%d.engram_embd.weight" % layers[0] not in model.where and \
+        "per_layer_token_embd.weight" in model.where
+    if one:
+        base = [sum(int(x) for x in primes[:24 * k]) for k in range(2)]
     for k, il in enumerate(layers):
-        name = "per_layer_token_embd.weight" if ple else "blk.%d.engram_embd.weight" % il
+        name = "per_layer_token_embd.weight" if ple or one else "blk.%d.engram_embd.weight" % il
         if name not in model.where:
             print("deepseek41: %s is missing" % name)
             return 1
         gg, t, _, path = model.where[name]
         need = sum(int(x) for x in primes[24 * k:24 * k + 24])
         rows = int(t.shape[1]) - base[k]
+        if one:
+            rows = min(rows, need) if k == 0 else rows
         if llama or t.type_name != "I8":   # any ggml row type (Q8_0 in the PR's converter, Q2_K in mrfakename's Q2_K,
             # IQ4_NL in unsloth's); the engine decodes with ggml's to_float
             rb = t.expected_bytes() // max(int(t.shape[1]), 1) if t.expected_bytes() else 0
@@ -486,9 +521,9 @@ def write_engram(out, g, model: Model) -> int:
         if not ok:
             print("deepseek41: %s is %s %s for %d rows of buckets" % (name, t.type_name, list(t.shape), need))
             return 1
-        if ple:
+        if ple or one:
             rows = need   # (the first table's rows end where the second's begin)
-        lines.append("table %d %d %d %d %s" % (k, il, gg.data_start + t.offset + base[k] * (rb if ple else 0), rows,
+        lines.append("table %d %d %d %d %s" % (k, il, gg.data_start + t.offset + base[k] * (rb if ple or one else 0), rows,
                                                pathlib.Path(path).resolve()))
     lines.insert(0, "format " + fmt)
     lines.append("primes " + " ".join(str(int(x)) for x in primes))
@@ -512,6 +547,8 @@ def main() -> int:
     ap.add_argument("--first-wins", action="store_true",
                     help="a hybrid shard set: a tensor in several shards is taken from the first (e.g. shard 1 = "
                          "another file's dense weights, the rest = the experts' GGUF)")
+    ap.add_argument("--engram", help="deepseek41: the GGUF holding the Engram tables when they are not in the shards "
+                                     "(blk.N.engram_embd, or per_layer_token_embd as unsloth's 1017 shards have them)")
     ap.add_argument("--compat-bf16", action="store_true",
                     help="dequantize small non-native projections to BF16 for ordinary Qwen4Exp GGUFs "
                          "(rounds weights; leaves experts and the PLE table unchanged)")
@@ -563,7 +600,20 @@ def main() -> int:
         if trunk < 1:
             print("%s: block_count %d - nextn %d leaves no trunk" % (arch, block_count, nextn))
             return 1
-    model = Model(src, first_wins=a.first_wins)
+    # deepseek41 with the Engram tables in a GGUF of their own (ISTA-DASLab's GSQ-RCO builds, Strata's layout:
+    # deepseek41.engram.file names it, beside shard 1): --engram, else that file - or any GGUF holding the same tables,
+    # e.g. unsloth's 1017 shard with per_layer_token_embd (the same IQ4_NL bytes: no second 110 GB download)
+    extra = []
+    eng_file = a.engram or (str(src.parent / str(g.metadata["deepseek41.engram.file"]))
+                            if "deepseek41.engram.file" in g.metadata else None)
+    if eng_file:
+        if not pathlib.Path(eng_file).is_file():
+            print("deepseek41: the Engram tables' file %s is missing (download it, or pass --engram <a GGUF with "
+                  "them>)" % eng_file)
+            return 1
+        extra.append(eng_file)
+        print("deepseek41: Engram tables from %s" % eng_file)
+    model = Model(src, first_wins=a.first_wins, extra=extra)
     if getattr(model, "shadowed", 0):
         print("first-wins: %d tensors of the later shards shadowed by earlier ones" % model.shadowed)
     if arch == "deepseek4" and trunk is not None and trunk < block_count and \

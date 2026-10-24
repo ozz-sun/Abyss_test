@@ -204,6 +204,15 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
 // a dense row's VRAM bytes as load_pack uploads it (0: not uploaded), and how: the fast path keeps the pack's big BF16
 // rows (kind 4) BF16 and the natively served rows (kind 0) quantized, dequantizes the rest to F32, and leaves
 // token_embd on the host (the embedding row is dequantized there from the shard mapping)
+// a natively served tensor's rows: every dimension past the first (ISTA-DASLab's GSQ-RCO V4.1 GGUFs keep the grouped
+// output LoRA as [4096, 1024, 8] where unsloth's is [4096, 8192] - the same bytes; reading shape[1] alone uploaded a
+// group of eight and the answers came out as noise)
+static int native_rows(const strata::TensorInfo* t) {
+    int64_t n = 1;
+    for (size_t i = 1; i < t->shape.size(); ++i) n *= (int64_t) t->shape[i];
+    return (int) n;
+}
+
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
                               std::string* how = nullptr) {
     if (fast && name == "token_embd.weight") return 0;
@@ -220,7 +229,7 @@ static uint64_t pack_row_vram(const std::string& name, const std::string& kind, 
         return ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
     }
     if (how) *how = " q" + std::to_string((int) t->type);
-    return (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
+    return (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], native_rows(t)) + 255u) &
            ~(uint64_t) 255u;
 }
 
@@ -257,7 +266,7 @@ static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const s
     for (const char* n : raw) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
-        bytes += (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
+        bytes += (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], native_rows(t)) + 255u) &
                  ~(uint64_t) 255u;
     }
     for (const char* n : b16) {
@@ -3031,12 +3040,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 return false;
             }
             const strata::TensorInfo* ti = gfs[(size_t) si]->find(r.name);
-            const size_t nbytes = strata::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0],
-                                                                            (int) ti->shape[1]);
+            const size_t nbytes = strata::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0], native_rows(ti));
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             ws_map_[r.name] = strata::core::WSlot{nullptr, (int) ti->type, (const void*) ((uint8_t*) w_arena_ + at),
-                                    (int64_t) ti->shape[0], (int64_t) ti->shape[1]};
+                                    (int64_t) ti->shape[0], (int64_t) native_rows(ti)};
             if (r.name == "token_embd.weight") {
                 pack_emb_src_ = src;
                 pack_emb_type_ = (int) ti->type;
@@ -3514,7 +3522,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             continue;
         }
         const strata::TensorInfo* t = find(P + n, si);
-        const size_t nb = strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
+        const size_t nb = strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], native_rows(t));
         if (cudaMemcpy(base + at, src_of(t, si), nb, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
         ws_map_[P + n] = strata::core::WSlot{nullptr, (int) t->type, (const void*) (base + at), (int64_t) t->shape[0],
                                              (int64_t) t->shape[1]};
