@@ -582,13 +582,25 @@ void Glm5Model::prefill_settle(double pinned_share) {
     prefill_cap((int) pick.first, "--prefill auto at 85%");
 }
 
-// the weight scratch the prompt path keeps beside a chunk's rows: {BF16 elements, F32 elements}
-static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool has_dsa) {
+// routed experts MMQ does not read (IQ1_M: ISTA-DASLab's GSQ-RCO V4.1 quants) whose rows dequant_f16 decodes: the
+// prompt path decodes each such expert to FP16 once and multiplies it by cuBLAS (run_blas_dq) - the idea of Strata
+// 0.2.4's gfx12 i-quant tiles and Maya's DS4_FAT_ROWS (a prompt expert's weights decoded once, not once per row tile)
+static bool mmq_layer(int gu, int d) { return mmq::supported(gu) && mmq::supported(d); }
+static bool deq_expert_type(int t) {
+    return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29 || strata::kernels::dequant_bf16_supported(t);
+}
+// rows a decoded expert's FP16 activations take beside its 2 n_ff x n_embd gate/up (run_blas_dq's X16)
+static constexpr int64_t kDqRows = 512;
+
+// the weight scratch the prompt path keeps beside a chunk's rows: {BF16 elements, F32 elements}.  deq: a layer's
+// experts go through run_blas_dq (their decoded gate/up and kDqRows activation rows)
+static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool has_dsa, bool deq = false) {
     const int64_t E = g.n_embd;
     int64_t w32 = 2 << 20;
     if (has_dsa)
         w32 = std::max<int64_t>({w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
     int64_t w16 = std::max<int64_t>((int64_t) g.d_inner() * E, (int64_t) 2048 * E);
+    if (deq) w16 = std::max<int64_t>(w16, ((int64_t) 2 * g.n_ff_exp + kDqRows) * E);
 #if defined(STRATA_USE_HIP)
     if (has_dsa)   // the MLA products' FP16 copy of wk_b / wv_b
         w16 = std::max<int64_t>({w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
@@ -611,7 +623,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     }
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
-    bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false;
+    bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false, has_deq = false;
     size_t gstride = 0;
     std::string why;
     const auto deq_ok = [&](const WSlot& w, const char* nm, int il) {
@@ -670,9 +682,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
             deq_ok(Ly.sh_up, "ffn_up_shexp", il);
             deq_ok(Ly.sh_down, "ffn_down_shexp", il);
-            if (!Ly.exl3 && (!mmq::supported(Ly.gu_type) || !mmq::supported(Ly.d_type)))   // (EXL3: run_set_x3)
-                why += "blk." + std::to_string(il) + " experts (types " + std::to_string(Ly.gu_type) + "/" +
-                       std::to_string(Ly.d_type) + ") ";
+            if (!Ly.exl3 && !mmq_layer(Ly.gu_type, Ly.d_type)) {   // (EXL3: run_set_x3)
+                if (deq_expert_type(Ly.gu_type) && deq_expert_type(Ly.d_type))
+                    has_deq = true;   // (run_blas_dq)
+                else
+                    why += "blk." + std::to_string(il) + " experts (types " + std::to_string(Ly.gu_type) + "/" +
+                           std::to_string(Ly.d_type) + ") ";
+            }
             gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
         } else {
             has_dense = true;
@@ -703,7 +719,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
 
     // ---- sizes: the chunk T from the budget (per device)
     const int64_t E = g.n_embd;
-    const auto wsc = weight_scratch(g, has_dsa);
+    const auto wsc = weight_scratch(g, has_dsa, has_deq);
+    if (has_deq)
+        std::fprintf(stderr, "glm prefill: CUDA%d experts without MMQ (IQ1_M ...) decoded to FP16 once each, then cuBLAS\n", dev_);
     const int64_t w16_elems = wsc.first, w32_elems = wsc.second;
     const size_t ws_bytes = kPfWorkspace;
     // ---- the chunk T, as Strata's --prefill (the config's args; STRATA_GLM_PREFILL, unset = auto).  `auto`: the
@@ -1023,7 +1041,7 @@ size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, boo
     const int max_pools = (int) std::max<int64_t>(1, max_ctx / g.idx_kpool);
     const int sub_env = prefill_sub_env();
     const auto pu = chunk_bytes(g, T, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env, mtp);
-    const auto ws = weight_scratch(g, has_dsa);
+    const auto ws = weight_scratch(g, has_dsa, g.v41);   // (v41: an IQ1_M part's run_blas_dq scratch, at most)
     Carve c;
     c.take<uint8_t>(pu.first + pu.second);
     c.take<uint16_t>((size_t) ws.first);
@@ -2783,10 +2801,53 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
             }
         };
+        // experts MMQ does not read (deq_expert_type): one at a time, gate and up decoded to FP16 into w16 [2 n_ff][E]
+        // (the blob's gate rows, then its up rows), the expert's rows gathered to FP16 and multiplied by cuBLAS, the
+        // SwiGLU, then the down [E][n_ff] the same way - the outputs land in the expert's own OUTP rows as run_blas's
+        const bool deq = !Ly.exl3 && !mmq_layer(Ly.gu_type, Ly.d_type);
+        const auto run_blas_dq = [&](const uint8_t* blob, int a, int nrows, int r0) {
+            const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
+            const int gu_rows = (int) std::min<int64_t>(kDqRows, std::max<int64_t>(1, (S->w16_elems - wgu) / E));
+            const int dn_rows = (int) std::max<int64_t>(1, (S->w16_elems - wdn) / nff);
+            const size_t up_off = mmq::matrix_bytes(Ly.gu_type, nff, E);
+            const int o = place(r0 + a, nrows);
+            // GU rows of 2 n_ff (gate | up) as MMQ's (2 * n_ff <= n_embd: inside the expert's own OUTP rows); the
+            // down's E-wide outputs then overwrite them from the expert's first row on, so its parts run last first
+            // (part c0's outputs reach only the inputs of rows past it, already multiplied)
+            float* GU = M.OUTP + (size_t) o * E;
+            strata::kernels::dequant_f16(Ly.gu_type, blob, 0, nff, E, S->w16, s);
+            strata::kernels::dequant_f16(Ly.gu_type, blob + up_off, 0, nff, E, S->w16 + (size_t) nff * E, s);
+            uint16_t* X16 = S->w16 + wgu;
+            for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
+                const int n = std::min(gu_rows, nrows - c0);
+                strata::kernels::exl3::rows_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
+                                     X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * 2 * nff, CUDA_R_32F, 2 * nff,
+                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm dq gate/up");
+            }
+            gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+            strata::kernels::dequant_f16(Ly.d_type, blob + Ly.down_off, 0, E, nff, S->w16, s);
+            uint16_t* H16 = S->w16 + wdn;
+            for (int c0 = (nrows - 1) / dn_rows * dn_rows; c0 >= 0; c0 -= dn_rows) {
+                const int n = std::min(dn_rows, nrows - c0);
+                strata::kernels::exl3::rows_f16(GU + (size_t) c0 * 2 * nff, 2 * nff, nullptr, n, nff, H16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
+                                     CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm dq down");
+            }
+        };
         const auto run_any = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                  int r0) {
-            if (Ly.exl3) run_set_x3(wbase, n_exp, stride, d_bounds, hb, r0);
-            else run_set(wbase, n_exp, stride, d_bounds, hb, r0);
+            if (Ly.exl3) {
+                run_set_x3(wbase, n_exp, stride, d_bounds, hb, r0);
+            } else if (deq) {
+                for (int i = 0; i < n_exp; ++i)
+                    if (hb[i + 1] > hb[i]) run_blas_dq(wbase + (size_t) i * stride, hb[i], hb[i + 1] - hb[i], r0);
+            } else {
+                run_set(wbase, n_exp, stride, d_bounds, hb, r0);
+            }
         };
         if (2 * nff > E) {   // (deepseek41: 2 x 2304 < 5120 - the packed rows still fit)
             err = "glm prefill: 2 * n_ff_exp > n_embd (the gate/up rows would not fit the set's output rows)";
