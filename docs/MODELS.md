@@ -154,6 +154,12 @@ tables above.
 | #1 | same | v1.3.31 | same, 393K context | defaults | a 291K prompt read at 279 tok/s, decode 19.5 |
 | #1 | same | v1.3.35 / v1.3.37 / v1.3.42 | V4.1 nazeshinjite Q2, 80 GB RAM tier | `TAIL_SKIP=3` + `_DISK=1` (KL 0.241) | 24-28 / 30.5 / 22-25; 8K prompt 42-48 -> 60 (v1.3.42) |
 
+`./abyss.sh --gpu-tune` reports (the dense Q6_K GEMV, a call's total in us; lower is faster):
+
+| issue | GPU | Abyss | 4 warps / a warp a row | the engine's choice |
+| --- | --- | --- | --- | --- |
+| #10 | RX 9070 XT 16 GB (gfx1201), Ryzen 7 7800X3D, 62 GB RAM | v1.3.53 | 868.0 / 537.8 (~590 GB/s on the large matrices) | a warp a row (the measured best, no change) |
+
 ### What the reports say
 
 - A 16 GB card with 64 GB of RAM (#8) runs V4 0731 at ~18 tok/s without TAIL_SKIP. No V4.1 report on such a PC yet.
