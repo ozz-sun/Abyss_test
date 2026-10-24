@@ -1072,19 +1072,25 @@ __device__ __forceinline__ float any_row_dot_part(int type, const void* w, int r
     }
 }
 
-// gfx1201, a full 64-CU die: a dispatch whose waves land at or near a multiple of the die's wave slots (CUs x 2 SIMDs
-// x 16 waves = 2048) delays the NEXT dispatch's start by 8-14 us (ROCm/TheRock#9300, ROCm 10.0 / HIP 7.15; only a
-// kernel that can fill every slot).  An AI PRO R9700 met it ~275 times a DeepSeek V4 token: the 4096-row GEMVs (a wave
-// a row) and the expert down (8192 waves).  Blocks that return at once move a launch out of the window (Strata PR
-// #2492: a 2560 -> 512 matvec 16.5 -> 5.0 us); every row and sum stays the same.  STRATA_GLM_GRID_PAD=0: none
+// gfx1201, a full 64-CU die: a dispatch whose waves land at or near a multiple of the die's wave slots delays the NEXT
+// dispatch's start by 8-14 us (ROCm/TheRock#9300, ROCm 10.0 / HIP 7.15; only a kernel that can fill every slot).  An AI
+// PRO R9700 met it ~275 times a DeepSeek V4 token: the 4096-row GEMVs (a wave a row) and the expert down (8192 waves).
+// Blocks that return at once move a launch out of the window (Strata PR #2492: a 2560 -> 512 matvec 16.5 -> 5.0 us);
+// every row and sum stays the same.  The window is HIP's CU count (32 on the R9700: WGPs) x 32 = 1024: the "full" 2048
+// (x 64, issue #9) measured no better there (2 of 4 runs at the no-padding level).  gfx11 does not show the stall
+// (issue #9, RX 7900 XT: none 40.4, 1024-style 39.9, 2048-style 40.7 tok/s, within the runs' spread), so the padding is
+// on only for gfx12 and the archs outside gfx11.  STRATA_GLM_GRID_PAD=0: none anywhere, =1: on everywhere.
 static int grid_pad(int blocks, int wpb) {
-    static const bool on = getenv("STRATA_GLM_GRID_PAD") == nullptr || std::atoi(getenv("STRATA_GLM_GRID_PAD")) != 0;
+    static const int env = getenv("STRATA_GLM_GRID_PAD") == nullptr ? -1 : std::atoi(getenv("STRATA_GLM_GRID_PAD")) != 0;
     static thread_local int dev = -1, slots = 0;
     int d = 0;
-    if (!on || wpb <= 0 || hipGetDevice(&d) != hipSuccess) return blocks;
+    if (env == 0 || wpb <= 0 || hipGetDevice(&d) != hipSuccess) return blocks;
     if (d != dev) {
         int cu = 0;
-        slots = hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, d) == hipSuccess ? cu * 32 : 0;
+        hipDeviceProp_t prop{};
+        const bool gfx11 = hipGetDeviceProperties(&prop, d) == hipSuccess && std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
+        slots = (env == 1 || !gfx11) && hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, d) == hipSuccess
+                    ? cu * 32 : 0;
         dev = d;
     }
     if (slots <= 0) return blocks;
