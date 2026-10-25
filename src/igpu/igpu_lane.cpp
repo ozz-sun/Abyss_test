@@ -355,10 +355,22 @@ __attribute__((visibility("default"))) int abyss_igpu_register(const void* host,
     hipError_t e = hipHostRegister(const_cast<void*>(host), bytes, hipHostRegisterMapped);
     // a HIP engine pinned it already (portable: every device maps it) - the lane reads it as it is
     const bool owned = e == hipSuccess;
-    if (e == hipErrorHostMemoryAlreadyRegistered) (void) hipGetLastError();
-    else if (e != hipSuccess) { say(err, err_n, "hipHostRegister", e); return -1; }
     void* d = nullptr;
-    if ((e = hipHostGetDevicePointer(&d, const_cast<void*>(host), 0)) != hipSuccess) {
+    if (e == hipErrorHostMemoryAlreadyRegistered) (void) hipGetLastError();
+    else if (e == hipErrorInvalidValue) {   // (ROCm 7.2: an already pinned range says this - the lane reads it if mapped)
+        (void) hipGetLastError();
+        if (hipHostGetDevicePointer(&d, const_cast<void*>(host), 0) != hipSuccess) {
+            (void) hipGetLastError();   // (the engine's own launch checks read the thread's last error: issue #11)
+            say(err, err_n, "hipHostRegister", e);
+            return -1;
+        }
+    } else if (e != hipSuccess) {
+        (void) hipGetLastError();
+        say(err, err_n, "hipHostRegister", e);
+        return -1;
+    }
+    if (d == nullptr && (e = hipHostGetDevicePointer(&d, const_cast<void*>(host), 0)) != hipSuccess) {
+        (void) hipGetLastError();
         say(err, err_n, "hipHostGetDevicePointer", e);
         return -1;
     }

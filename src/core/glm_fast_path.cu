@@ -1621,6 +1621,9 @@ void Glm5Model::fast_igpu_setup() {
     const auto fail = [&](const std::string& why) {
         std::fprintf(stderr, "glm fast: CUDA%d iGPU lane off (%s) - the CPU lane computes\n", dev_, why.c_str());
         if (lib != nullptr) dlclose(lib);
+        // the lane's failed call left its error as the thread's last one: the next launch_check counted it, and the
+        // count is never reset - every request then ended "kernel launch(es) failed" (ROCm 7.2.1, issue #11)
+        (void) cudaGetLastError();
     };
     if (lib == nullptr) return fail(std::string("dlopen ") + path + ": " + dlerror());
     auto ver = (abyss_igpu_version_fn) dlsym(lib, "abyss_igpu_version");
