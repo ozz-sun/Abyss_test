@@ -342,6 +342,14 @@ the Ryzen AI Max's Radeon 8060S (gfx1151).
   `STRATA_DS4_IDX=1` keeps the older indexer kernels, and `STRATA_DS4_ATTN=1` the older attention.
 - **Limits:** mixing it with NVIDIA in one process (CUDA and HIP together) is not supported.
 
+### Measuring this PC (`./abyss.sh --bench`)
+
+`./abyss.sh --bench` (Abyss stopped, a few minutes) measures the installed model the same way on every PC: decode on
+three questions, prefill at 2k / 8k tokens, then where a token's time goes (SSD waits, the CPU / iGPU lane, PCIe
+copies, the GPU), the likely bottleneck with what moves it, and a quality check against a known-good run of the same
+model (`bench/ref`). `--deep` adds the GPU timeline and a sweep of the PCIe / lane share; `--full` repeats the answers
+and adds a 32k prompt. It writes `abyss-bench.txt` to paste into an issue. [BENCH.md](BENCH.md) explains each line.
+
 ### Tuning for your GPU (`./abyss.sh --gpu-tune`)
 
 Some kernel choices depend on the GPU; the engine picks them per GPU architecture (it logs `glm fast: dense GEMV

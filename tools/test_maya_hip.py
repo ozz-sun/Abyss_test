@@ -282,7 +282,7 @@ class HipSetupTests(unittest.TestCase):
             self.assertEqual(maya.bench(path, "test"), 0)
         proc.wait.assert_called_once_with(timeout=120)
         self.assertIn("QUIT\n", [call.args[0] for call in proc.stdin.write.call_args_list])
-        text = (self.root / "maya-bench.txt").read_text()
+        text = (self.root / "abyss-bench.txt").read_text()
         self.assertIn("128.0 tokens/s over 3 answers", text)
         self.assertIn("2048 tokens/s, 2048 tokens", text)
         self.assertIn("8192 tokens/s, 8192 tokens", text)
@@ -344,7 +344,7 @@ class HipSetupTests(unittest.TestCase):
                 patch.object(maya.S, "page_file_gb", return_value=None), \
                 patch.object(maya.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}" if name in tools else None):
             self.assertEqual(maya.report("test", backend, cfg_path), 0)
-        return (self.root / "maya-report.txt").read_text(), query
+        return (self.root / "abyss-report.txt").read_text(), query
 
     def test_report_rocm_smi_json_and_engine_speed_lines(self):
         cfg_path = self.installed_config()
@@ -460,18 +460,18 @@ class HipSetupTests(unittest.TestCase):
         query.assert_any_call(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
                                              "pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,power.limit,"
                                              "temperature.gpu", "--format=csv"])
-        text = (self.root / "maya-report.txt").read_text()
+        text = (self.root / "abyss-report.txt").read_text()
         self.assertIn(json.dumps(stamp), text)
         self.assertNotIn("## ROCm", text)
 
     def test_cli_backend_selects_hip_config_for_bench(self):
         hip = self.installed_config()
         cuda = self.installed_config(backend="cuda")
-        with patch.object(maya, "configs", return_value=[cuda, hip]), \
+        with patch.object(maya, "all_configs", return_value=[cuda, hip]), \
                 patch.object(sys, "argv", ["abyss.py", "--backend", "hip", "--bench"]), \
                 patch.object(maya, "bench", return_value=0) as bench:
             self.assertEqual(maya.main(), 0)
-        bench.assert_called_once_with(hip, (maya.HERE / "VERSION").read_text().strip())
+        bench.assert_called_once_with(hip, (maya.HERE / "VERSION").read_text().strip(), deep=False, full=False)
 
     def test_cli_explicit_config_for_bench_and_report(self):
         path = self.installed_config()

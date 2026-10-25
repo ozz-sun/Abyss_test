@@ -22,8 +22,11 @@ The sections below are Maya's and apply to its GLM-5.3-Flash setup.
 
 Open an issue with:
 
-- **`./abyss.sh --bench`** (Maya stopped) **then `./abyss.sh --report`**, and attach `maya-report.txt`. Windows:
-  `START-ABYSS.bat --bench` / `--report`. The report includes the bench results.
+- **`./abyss.sh --bench --deep`** (Abyss stopped), and paste `abyss-bench.txt` (the
+  [speed report](https://github.com/zephel01/Abyss/issues/new?template=bench.md) template). It has the speeds, where a
+  token's time goes, the likely bottleneck and a quality check; [docs/BENCH.md](docs/BENCH.md) explains each line.
+  `./abyss.sh --report` adds the setup and the engine log (`abyss-report.txt`, includes the bench). Windows:
+  `START-ABYSS.bat --bench --deep` / `--report`.
 - **A build from source without the installer** is fine too. Send the same things by hand:
   - the exact engine command and environment (`STRATA_GLM_*` settings);
   - GPUs (model, VRAM, PCIe generation and width as `nvidia-smi` shows them), CPU, RAM, disk;
@@ -33,12 +36,13 @@ Open an issue with:
   For numbers comparable with the README's table, measure the way `--bench` does: three questions of 256 tokens,
   greedy, thinking off, one short warm-up first; prefill (reading the prompt) at 2048 and 8192 tokens.
 
-Name your Maya version (`VERSION`, or the commit). Say what you measured and what you didn't.
+Name your Abyss version (`VERSION`, or the commit). Say what you measured and what you didn't.
 
 ## A bug
 
-Run `./abyss.sh --report` right after the failure and attach `maya-report.txt`. If the engine stopped, add the end
-of its log (the `.log` next to your `maya-*.json`).
+Run `./abyss.sh --report` right after the failure and attach `abyss-report.txt`. If the engine stopped, add the end
+of its log (the `.log` next to your `abyss-*.json` / `maya-*.json`). Wrong or garbled output: `./abyss.sh --bench`
+too - its quality check tells a broken kernel on your GPU from a prompt problem.
 
 ## A pull request
 

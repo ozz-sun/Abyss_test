@@ -7,6 +7,36 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.55 - 2026-10-25
+
+**`./abyss.sh --bench` measures where a token's time goes on your PC, names the likely bottleneck, and checks the
+PC computes what a known-good run did - one file to paste into an issue.**
+
+- `--bench` (rebuilt): the model's own chat template (DeepSeek V4 / V4.1, Ornith and GLM alike - it was GLM's for all),
+  then from the engine's per-request counters: SSD waits, the CPU / iGPU lane's busy time, the experts GPU memory holds
+  and those copied over PCIe, the drafter's acceptance. A verdict - ssd / cpu / pcie / gpu - with what moves it
+  (docs/BENCH.md's table). On our R9700: Ornith-1.5-122B "gpu" (56.4 tok/s, SSD waits 0%), DeepSeek V4.1 UD-IQ2_XXS
+  (300 GB) "ssd" (20.1 tok/s, 39% of a token waits on the SSD).
+- The PCIe link is read while the engine works (links drop to Gen1 x4 when idle): AMD on Linux from sysfs, the
+  narrowest link up to the root port (an AMD card's own switch shows x16 - our OCuLink R9700 is Gen4 x4); NVIDIA on
+  Linux and Windows from nvidia-smi. The model SSD's read speed: 2 GB of its GGUF past the page cache (Linux
+  `posix_fadvise`, Windows unbuffered).
+- A quality check: the engine scores 512 tokens of known text against the top-32 log-probs the same model gave on a
+  known-good run (`bench/ref`, made by `tools/bench_ref.py`): OK up to KL 0.02, OFF above 0.05 - a kernel broken on
+  that GPU shows there (issue #9 style). References for Ornith-1.5-122B UD-Q4_K_XL, DeepSeek V4.1 UD-IQ2_XXS, V4
+  UD-Q2_K_XL and GLM-5.3-Flash Maya-S-v2 IQ2_XXS (128 KB each); the same PC gives 0-0.01. Settings that change the
+  numbers on purpose (tail skip, the abliteration edit, deferral) are left out of the scoring run, and another quant or
+  an overlay pack is skipped rather than flagged.
+- `--bench --deep` finds the bottleneck by experiment: the GPU timeline (`STRATA_GLM_GAP_PROF=1`) and five answers at
+  PCIe / lane shares 0 to 1 - whether `--calibrate` would gain, or which path is the narrow one (Ornith on Gen4 x4: all
+  over PCIe 4.8x slower than all on the lane). `--bench --full`: three runs of each question and a 32k prompt.
+- The result is `abyss-bench.txt`: a one-line summary for docs/MODELS.md's tables, then the details. No host name,
+  user name or folder path. A "Speed report" issue template takes it.
+- `--bench` and `--report` find setup-deepseek.sh's `abyss-*.json` configs too (they looked for `maya-*.json` only);
+  `--report` writes `abyss-report.txt`. The start line says Abyss, not Project Maya.
+- Docs: docs/BENCH.md / BENCH.ja.md (how to run it, what each line means, the verdict table, platforms); MANUAL,
+  README and CONTRIBUTING point to it.
+
 ## v1.3.54 - 2026-10-25
 
 **Bug fixes: the HIP iGPU lane on a PC with no iGPU (issue #11), ROCm 7.2.1 with the lane, RDNA3 grid padding (issue

@@ -2325,11 +2325,11 @@ def rocm_report(rocm: Path) -> str:
 
 
 def report(version: str, backend: str | None = None, cfg_path: Path | None = None) -> int:
-    """--report: maya-report.txt in the Maya folder - this PC, the installed setup and the engine log's speed lines,
+    """--report: abyss-report.txt in the Abyss folder - this PC, the installed setup and the engine log's speed lines,
     for a bug or speed report.  Nothing is sent anywhere; the home folder is written as ~ and API keys are left out."""
     home = str(Path.home())
     lines = []
-    have = [cfg_path] if cfg_path is not None else configs()
+    have = [cfg_path] if cfg_path is not None else all_configs()   # (setup-deepseek.sh's abyss-*.json too)
     cfg = {}
     for p in have:
         candidate = read_json(p)
@@ -2346,7 +2346,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
         lines.append("")
 
     git = S.out(["git", "-C", str(ROOT), "log", "-1", "--format=%h %cd", "--date=short"]).strip()
-    add("Maya", f"version {version}, commit {git or '?'}, Python {sys.version.split()[0]}, "
+    add("Abyss", f"version {version}, commit {git or '?'}, Python {sys.version.split()[0]}, "
                 f"{sys.platform}{' (WSL)' if S.is_wsl() else ''}")
     import platform
     add("System", f"{platform.platform()}")
@@ -2398,15 +2398,15 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
             add(f"Engine log {log.name}: the last 25 lines", "\n".join(text[-25:]))
         else:
             add(f"Engine log {log.name}", "not written yet (start Maya once and ask it something)")
-    bench_txt = ROOT / "maya-bench.txt"
+    bench_txt = ROOT / "abyss-bench.txt"
     if bench_txt.exists():
-        add("Benchmark (maya-bench.txt, from --bench)", bench_txt.read_text(encoding="utf-8", errors="replace"))
-    out = ROOT / "maya-report.txt"
+        add("Benchmark (abyss-bench.txt, from --bench)", bench_txt.read_text(encoding="utf-8", errors="replace"))
+    out = ROOT / "abyss-report.txt"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     say()
     ok(f"written: {out}")
     say("  Attach this file to your report (GitHub issue, X, or wherever you are asking). It has this PC's hardware,")
-    say("  your Maya setup and the engine's speed lines - no API key, and your home folder is shown as ~.")
+    say("  your Abyss setup and the engine's speed lines - no API key, and your home folder is shown as ~.")
     say("  Best: run it right after a slow answer, so the log has that answer's numbers.")
     return 0
 
@@ -2418,12 +2418,334 @@ BENCH_TOPICS = [
     "Explain how photosynthesis works, step by step, for a high-school student.",
     "Write a complete HTML page with a canvas that draws a bouncing ball animation in JavaScript.",
 ]
+# the engine's per-request line after each answer (src/program/generate.cpp, "glm stat"), its drafter's and - with
+# STRATA_GLM_GAP_PROF=1 - its GPU timeline's (src/core/glm_fast_path.cu gap_report)
+STAT_LINE = re.compile(
+    r"glm stat: decode (?P<ms>[\d.]+) ms/tok \([\d.]+ tok/s\) \| vram hit (?P<vram_hit>[\d.]+)% \| "
+    r"ram fetches (?P<ram_fetch>[\d.]+)/tok \| disk (?P<disk_reads>[\d.]+) reads/tok in (?P<disk_waits>[\d.]+) "
+    r"waits/tok, (?P<disk_ms>[\d.]+) ms/tok \| promotions (?P<promotions>[\d.]+)/tok \| cpu lane "
+    r"(?P<lane>[\d.]+)/tok in (?P<lane_ms>[\d.]+) ms/tok \| tail skip (?P<tail_skip>[\d.]+)/tok \| "
+    r"prompt (?P<prompt_ms>[\d.]+) ms/tok")
+SPEC_LINE = re.compile(r"glm spec: (\d+) of (\d+) drafts accepted")
+GAP_LINE = re.compile(r"glm gap prof .*GPU busy (?P<busy>[\d.]+), idle between tokens (?P<idle>[\d.]+)")
+PCIE_GEN = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5, "64.0": 6}
+PCIE_LANE_GBS = {1: 0.25, 2: 0.5, 3: 0.985, 4: 1.97, 5: 3.94, 6: 7.88}   # per lane and direction
 
 
-def bench(cfg_path: Path, version: str) -> int:
+def bench_records(lines) -> list:
+    """One record per request, in order: its "glm stat" numbers, with the drafter's and the GPU timeline's lines that
+    follow it attached (a prompt-only request has its stat line too: one token out)."""
+    recs = []
+    for x in lines:
+        m = STAT_LINE.search(x)
+        if m:
+            recs.append({k: float(v) for k, v in m.groupdict().items()})
+            continue
+        if not recs:
+            continue
+        m = SPEC_LINE.search(x)
+        if m:
+            recs[-1]["spec"] = (int(m.group(1)), int(m.group(2)))
+        m = GAP_LINE.search(x)
+        if m:
+            recs[-1]["gpu_busy"], recs[-1]["gpu_idle"] = float(m.group("busy")), float(m.group("idle"))
+    return recs
+
+
+def _mean(xs) -> float:
+    xs = list(xs)
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+# what each bottleneck means and what moves it - the bench's verdict, and docs/BENCH(.ja).md's table
+BENCH_ADVICE = {
+    "ssd": ("the SSD: the experts that fit neither in GPU memory nor in the RAM tier are read from disk every token",
+            "a smaller quant that fits GPU + RAM, more RAM for the RAM tier (STRATA_GLM_RAM_GB), a faster SSD"),
+    "cpu": ("the CPU / iGPU lane: the experts it computes take as long as the GPU's whole token",
+            f"{ME} --calibrate (the lane's share and threads), the CPU's power mode; on a PC with a Radeon iGPU the "
+            "iGPU lane"),
+    "pcie": ("PCIe: experts copied from RAM to the GPU every token",
+             "the GPU's slot (Gen4 x16 moves 4x what an x4 / OCuLink link does), "
+             f"{ME} --calibrate (moves the share to the CPU lane)"),
+    "gpu": ("the GPU itself: the memory tiers keep up",
+            f"{ME} --gpu-tune, and a report with this file: the kernels for this GPU may have room"),
+}
+
+
+def bench_verdict(recs, lane_name: str = "CPU lane") -> tuple:
+    """(the likely bottleneck - a BENCH_ADVICE key, or "" - and the evidence lines) from the decode records' means.
+    Rules of thumb, checked on the R9700 / RTX 5090 runs of docs/MODELS.md: SSD waits a quarter of a token or more
+    -> the SSD; the CPU lane busy 80% of a token or more -> the CPU lane; the GPU busy 85% of its timeline (--deep,
+    without a drafter: its windows' timeline does not split that way) -> the GPU; ten or more experts a token over PCIe
+    -> PCIe; else the GPU.  `lane_name`: "iGPU lane" where the engine's log says the iGPU computes it."""
+    if not recs:
+        return "", ["the engine printed no per-token statistics (not the fast path?)"]
+    ms = _mean(r["ms"] for r in recs)
+    disk, lane = _mean(r["disk_ms"] for r in recs), _mean(r["lane_ms"] for r in recs)
+    fetch, hit = _mean(r["ram_fetch"] for r in recs), _mean(r["vram_hit"] for r in recs)
+    ev = [f"a token: {ms:.1f} ms ({1000.0 / max(ms, 1e-6):.1f} tokens/s)",
+          f"SSD waits: {disk:.1f} ms a token ({disk / ms:.0%}), {_mean(r['disk_reads'] for r in recs):.1f} expert "
+          "reads a token",
+          f"{lane_name}: busy {lane:.1f} ms a token ({lane / ms:.0%}), {_mean(r['lane'] for r in recs):.0f} experts a "
+          "token",
+          f"GPU memory: holds {hit:.0f}% of the experts a token uses; {fetch:.1f} a token come over PCIe from RAM"]
+    spec = [r["spec"] for r in recs if "spec" in r]
+    if spec:
+        ev.append(f"drafter: {sum(a for a, _ in spec) / max(1, sum(b for _, b in spec)):.0%} of its drafts accepted")
+    skip = _mean(r["tail_skip"] for r in recs)
+    if skip > 0:
+        ev.append(f"tail skip on: {skip:.1f} experts a token skipped (lossy - its KL is in docs/MODELS.md)")
+    busy = [r["gpu_busy"] / max(1e-6, r["gpu_busy"] + r["gpu_idle"]) for r in recs if "gpu_busy" in r]
+    if busy and spec:
+        ev.append(f"GPU timeline: busy {_mean(busy):.0%} (with the drafter's windows: shown, not used for the verdict)")
+        busy = []
+    elif busy:
+        ev.append(f"GPU timeline: busy {_mean(busy):.0%} of it, idle between tokens the rest")
+    if disk >= 0.25 * ms:
+        v = "ssd"
+    elif lane >= 0.8 * ms:
+        v = "cpu"
+    elif busy and _mean(busy) >= 0.85:
+        v = "gpu"
+    elif fetch >= 10.0:
+        v = "pcie"
+    else:
+        v = "gpu"
+    return v, ev
+
+
+def pcie_chain(pci: str, base: str = "/sys/bus/pci/devices") -> list:
+    """[(generation, width, max generation, max width)] of each link from the GPU up to its root port (Linux; an AMD
+    card's own switch shows x16 inside it - the real limit is the narrowest link on the way)."""
+    out = []
+    try:
+        d = Path(os.path.realpath(Path(base) / pci))
+    except OSError:
+        return out
+    while (d / "current_link_speed").exists():
+        try:
+            rd = lambda f: (d / f).read_text().strip()
+            gen = lambda s: PCIE_GEN.get(s.split()[0].rstrip("GT/s").strip(), 0)
+            out.append((gen(rd("current_link_speed")), int(rd("current_link_width")),
+                        gen(rd("max_link_speed")), int(rd("max_link_width"))))
+        except (OSError, ValueError):
+            break
+        d = d.parent
+    return out
+
+
+def pcie_link(chain) -> str:
+    """"Gen4 x4 (~7.9 GB/s)" of a pcie_chain: the narrowest link on the way, and what the GPU itself could do."""
+    if not chain:
+        return "?"
+    g = min(c[0] for c in chain)
+    w = min(c[1] for c in chain)
+    gm, wm = chain[0][2], chain[0][3]
+    s = f"Gen{g} x{w} (~{PCIE_LANE_GBS.get(g, 0) * w:.1f} GB/s)"
+    return s + (f", the GPU can do Gen{gm} x{wm}" if (gm, wm) != (g, w) else "")
+
+
+class LinkWatch:
+    """The PCIe links of the config's GPUs sampled while the engine works: links train down when idle (ASPM - an
+    R9700 sits at Gen1 x4 between requests), so the busiest reading is the one that counts.  AMD on Linux: sysfs, from
+    the GPU up to its root port (`pcis`); NVIDIA (Linux and Windows): nvidia-smi's current link (`nvidia` indices)."""
+
+    def __init__(self, pcis=(), nvidia=()):
+        import threading
+        self.pcis, self.nvidia, self.best, self._stop = list(pcis), list(nvidia), {}, threading.Event()
+        self._t = None
+        if (self.pcis and not WIN) or (self.nvidia and shutil.which("nvidia-smi")):
+            self._t = threading.Thread(target=self._run, daemon=True)
+            self._t.start()
+
+    def _keep(self, key, chain):
+        cur = lambda c: (min(x[0] for x in c), min(x[1] for x in c))
+        if chain and (key not in self.best or cur(chain) > cur(self.best[key])):
+            self.best[key] = chain
+
+    def _run(self):
+        n = 0
+        while not self._stop.wait(0.25):
+            if not WIN:
+                for p in self.pcis:
+                    self._keep(p, pcie_chain(p))
+            n += 1
+            if self.nvidia and n % 4 == 1:   # (a second apart: nvidia-smi takes ~50 ms)
+                for i, chain in nvidia_links(self.nvidia).items():
+                    self._keep(f"GPU {i}", chain)
+
+    def stop(self) -> dict:
+        self._stop.set()
+        if self._t:
+            self._t.join(timeout=3)
+        return {p: pcie_link(c) for p, c in self.best.items()}
+
+
+def nvidia_links(indices) -> dict:
+    """{index: [(generation, width, max generation, max width)]} from nvidia-smi (the card's own link: an NVIDIA GPU
+    has no switch of its own, so a riser's or OCuLink's x4 shows here)."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,pcie.link.gen.current,pcie.link.width.current,"
+                            "pcie.link.gen.max,pcie.link.width.max", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    out = {}
+    for line in (r.stdout or "").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        try:
+            if len(f) == 5 and int(f[0]) in indices:
+                out[int(f[0])] = [(int(f[1]), int(f[2]), int(f[3]), int(f[4]))]
+        except ValueError:
+            continue
+    return out
+
+
+def bench_links(cfg: dict, SV) -> LinkWatch:
+    """The LinkWatch for a config's GPUs: its gpu_pci (setup writes them for AMD), else the KFD topology's addresses of
+    its GPU numbers; NVIDIA by nvidia-smi index."""
+    if cfg.get("backend") == "hip":
+        pcis = cfg.get("gpu_pci") or []
+        if not pcis and not WIN:
+            nodes = {n["index"]: n["pci"] for n in SV.amd_gpu_nodes()}
+            pcis = [nodes[i] for i in SV.gpu_list(cfg) if i in nodes]
+        return LinkWatch(pcis=pcis)
+    return LinkWatch(nvidia=SV.gpu_list(cfg))
+
+
+def disk_read_gbs(files, gib: float = 2.0) -> float | None:
+    """Sequential read speed (GB/s) of the model's own files, from the disk - the pages are dropped from the page cache
+    first (posix_fadvise; Linux), or read unbuffered (Windows).  None where that is not possible."""
+    files = [f for f in files if f.exists() and f.stat().st_size > 1 << 28]
+    if not files:
+        return None
+    f = max(files, key=lambda p: p.stat().st_size)
+    n = min(int(gib * 2**30), f.stat().st_size // 2)
+    if WIN:
+        return disk_read_gbs_win(f, f.stat().st_size // 4 // 4096 * 4096, n)
+    if not hasattr(os, "posix_fadvise"):
+        return None
+    try:
+        fd = os.open(f, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        start = f.stat().st_size // 4 // 4096 * 4096
+        os.posix_fadvise(fd, start, n, os.POSIX_FADV_DONTNEED)
+        t0, got = time.time(), 0
+        while got < n:
+            b = os.pread(fd, 16 << 20, start + got)
+            if not b:
+                break
+            got += len(b)
+        dt = time.time() - t0
+        os.posix_fadvise(fd, start, n, os.POSIX_FADV_DONTNEED)   # (do not leave 2 GB of it cached for the engine)
+        return got / dt / 1e9 if dt > 0 and got > 0 else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def disk_read_gbs_win(f: Path, start: int, n: int) -> float | None:
+    """Windows: `n` bytes of `f` from `start`, unbuffered (FILE_FLAG_NO_BUFFERING: past the file cache, into a
+    page-aligned buffer, sector-aligned offsets)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.VirtualAlloc.restype = ctypes.c_void_p
+        h = k32.CreateFileW(str(f), 0x80000000, 1, None, 3, 0x20000000 | 0x08000000, None)   # GENERIC_READ, OPEN_EXISTING
+        if h in (None, wintypes.HANDLE(-1).value):
+            return None
+    except (OSError, AttributeError):
+        return None
+    chunk = 16 << 20
+    buf = k32.VirtualAlloc(None, chunk, 0x3000, 0x04)   # MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+    try:
+        if not buf or not k32.SetFilePointerEx(wintypes.HANDLE(h), ctypes.c_longlong(start), None, 0):
+            return None
+        got, red = 0, wintypes.DWORD(0)
+        t0 = time.time()
+        while got < n:
+            if not k32.ReadFile(wintypes.HANDLE(h), ctypes.c_void_p(buf), chunk, ctypes.byref(red), None) or not red.value:
+                break
+            got += red.value
+        dt = time.time() - t0
+        return got / dt / 1e9 if dt > 0 and got > 0 else None
+    finally:
+        if buf:
+            k32.VirtualFree(ctypes.c_void_p(buf), 0, 0x8000)   # MEM_RELEASE
+        k32.CloseHandle(wintypes.HANDLE(h))
+
+
+def model_key(pack: Path | None) -> tuple:
+    """(the model's name - its GGUF set without the shard suffix -, the set's bytes) for bench/ref/<name>.json."""
+    if pack is None or not pack.parent.exists():
+        return "", 0
+    ggufs = sorted(pack.parent.glob("*.gguf"))
+    first = [p for p in ggufs if re.search(r"-00001-of-\d{5}\.gguf$", p.name)]
+    if first:
+        stem = re.sub(r"-00001-of-\d{5}\.gguf$", "", first[0].name)
+        ggufs = [p for p in ggufs if re.fullmatch(re.escape(stem) + r"-\d{5}-of-\d{5}\.gguf", p.name)]
+    else:
+        ggufs = sorted(ggufs, key=lambda p: p.stat().st_size)[-1:]
+        stem = ggufs[0].stem if ggufs else ""
+    return stem, sum(p.stat().st_size for p in ggufs)
+
+
+# the settings that change a model's numbers on purpose (lossy speed-ups, the abliteration edit): the quality check
+# scores without them - it checks this PC's arithmetic, not those settings (their KL is in docs/MODELS.md)
+BENCH_LOSSY = ("STRATA_GLM_TAIL_SKIP", "STRATA_GLM_ABL", "STRATA_GLM_DEFER")
+
+
+def bench_quality(cfg: dict, pack: Path | None, SV) -> dict | None:
+    """The engine scores bench/ref/<model>.json's tokens (teacher-forced, the one-token decode path) against the
+    top-k log-probs the same model gave on a known-good run (tools/bench_ref.py): KL near 0 = this PC computes what
+    that one did; a broken kernel on this GPU shows up as a large KL (issue #9).  None: no reference for this model."""
+    name, size = model_key(pack)
+    ref = ROOT / "bench" / "ref" / f"{name}.json"
+    if not name or not ref.exists():
+        return None
+    r = read_json(ref)
+    topk = ref.with_name(r.get("topk") or f"{name}.topk")
+    if r.get("gguf_bytes") not in (None, size) or not topk.exists() or not r.get("ids"):
+        return {"skipped": "the reference is for another copy of this model (its files differ)"}
+    dense = pack / "dense.bin"
+    if r.get("dense_bytes") not in (None, dense.stat().st_size if dense.exists() else 0):
+        return {"skipped": "this pack's dense weights differ from the reference's (an overlay pack?)"}
+    env = SV.child_env(cfg)
+    off = sorted(k for k in env if k.startswith(BENCH_LOSSY))   # (the check is of the model as it ships)
+    for k in off:
+        env.pop(k)
+    env.update(STRATA_GLM_SCORE=str(int(r.get("skip", 0))), STRATA_GLM_SCORE_TOPK=str(topk))
+    args = [a for a in SV.engine_args(cfg)]
+    if "--max-context" in args[:-1]:
+        args[args.index("--max-context") + 1] = str(max(2048, len(r["ids"]) + 64))
+    try:
+        p = subprocess.run([cfg["exe"]] + args + ["--tokens", ",".join(map(str, r["ids"]))], env=env,
+                           cwd=cfg.get("cwd") or str(ROOT), capture_output=True, text=True, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"skipped": f"the scoring run did not finish ({e})"}
+    m = re.search(r"SCORE (\d+) tokens: nll ([\d.]+) .*?top1 ([\d.]+)%.*?KL ([\d.]+) \(max ([\d.]+)\), same top token "
+                  r"([\d.]+)%", p.stdout or "")
+    if not m:
+        tail = ((p.stderr or "").strip().splitlines() or ["no output"])[-1]
+        return {"skipped": f"the scoring run printed no score ({tail[:160]})"}
+    kl = float(m.group(4))
+    return {"tokens": int(m.group(1)), "nll": float(m.group(2)), "kl": kl, "kl_max": float(m.group(5)),
+            "same_top": float(m.group(6)), "ref_nll": r.get("nll"), "ref_made": r.get("made_with", "?"),
+            "verdict": "OK" if kl <= 0.02 else "slightly off" if kl <= 0.05 else "OFF", "lossy_off": off}
+
+
+def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) -> int:
     """--bench: a standard speed test of the installed model on this PC - decode (writing an answer) on three
     questions and prefill (reading a prompt) at 2k and 8k tokens of this folder's docs - through the engine alone, the
-    way the dashboard starts it.  Writes maya-bench.txt (--report includes it).  A few minutes."""
+    way the dashboard starts it, then where a token's time goes (the engine's own counters: SSD waits, the CPU lane,
+    PCIe fetches, the GPU) and a quality check against a known-good run of the same model when bench/ref has one.
+    --deep also times the GPU's timeline and sweeps the PCIe / CPU-lane share (what moves the speed here);
+    --full repeats the answers and adds a 32k prompt.  Writes abyss-bench.txt (--report includes it)."""
     import urllib.request
     cfg = read_json(cfg_path)
     select_build_backend(cfg.get("backend", "cuda"))
@@ -2432,8 +2754,8 @@ def bench(cfg_path: Path, version: str) -> int:
     port = cfg.get("port") or 8080
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
-        fail(f"Maya is running (port {port}): the benchmark needs the GPU memory it holds",
-             "stop it (Ctrl+C in its window), then run --bench again")
+        fail(f"Abyss is running (port {port}): the benchmark needs the GPU memory it holds",
+             f"stop it ({ME} stop, or Ctrl+C in its window), then run --bench again")
     except OSError:
         pass
     sys.path.insert(0, str(ROOT))
@@ -2450,17 +2772,42 @@ def bench(cfg_path: Path, version: str) -> int:
                        for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) +
                        sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
     doc = tok.encode(text)
-    lens = [n for n in (2048, 8192) if n + 64 <= ctx and n <= len(doc)]
-    log_path = ROOT / "maya-bench.log"
+    lens = [n for n in ((2048, 8192, 32768) if full else (2048, 8192)) if n + 64 <= ctx and n <= len(doc)]
+    # the model's own chat template, thinking off (GLM's, DeepSeek's, Qwen's alike); GLM's opening without one
+    tpl = None
+    if (tp / "chat_template.jinja").exists():
+        try:
+            from serve.frontend import ChatTemplate
+            tpl = ChatTemplate(tp / "chat_template.jinja")
+        except Exception:                          # (no jinja2, a template it cannot read: GLM's opening below)
+            tpl = None
+
+    def chat(q):
+        if tpl is not None:
+            try:
+                s = tpl.render([{"role": "user", "content": q}], enable_thinking=False)
+                if isinstance(s, str) and s:
+                    return tok.encode(s, parse_special=True)
+            except Exception:
+                pass
+        return tok.encode("[gMASK]<sop><|user|>\n" + q + "<|assistant|>\n</think>", parse_special=True)
+
+    model_files = sorted(pack.parent.glob("*.gguf")) if pack and pack.parent.exists() else []
+    disk = disk_read_gbs(model_files)
+    log_path = ROOT / "abyss-bench.log"
+    env = SV.child_env(cfg)
+    if deep:
+        env["STRATA_GLM_GAP_PROF"] = "1"
     step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
     t0 = time.time()
+    shares = []
     with open(log_path, "w", encoding="utf-8") as log:
         p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=log, text=True, env=SV.child_env(cfg),
+                             stdout=subprocess.PIPE, stderr=log, text=True, env=env,
                              cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
 
-        def gen(ids, n_new):
-            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, ids)) + "\n")
+        def gen(ids, n_new, keys=""):
+            p.stdin.write(f"GEN {n_new} temperature=0 {keys}" + ",".join(map(str, ids)) + "\n")
             p.stdin.flush()
             while True:
                 line = p.stdout.readline()
@@ -2476,14 +2823,15 @@ def bench(cfg_path: Path, version: str) -> int:
             if line.startswith("READY"):
                 break
         ok(f"loaded in {time.time() - t0:.0f} s")
-        chat = lambda q: tok.encode("[gMASK]<sop><|user|>\n" + q + "<|assistant|>\n</think>", parse_special=True)
+        watch = bench_links(cfg, SV)
         gen(chat("Say hello in five languages."), 64)          # warm-up: the first answer after a start is slower
         results = []
-        for q in BENCH_TOPICS:
+        for q in BENCH_TOPICS * (3 if full else 1):
             f = gen(chat(q), 256)
             if f[0] == "DONE" and float(f[4]) > 0:
                 results.append(("decode", q, int(f[1]) / float(f[4]) * 1000.0))
                 say(f"  decode  {results[-1][2]:6.1f} tokens/s   {q[:60]}")
+        n_dec = len(results)
         if lens:                                            # warm-up: the first prompt after a start is slower
             gen(doc[-lens[0]:], 1)                          # (cold caches, issue #8); its opening is not reused below
         for i, n in enumerate(lens):
@@ -2491,13 +2839,30 @@ def bench(cfg_path: Path, version: str) -> int:
             if f[0] == "DONE" and float(f[3]) > 0:
                 results.append(("prefill", f"{n} tokens", n / float(f[3]) * 1000.0))
                 say(f"  prefill {results[-1][2]:6.0f} tokens/s   a {n}-token prompt")
+        if deep:                                            # what moves the speed: the missed experts' PCIe share
+            say("  the PCIe / CPU-lane share (0 = every missed expert on the CPU lane, 1 = all copied to the GPU):")
+            for s in (0.0, 0.25, 0.5, 0.75, 1.0):
+                f = gen(chat(BENCH_TOPICS[0]), 128, f"pcie_frac={s} ")
+                if f[0] == "DONE" and float(f[4]) > 0:
+                    shares.append((s, int(f[1]) / float(f[4]) * 1000.0))
+                    say(f"    share {s:.2f}: {shares[-1][1]:6.1f} tokens/s")
+        links = watch.stop()
         p.stdin.write("QUIT\n")
         p.stdin.flush()
         try:
             p.wait(timeout=120)
         except subprocess.TimeoutExpired:
             p.kill()
-    stats = speed_lines(log_path.read_text(encoding="utf-8", errors="replace").splitlines())
+    log_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    stats = speed_lines(log_lines)
+    recs = bench_records(log_lines)
+    dec_recs = recs[1:1 + n_dec] if len(recs) >= 1 + n_dec else []
+    lane_name = "iGPU lane" if any("the iGPU computes the lane" in x for x in log_lines) else "CPU lane"
+    verdict, evidence = bench_verdict(dec_recs, lane_name)
+    quality = None
+    if pack is not None:
+        say("  quality check: scoring a known text against a known-good run of this model ...")
+        quality = bench_quality(cfg, pack, SV)
     dec = [r[2] for r in results if r[0] == "decode"]
     found = S.amd_gpus() if cfg.get("backend") == "hip" else S.gpus()
     if cfg.get("backend") == "hip" and SV.gpu_list(cfg):
@@ -2505,20 +2870,65 @@ def bench(cfg_path: Path, version: str) -> int:
         found = [by_index[i] for i in SV.gpu_list(cfg) if i in by_index]
     gpus = ", ".join(f"{g['name']} {g['vram_gb']:.0f} GB" for g in found) or "?"
     total, _ = mem_gb()
-    lines = [f"Project Maya v{version} benchmark, {time.strftime('%Y-%m-%d %H:%M')}",
-             f"GPUs: {gpus}; RAM {total:.0f} GB; CPU {S.cpu_info()[0]}",
-             f"setup: {cfg_path.name}, context {ctx}, GPUs {cfg.get('gpu')}",
-             f"decode (writing the answer): mean {sum(dec) / max(1, len(dec)):.1f} tokens/s over {len(dec)} answers of "
-             f"256 tokens (greedy, thinking off)"]
+    name, size = model_key(pack)
+    pre = {r[1]: r[2] for r in results if r[0] == "prefill"}
+    q_txt = ("no reference for this model in bench/ref" if quality is None else
+             f"skipped: {quality['skipped']}" if "skipped" in quality else
+             f"{quality['verdict']} (KL {quality['kl']:.4f} vs a known-good run, same top token "
+             f"{quality['same_top']:.1f}%)")
+    summary = (f"Abyss v{version} | {name or cfg_path.stem} | {gpus} | PCIe "
+               f"{', '.join(links.values()) or '?'} | RAM {total:.0f} GB | SSD "
+               f"{f'{disk:.1f} GB/s' if disk else '?'} | decode {_mean(dec):.1f} tok/s"
+               + (f" | prompt 8k {pre['8192 tokens']:.0f} tok/s" if "8192 tokens" in pre else "")
+               + f" | quality {q_txt.split(' (')[0]} | bottleneck: {verdict or '?'}")
+    lines = ["### Abyss benchmark", "", summary, "",
+             f"- date: {time.strftime('%Y-%m-%d %H:%M')}; setup: {cfg_path.name}, context {ctx}, GPUs {cfg.get('gpu')}"
+             f"{', backend ' + cfg.get('backend', 'cuda')}",
+             f"- model: {name or '?'} ({size / 1e9:.1f} GB of GGUF)" if size else f"- model: {cfg_path.stem}",
+             f"- GPUs: {gpus}; CPU {S.cpu_info()[0]}; RAM {total:.0f} GB; model SSD reads "
+             f"{f'{disk:.1f} GB/s' if disk else '? (not measured)'}",
+             f"- PCIe while working: " + ("; ".join(f"{k} {v}" for k, v in links.items()) or "? (not readable here: an AMD "
+                                                                                        "GPU on Windows, or no GPU found)"),
+             "", f"decode (writing the answer): mean {_mean(dec):.1f} tokens/s over {len(dec)} answers of 256 tokens "
+                 "(greedy, thinking off)"]
     lines += [f"  {r[2]:6.1f} tokens/s  {r[1]}" for r in results if r[0] == "decode"]
     lines += [f"prefill (reading the prompt): {r[2]:.0f} tokens/s, {r[1]}" for r in results if r[0] == "prefill"]
-    lines += ["", "engine lines:"] + [x.replace(str(Path.home()), "~") for x in stats[-40:]]
-    out = ROOT / "maya-bench.txt"
+    lines += ["", "where a token's time goes (the engine's counters, decode answers):"] + [f"- {x}" for x in evidence]
+    if verdict:
+        what, moves = BENCH_ADVICE[verdict]
+        lines += [f"- likely bottleneck: {what}", f"- what moves it: {moves}"]
+    if shares:
+        best = max(shares, key=lambda x: x[1])
+        lines += ["", "PCIe / CPU-lane share sweep (--deep; 0 = all missed experts on the CPU lane, 1 = all over PCIe):"]
+        lines += [f"  share {s:.2f}: {v:6.1f} tokens/s" + ("  <- fastest" if (s, v) == best else "")
+                  for s, v in shares]
+        now = _mean(r["ms"] for r in dec_recs)
+        now = 1000.0 / now if now > 0 else _mean(dec)
+        if best[1] > 1.05 * now:
+            lines.append(f"  share {best[0]:.2f} beats the engine's own choice ({now:.1f} tokens/s): {ME} --calibrate "
+                         "sets it for this PC")
+        elif max(v for _, v in shares) > 1.25 * min(v for _, v in shares):
+            slow = min(shares, key=lambda x: x[1])
+            lines.append(f"  the engine's own choice is already the fastest; share {slow[0]:.2f} is "
+                         f"{best[1] / slow[1]:.1f}x slower - " + ("PCIe is the narrow path here (the lane does the "
+                         "missed experts better)" if slow[0] > best[0] else "the lane is the slow path here"))
+        else:
+            lines.append(f"  the share barely moves the speed: neither PCIe nor the {lane_name} is what limits it")
+    lines += ["", f"quality: {q_txt}"]
+    if quality and quality.get("lossy_off"):
+        lines.append(f"  (scored without this setup's {', '.join(quality['lossy_off'])}: they change the numbers on "
+                     "purpose)")
+    if quality and "kl" in quality and quality["verdict"] != "OK":
+        lines.append("  a large KL means this PC computes something the known-good run did not - please report it")
+    lines += ["", "<details><summary>engine lines</summary>", "", "```"] + \
+             [x.replace(str(Path.home()), "~") for x in stats[-40:]] + ["```", "", "</details>"]
+    out = ROOT / "abyss-bench.txt"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     say()
-    for x in lines[:4 + len(results)]:
+    say("  " + summary)
+    for x in evidence + ([f"likely bottleneck: {BENCH_ADVICE[verdict][0]}"] if verdict else []):
         say("  " + x)
-    ok(f"written: {out} - attach it (with {ME} --report) to a speed report")
+    ok(f"written: {out} - paste it into an issue (https://github.com/zephel01/Abyss/issues) with a speed report")
     return 0
 
 
@@ -2658,12 +3068,17 @@ def main() -> int:
     ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
     ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
     ap.add_argument("--repack", action="store_true", help="build the pack again")
-    ap.add_argument("--report", action="store_true", help="write maya-report.txt - this PC, the setup and the engine's "
+    ap.add_argument("--report", action="store_true", help="write abyss-report.txt - this PC, the setup and the engine's "
                                                           "speed lines - to attach when you report a problem or a "
                                                           "speed (nothing is sent anywhere)")
     ap.add_argument("--bench", action="store_true", help="a standard speed test of the installed model (a few "
-                                                         "minutes, with Maya stopped): decode on three questions and "
-                                                         "prefill at 2k / 8k tokens; writes maya-bench.txt")
+                                                         "minutes, with Abyss stopped): decode on three questions, "
+                                                         "prefill at 2k / 8k tokens, where a token's time goes (the "
+                                                         "likely bottleneck) and a quality check; writes "
+                                                         "abyss-bench.txt to paste into an issue")
+    ap.add_argument("--deep", action="store_true", help="with --bench: find the bottleneck - the GPU's timeline and a "
+                                                        "sweep of the PCIe / CPU-lane share (a few minutes more)")
+    ap.add_argument("--full", action="store_true", help="with --bench: three runs of each question and a 32k prompt")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's CPU lane for this PC (the PCIe share and the CPU threads, ~10-15 minutes), "
                          "then start the model (with --no-start: only tune)")
@@ -2686,18 +3101,18 @@ def main() -> int:
         sys.stdout.flush()
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "abyss.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     version = maya_version()
-    say(f"Project Maya v{version} - GLM-5.3-Flash on your own GPU(s).")
+    say(f"Abyss v{version} - big MoE models on your own GPU, RAM and SSD.")
     if a.report:
         return report(version, a.backend, a.config)
     if a.gpu_tune:
         return gpu_tune(a)
     if a.bench:
-        have = [a.config] if a.config is not None else configs()
+        have = [a.config] if a.config is not None else all_configs()   # (setup-deepseek.sh's abyss-*.json too)
         if a.backend:
             have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
         if not have:
-            fail("Maya is not set up here yet", f"run {ME} first")
-        return bench(have[0], version)
+            fail("Abyss is not set up here yet", f"run {ME} first")
+        return bench(have[0], version, deep=a.deep, full=a.full)
 
     have = configs() if a.config is None else [a.config.resolve()]   # (--config: that one, no question)
     if a.backend:
