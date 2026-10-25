@@ -1128,7 +1128,8 @@ static const MvTune& mv_tune() {
         std::snprintf(arch, sizeof arch, "%s", prop.gcnArchName);
         if (char* c = std::strchr(arch, ':')) *c = 0;
         const bool gfx12 = std::strncmp(arch, "gfx12", 5) == 0;   // RDNA 4 (gfx1200 / gfx1201)
-        t.q6k_split = !gfx12;
+        const bool gfx1100 = std::strncmp(arch, "gfx1100", 7) == 0; // RX 7900 XT / XTX: 1 warp a row measured best (abyss_gpu_tune)
+        t.q6k_split = !(gfx12 || gfx1100);
 #else
         std::snprintf(arch, sizeof arch, "sm_%d%d", prop.major, prop.minor);
 #endif
@@ -4541,10 +4542,10 @@ void gate_up_impl(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, flo
                   const MoeCols& mc) {
 #if defined(STRATA_USE_HIP)
     // IQ2_XS (DeepSeek V4's gate/up) the same way, measured on gfx1151 (the Radeon 8060S lane) and gfx1201 (an AI PRO
-    // R9700: 90.6 -> 75.6 us for 8 experts), bit-identical sums; gfx1100 not measured
+    // R9700: 90.6 -> 75.6 us for 8 experts), the RX 7900 XT (gfx1100: 78.4 -> 60.1 us), bit-identical sums
     static const bool gu17_legacy = std::getenv("ABYSS_IGPU_GU17_LEGACY") != nullptr;
     const RdnaArch ra = rdna_expert_arch();
-    if (gu_type == 17 && n_embd == 4096 && n_ff == 2048 && (ra == RdnaArch::gfx1151 || ra == RdnaArch::gfx1201) &&
+    if (gu_type == 17 && n_embd == 4096 && n_ff == 2048 && (ra == RdnaArch::gfx1100 || ra == RdnaArch::gfx1151 || ra == RdnaArch::gfx1201) &&
         !gu17_legacy) {
         launch_expert_gu<17, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
             xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
@@ -4553,9 +4554,9 @@ void gate_up_impl(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, flo
     }
     // DeepSeek V4.1's 5120 / 2304 (unsloth's UD quants): IQ2_XS / IQ2_S gate/up the same LDS-grid kernel - 8 experts
     // (hip_expert_kernel_bench --sweep --shape 5120x2304), an AI PRO R9700 (gfx1201) 125 / 131 -> 101 / 106 us, the
-    // Radeon 8060S (gfx1151, the iGPU lane) 261 / 301 -> 249 / 273; bit-identical.  gfx1100 not measured
+    // Radeon 8060S (gfx1151, the iGPU lane) 261 / 301 -> 249 / 273, the RX 7900 XT (gfx1100) 103 / 116 -> 80 / 87 us; bit-identical.
     if ((gu_type == 17 || gu_type == 22) && n_embd == 5120 && n_ff == 2304 &&
-        (ra == RdnaArch::gfx1201 || ra == RdnaArch::gfx1151)) {
+        (ra == RdnaArch::gfx1100 || ra == RdnaArch::gfx1201 || ra == RdnaArch::gfx1151)) {
         if (gu_type == 17)
             launch_expert_gu<17, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
                 xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
@@ -4704,10 +4705,10 @@ void down_impl(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t 
     // DeepSeek V4.1's 5120 / 2304: four rows a warp with the grid in LDS - 8 experts (hip_expert_kernel_bench --sweep
     // --shape 5120x2304), IQ2_XXS / IQ2_S / IQ3_XXS / IQ2_XS down: an AI PRO R9700 (gfx1201) 66.6 / 81.0 / 76.7 / 71.1
     // -> 45.9 / 52.1 / 55.9 / 50.3 us, the Radeon 8060S (gfx1151, the iGPU lane) 151.7 / 189.8 / 183.9 / 164.8 ->
-    // 117.7 / 155.6 / 177.3 / 137.1; bit-identical.  gfx1100 not measured
+    // 117.7 / 155.6 / 177.3 / 137.1, the RX 7900 XT (gfx1100) 64.4 / 77.2 / 72.0 / 70.0 -> 46.6 / 54.6 / 58.6 / 51.8 us; bit-identical.
     const RdnaArch ra = rdna_expert_arch();
     if ((d_type == 16 || d_type == 22 || d_type == 18 || d_type == 17) && n_embd == 5120 && n_ff == 2304 &&
-        (ra == RdnaArch::gfx1201 || ra == RdnaArch::gfx1151)) {
+        (ra == RdnaArch::gfx1100 || ra == RdnaArch::gfx1201 || ra == RdnaArch::gfx1151)) {
         switch (d_type) {
             case 16: launch_expert_down<16, 4, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc); break;
             case 17: launch_expert_down<17, 4, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc); break;
