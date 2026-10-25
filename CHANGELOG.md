@@ -7,6 +7,35 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.56 - 2026-10-25
+
+**Two contributed CPU / Windows speed-ups merged, and `--bench` fixed where reports from 16 GB cards showed it
+misleading.**
+
+- CPU lane (PR #13, thanks to its author): AVX-VNNI one-token kernels for IQ2_XXS / IQ3_XXS / IQ3_S experts, picked at
+  run time by CPUID on CPUs that have it (Intel 12th gen and later, AMD Zen 5) and built only by compilers that can
+  target it (GCC 11+, Clang 12+, MSVC 2022); the one-token loops keep their unroll. Bit-identical with VNNI on, off
+  (`STRATA_NO_AVXVNNI=1`) and forced AVX2; rows 1-5% faster than AVX2 where it applies.
+- Windows (PR #12, thanks to its author): with `STRATA_GLM_CPU_PIN` set, the pinned CPU-lane workers turn off EcoQoS
+  power throttling and run above normal priority - Windows 11 parked them on efficiency settings (reported 18.8 ->
+  36.5 tok/s on an i7-14700K). Nothing changes without `STRATA_GLM_CPU_PIN`.
+- `--bench --deep` (issues #14, #15): the PCIe / CPU-lane share sweep ran last, on tiers the prompts had warmed and
+  128-token answers, and was compared with the 256-token decode above it - so a warm-tier gain read as "share X beats
+  the engine's own choice" (1.5-1.7x on SSD-bound models). The engine's own share now runs before and after the five
+  shares under the same conditions, the report names its share, and it warns when those two runs differ by more than
+  10% (the tiers still warming). On AMD it points to `STRATA_GLM_PCIE_SHARE` in the config's `"env"` - `--calibrate`
+  is CUDA-only - instead of `--calibrate`.
+- Quality check: DeepSeek V4 0731 UD-Q2_K_XL was "skipped" for everyone with the stock unsloth files - the reference
+  had been made from our attention-Q5_K overlay of them. Both now have a reference (`bench/ref/<model>.json` for the
+  stock files, `<model>.attn-q5k.json` for the overlay); the check takes the one whose GGUF size matches, and
+  `tools/bench_ref.py --variant <tag>` writes another copy's.
+- Quality check: "slightly off" (KL 0.02-0.05) now says it is expected on a smaller GPU - a 16 GB card leaves many
+  more experts to the CPU lane, which rounds differently from the GPU the reference ran on (GLM-5.3 Maya-S-v2 limited
+  to 16 GB here: KL 0.000 -> 0.025; V4.1 UD-IQ2_XXS 0.008 -> 0.012). Only OFF asks for a report.
+- docs/BENCH(.ja).md: the sweep's new runs, the AMD advice, the small-GPU KL, and why a 2k prompt can read slower per
+  token than an 8k one on a model that does not fit GPU + RAM (each prompt reads the disk-only experts once, whatever
+  its length).
+
 ## v1.3.55 - 2026-10-25
 
 **`./abyss.sh --bench` measures where a token's time goes on your PC, names the likely bottleneck, and checks the

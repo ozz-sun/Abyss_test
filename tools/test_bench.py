@@ -125,6 +125,29 @@ class BenchTests(unittest.TestCase):
             (d / "Nothing-00001-of-00001.gguf").write_bytes(b"x")
             self.assertIsNone(A.bench_quality({}, d / "pack", None))
 
+    def test_quality_picks_the_reference_of_this_copy(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t)
+            (d / "pack").mkdir()
+            (d / "M-00001-of-00001.gguf").write_bytes(b"x" * 30)
+            ref = d / "bench" / "ref"
+            ref.mkdir(parents=True)
+            for stem, size in (("M", 99), ("M.overlay", 30)):   # issue #15: stock files + an overlay, one name
+                (ref / f"{stem}.json").write_text(f'{{"gguf_bytes": {size}, "topk": "{stem}.topk", "ids": [1, 2]}}')
+                (ref / f"{stem}.topk").write_bytes(b"k")
+            sv = SimpleNamespace(child_env=lambda cfg: {}, engine_args=lambda cfg: [])
+            out = A.subprocess.CompletedProcess([], 0, "SCORE 2 tokens: nll 1.0 top1 50.0% KL 0.004 (max 0.1), "
+                                                       "same top token 99.0%", "")
+            with patch.object(A, "ROOT", d), patch.object(A.subprocess, "run", return_value=out) as run:
+                q = A.bench_quality({"exe": "strata"}, d / "pack", sv)
+            self.assertEqual(q["verdict"], "OK")
+            self.assertTrue(run.call_args.kwargs["env"]["STRATA_GLM_SCORE_TOPK"].endswith("M.overlay.topk"))
+            (d / "M-00001-of-00001.gguf").write_bytes(b"x" * 31)                      # neither copy
+            with patch.object(A, "ROOT", d):
+                self.assertIn("skipped", A.bench_quality({"exe": "strata"}, d / "pack", sv))
+
 
 if __name__ == "__main__":
     unittest.main()

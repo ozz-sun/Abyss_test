@@ -45,6 +45,7 @@ Nothing is installed system-wide: a missing tool is reported with the command th
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
@@ -2729,9 +2730,15 @@ def bench_quality(cfg: dict, pack: Path | None, SV) -> dict | None:
     top-k log-probs the same model gave on a known-good run (tools/bench_ref.py): KL near 0 = this PC computes what
     that one did; a broken kernel on this GPU shows up as a large KL (issue #9).  None: no reference for this model."""
     name, size = model_key(pack)
-    ref = ROOT / "bench" / "ref" / f"{name}.json"
-    if not name or not ref.exists():
+    if not name:
         return None
+    # <model>.json, then the other copies' references, <model>.<variant>.json (issue #15: the stock files and an
+    # overlay of them share a name): the one made from files of this size
+    d = ROOT / "bench" / "ref"
+    refs = [p for p in [d / f"{name}.json"] + sorted(d.glob(f"{glob.escape(name)}.*.json")) if p.exists()]
+    if not refs:
+        return None
+    ref = next((p for p in refs if read_json(p).get("gguf_bytes") in (None, size)), refs[0])
     r = read_json(ref)
     topk = ref.with_name(r.get("topk") or f"{name}.topk")
     if r.get("gguf_bytes") not in (None, size) or not topk.exists() or not r.get("ids"):
@@ -2962,7 +2969,12 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
     if quality and quality.get("lossy_off"):
         lines.append(f"  (scored without this setup's {', '.join(quality['lossy_off'])}: they change the numbers on "
                      "purpose)")
-    if quality and "kl" in quality and quality["verdict"] != "OK":
+    if quality and "kl" in quality and quality["verdict"] == "slightly off":
+        # issue #15: a smaller GPU leaves more experts to the CPU lane, which rounds differently from the GPU (GLM on
+        # 16 GB here: KL 0.000 -> 0.025) - expected, not a fault
+        lines.append("  slightly off is expected when the CPU lane computes many experts (a GPU of 16 GB or less): it "
+                     "rounds differently from the GPU the reference ran on")
+    if quality and "kl" in quality and quality["verdict"] == "OFF":
         lines.append("  a large KL means this PC computes something the known-good run did not - please report it")
     lines += ["", "<details><summary>engine lines</summary>", "", "```"] + \
              [x.replace(str(Path.home()), "~") for x in stats[-40:]] + ["```", "", "</details>"]

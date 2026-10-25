@@ -2,13 +2,15 @@
 """tools/bench_ref.py - the quality check's reference for one model: `./abyss.sh --bench` scores the same tokens
 on another PC and compares (KL) its log-probs with these.
 
-    .venv/bin/python tools/bench_ref.py <config.json> [--tokens 512] [--k 32] [--check]
+    .venv/bin/python tools/bench_ref.py <config.json> [--tokens 512] [--k 32] [--check] [--variant <tag>]
 
 Runs the config's engine on a known-good PC in the score mode (STRATA_GLM_SCORE, teacher-forced through the one-token
 decode path), keeps each position's top-k log-probs and writes bench/ref/<model>.json (the token ids, the GGUF set's
 size, the score) and bench/ref/<model>.topk (the engine's STRATA_GLM_SCORE_TOPK format: int32 k, then per scored
 position k int32 ids, best first, and their k float32 log-probs).  <model> is the GGUF set's name without its shard
-suffix (abyss.model_key), so a copy with other files - another quant - finds no reference.  --check scores once more
+suffix (abyss.model_key), so a copy with other files - another quant - finds no reference.  --variant <tag> writes
+bench/ref/<model>.<tag>.json / .topk instead, for a second copy under the same name (an overlay of the stock files):
+the check picks the reference whose GGUF size matches.  --check scores once more
 against the new reference (the KL should be ~0: the run-to-run floor).
 
 The text is the start of README.md and README.ja.md, English then Japanese; its token ids are stored, so later edits
@@ -35,6 +37,7 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=512)
     ap.add_argument("--k", type=int, default=32)
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--variant", default="", help="write <model>.<variant>.json: another copy under the same name")
     a = ap.parse_args()
     import numpy as np
     import abyss as A
@@ -80,7 +83,8 @@ def main() -> int:
         lp = lp.reshape(n, -1)
         top = np.argsort(-lp, axis=1)[:, :a.k].astype(np.int32)
         val = np.take_along_axis(lp, top, axis=1).astype(np.float32)
-    topk = out / f"{name}.topk"
+    stem = f"{name}.{a.variant}" if a.variant else name
+    topk = out / f"{stem}.topk"
     with open(topk, "wb") as f:
         np.array([a.k], dtype=np.int32).tofile(f)
         for i in range(n):
@@ -92,8 +96,8 @@ def main() -> int:
     ref = {"model": name, "gguf_bytes": size, "dense_bytes": dense.stat().st_size if dense.exists() else 0, "skip": 0, "k": a.k, "topk": topk.name, "ids": ids,
            "nll": float(m.group(1)), "top1": float(m.group(2)),
            "made_with": f"Abyss v{(ROOT / 'VERSION').read_text().strip()}, {gpu}, {Path(a.config).name}"}
-    (out / f"{name}.json").write_text(json.dumps(ref) + "\n", encoding="utf-8")
-    print(f"written: {out / (name + '.json')} and {topk.name} ({os.path.getsize(topk) / 1024:.0f} KB)")
+    (out / f"{stem}.json").write_text(json.dumps(ref) + "\n", encoding="utf-8")
+    print(f"written: {out / (stem + '.json')} and {topk.name} ({os.path.getsize(topk) / 1024:.0f} KB)")
     if a.check:
         print("check:", score({"STRATA_GLM_SCORE_TOPK": str(topk)}))
     return 0

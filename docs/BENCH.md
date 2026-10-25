@@ -28,7 +28,7 @@ What it runs, through the engine alone (the way the dashboard starts it):
 | step | what | why |
 |---|---|---|
 | decode | three fixed questions, 256 tokens each, greedy, thinking off (after one warm-up answer) | the same work on every PC, so tok/s compare |
-| prefill | prompts of 2k and 8k tokens of the Abyss docs (32k with `--full`) | prompt reading speed |
+| prefill | prompts of 2k and 8k tokens of the Abyss docs (32k with `--full`) | prompt reading speed; on a model that does not fit GPU + RAM, each prompt reads the disk-only experts once whatever its length, so 2k can read slower per token than 8k (issue #15) |
 | counters | the engine's per-request line (`glm stat`) of each answer | where a token's time goes |
 | PCIe | the GPU's link, read while the engine works | links drop to Gen1 when idle, so an idle reading lies |
 | SSD | 2 GB of the model's own GGUF, read from the disk (past the page cache) | the speed the engine's SSD tier gets |
@@ -119,6 +119,10 @@ top-32 log-probs with those the same model gave on our PC (`bench/ref/<model>.js
 varies run to run, and the two round differently); another GPU's arithmetic adds a little. **OK** is up to 0.02,
 **slightly off** up to 0.05, **OFF** above - then this PC computes something the known-good run did not (a kernel bug
 on that GPU, issue #9 style): please report it.
+
+**slightly off** is expected on a smaller GPU: the references were made on a 32 GB card, and a 16 GB one leaves many
+more experts to the CPU lane, which rounds differently (issue #15; here, GLM-5.3 Maya-S-v2 limited to 16 GB: KL 0.000
+-> 0.025, V4.1 UD-IQ2_XXS: 0.008 -> 0.012). Only **OFF** points to a fault.
 
 - The check needs the same model files: another quant, or a pack with an overlay (`tools/dense_overlay.py`), says
   "skipped" instead.
