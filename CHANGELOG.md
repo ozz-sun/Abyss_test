@@ -7,6 +7,30 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.54 - 2026-10-25
+
+**Bug fixes: the HIP iGPU lane on a PC with no iGPU (issue #11), ROCm 7.2.1 with the lane, RDNA3 grid padding (issue
+#9); a docs correction.**
+
+- HIP: the iGPU lane stays off unless an integrated GPU other than the engine's own card is visible. With one discrete
+  Radeon (an RX 9070 XT, the APU's iGPU off in the BIOS) the lane library fell back to device 0 - the engine's own
+  card - and its calls ran 27-62 ms late; the user measured `STRATA_GLM_IGPU=0` +30-50% decode (issue #11). The CPU
+  lane computes instead; with `STRATA_GLM_IGPU=1` the log says why the lane is off.
+- ROCm 7.2.1: with the lane on, every request ended "kernel launch(es) failed". The lane's failed `hipHostRegister`
+  left its error as the thread's last one, the engine's next launch check counted it, and that count is never reset.
+  The lane and the engine's lane-off path now clear the error. The lane also takes ROCm 7.2's "invalid argument" on a
+  range the engine already pinned as "already registered" when the range is mapped (not checkable here: no 7.2.1).
+  ROCm 7.2.1 runs with `STRATA_GLM_IGPU=0` (Ornith 32-35 tok/s against ~39 on ROCm 10, the user's report).
+- HIP grid padding: off by default on gfx11 (issue #9, RX 7900 XT: no TheRock#9300 stall there, the padding within
+  noise); `STRATA_GLM_GRID_PAD=1` forces it on.
+- DeepSeek V4.1: a shard holding only the Engram table may be left undownloaded when `--engram` names another GGUF with
+  the same table (iq_pack.py skips it, the engine skips a missing shard when engram.txt is there): orcarouter's
+  abliterated Mix-256G shard 00002 is unsloth's IQ4_NL table byte for byte, 110.6 GB not downloaded twice.
+- Docs: v1.3.53 called ISTA's IQ2_XXS the best quality per GB; it compared ISTA's size without the Engram table
+  against unsloth's with it. Without the table UD-IQ1_M is 139.5 GB at KL 0.27 against IQ2_XXS's 138 GB at 0.31.
+  README corrected. docs/MODELS: issue #11's rows (V4.1 ISTA IQ2_XXS and Ornith on a 16 GB RX 9070 XT, lane on / off,
+  ROCm 7.2.1), the #8 rows marked as measured with the lane bug, and the first `--gpu-tune` report (issue #10).
+
 ## v1.3.53 - 2026-10-24
 
 **DeepSeek V4.1: ISTA-DASLab's GSQ-RCO GGUFs, the Lucebox DSpark drafter (opt-in), the abliteration edit at run time;

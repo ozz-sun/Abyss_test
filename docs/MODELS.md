@@ -144,6 +144,9 @@ tables above.
 | #8 | same | v1.3.44 / v1.3.46 | same | `TAIL_SKIP=3` + `_DISK=1` (KL not measured on V4; 0.229 -> 0.241 on V4.1) | 23.7-24.1; 29-31 as a topic goes on (v1.3.46's RAM fill: 40% fewer skips, same speed) |
 | #8 | same | v1.3.44 | GLM Maya-S-v2 IQ2_XXS | defaults | 10.3-10.6 |
 | #8 | same | v1.3.46 | Ornith UD-Q4_K_XL / UD-IQ3_XXS | `TAIL_SKIP=3` + `_DISK=1` (KL not measured), NextN (the build with the bug fixed in v1.3.49), no iGPU | prose 20.8 / 21.9, code 25-29 / 34-39 |
+| #11 | same box (the 7800X3D's iGPU off in the BIOS, PCIe Gen5 x16), Linux (ROCm 10 container) | v1.3.53 | V4.1 1017 ISTA GSQ-RCO IQ2_XXS, 128K, `RAM_GB=44` | `TAIL_SKIP=3` + `_DISK=1`; the lane on (the bug) / `STRATA_GLM_IGPU=0` | cold 18.3 / 26.3; same topic 22.9-24.0 / 31.3-31.5; new topic 17.7-17.9 / 18.7-20.9; after a 10K prompt 18.0 / 20.3 |
+| #11 | same | v1.3.53 | Ornith UD-IQ3_XXS, 128K, no thinking | the lane on (the bug) / `STRATA_GLM_IGPU=0` | 25.9-28.0 / 39.1-39.3 |
+| #11 | same, ROCm 7.2.1 container (`ABYSS_OLD_ROCM=1`) | v1.3.53 | Ornith UD-IQ3_XXS | `STRATA_GLM_IGPU=0` (with the lane on 7.2.1 failed every request: fixed in v1.3.54) | 32-35 (short answers) |
 | #5 | RX 7900 XT 20 GB + i7-14700K + 128 GB DDR4, Windows 11 (TheRock 7.14.1) | v1.3.30 -> v1.3.46 | V4 0731 UD-Q2_K_XL, 64K | `TAIL_SKIP=0` | 13.71 -> 12.56 |
 | #5 | same | v1.3.30 -> v1.3.46 | same | `TAIL_SKIP=1`, `LANE=8`, `PIN=0-15` (KL not measured; a large quality change) | 28.20 -> 32.86 |
 | #5 | same | v1.3.30 -> v1.3.46 | same, 256K | `TAIL_SKIP=4` (KL 0.0226, measured on the 5090) | 17.77 -> 16.40 |
@@ -154,6 +157,10 @@ tables above.
 | #1 | same | v1.3.31 | same, 393K context | defaults | a 291K prompt read at 279 tok/s, decode 19.5 |
 | #1 | same | v1.3.35 / v1.3.37 / v1.3.42 | V4.1 nazeshinjite Q2, 80 GB RAM tier | `TAIL_SKIP=3` + `_DISK=1` (KL 0.241) | 24-28 / 30.5 / 22-25; 8K prompt 42-48 -> 60 (v1.3.42) |
 
+The #8 rows and #11's "lane on" ones were measured with the iGPU lane wrongly running on the 9070 XT itself (no
+iGPU visible, the lane fell back to the engine's card: issue #11, fixed in v1.3.54). With it off V4.1 is about 30%
+faster and Ornith 40-50%.
+
 `./abyss.sh --gpu-tune` reports (the dense Q6_K GEMV, a call's total in us; lower is faster):
 
 | issue | GPU | Abyss | 4 warps / a warp a row | the engine's choice |
@@ -162,7 +169,10 @@ tables above.
 
 ### What the reports say
 
-- A 16 GB card with 64 GB of RAM (#8) runs V4 0731 at ~18 tok/s without TAIL_SKIP. No V4.1 report on such a PC yet.
+- A 16 GB card with 64 GB of RAM (#8) runs V4 0731 at ~18 tok/s without TAIL_SKIP (the lane-on bug included), and
+  V4.1's ISTA IQ2_XXS at 19-31 tok/s with TAIL_SKIP=3 (#11, the lane off).
+- ROCm 7.2.1 runs (Ornith 32-35 tok/s against ~39 on ROCm 10 on the same box, #11); setup still asks for ROCm 10 and
+  `ABYSS_OLD_ROCM=1` overrides it.
 - With 128 GB of RAM (#1, #5) V4.1's Q2 runs too; the SSD and the RAM tier's size set its speed.
 - `TAIL_SKIP=1` / `=2` speeds come from settings whose KL nobody measured. To compare quality, use `=3` (V4.1, with
   `_DISK=1`) or `=4` and above.

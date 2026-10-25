@@ -71,7 +71,7 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 | | unsloth の [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（v1.3.38）、UD-IQ1_M | 233 / 266 GB | 計測済み: 速いが品質は下がる（KL 0.36 / 0.27） |
 | | mrfakename の Q2_K、Lucebox の dense + Engram と mrfakename の expert の組み合わせ（ハイブリッド） | 247 / 201 GB | 動作確認済み: 単体では低品質 / 最も正確だが遅い |
 | | unsloth のほかの量子化、Project Maya の Maya-S | 178〜508 GB | UD-IQ1_S と同じ形式、未確認 |
-| | ISTA-DASLab の [GSQ-RCO](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) IQ2_XXS / IQ1_M（v1.3.53、Engram の表は別の GGUF） | 138 / 121 GB | AI PRO R9700 で計測済み: KL 0.31 / 0.38。IQ2_XXS は測った中でサイズあたりの品質が最も高い |
+| | ISTA-DASLab の [GSQ-RCO](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) IQ2_XXS / IQ1_M（v1.3.53、Engram の表は別の GGUF） | 138 / 121 GB | AI PRO R9700 で計測済み: KL 0.31 / 0.38。サイズは Engram の表を除いた値。表を除くと UD-IQ1_M は 139.5 GB で KL 0.27 なので、同じサイズなら unsloth のほうが良い（v1.3.53 で「サイズあたりの品質が最も高い」と書いたのは、表を含むサイズと含まないサイズを比べた誤り） |
 | | Lucebox の DSpark ドラフトモデル DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf（`STRATA_DS4_DSPARK=<ファイル>`、v1.3.53） | 4.9 GB | AI PRO R9700 で計測済み: swe-bench +16%。約 3.4 GB/s の SSD では効果なし |
 | | mrfakename の abliteration の編集（`STRATA_GLM_ABL`、または `tools/dense_overlay.py --abl` のオーバーレイ） | 43 KB | 計測済み: 16 問中 12 問の拒否が 0 に、KL +0.002 |
 | Ornith-1.5-122B（Qwen3.5-MoE、[docs/ornith](docs/ornith/README.md)） | unsloth の [UD-Q4_K_XL](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF)（v1.3.46） | 79.7 GB | AI PRO R9700 で計測済み: 42 tok/s、llama.cpp との KL 0.024。NVIDIA はビルドのみ、未計測 |
