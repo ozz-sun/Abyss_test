@@ -70,8 +70,8 @@ The benchmark names the likely bottleneck from those counters (rules of thumb, c
 | verdict | rule | what moves it |
 |---|---|---|
 | **ssd** | SSD waits >= 25% of a token | a smaller quant that fits GPU + RAM, more RAM for the RAM tier (`STRATA_GLM_RAM_GB`), a faster SSD |
-| **cpu** | the lane busy >= 80% of a token | `./abyss.sh --calibrate` (the lane's share and threads), the CPU's power mode, the iGPU lane on a Radeon APU |
-| **pcie** | >= 10 experts a token copied over PCIe | a better slot (Gen4 x16 carries 4x an x4 / OCuLink link), `--calibrate` |
+| **cpu** | the lane busy >= 80% of a token | `./abyss.sh --calibrate` (the lane's share and threads; AMD: the sweep's best share as `STRATA_GLM_PCIE_SHARE`), the CPU's power mode, the iGPU lane on a Radeon APU |
+| **pcie** | >= 10 experts a token copied over PCIe | a better slot (Gen4 x16 carries 4x an x4 / OCuLink link), `--calibrate` (AMD: `STRATA_GLM_PCIE_SHARE`) |
 | **gpu** | none of the above (or, with `--deep` and no drafter, the GPU busy >= 85%) | `./abyss.sh --gpu-tune`, and a report: the kernels for this GPU may have room |
 
 An SSD-bound run (DeepSeek V4.1 Flash 1017 UD-IQ2_XXS, 300 GB, on the same PC) reads like this:
@@ -89,7 +89,9 @@ host between tokens) are what is left to speed up. That is where a report from a
 ### `--deep`: the share sweep
 
 The engine splits the experts that are not in GPU memory between the lane (computed on the CPU / iGPU, from RAM) and
-PCIe (copied to the GPU). `--deep` answers the same question at five shares:
+PCIe (copied to the GPU). `--deep` answers the same question at five shares, with the engine's own share before and
+after them (the sweep runs last, on warmer tiers and shorter answers than the decode above, so it is compared with
+those two runs, not with the decode):
 
 ```
   share 0.00:   58.4 tokens/s  <- fastest
@@ -99,7 +101,8 @@ PCIe (copied to the GPU). `--deep` answers the same question at five shares:
   the engine's own choice is already the fastest; share 1.00 is 4.8x slower - PCIe is the narrow path here
 ```
 
-- The fastest share well above the engine's own speed: `./abyss.sh --calibrate` sets it for this PC.
+- The fastest share well above the engine's own share: `./abyss.sh --calibrate` sets it for this PC on NVIDIA; on
+  AMD (`--calibrate` is CUDA-only) put it in the config's `"env"` as `"STRATA_GLM_PCIE_SHARE": "<share>"`.
 - The engine already the fastest, and the curve steep: one path is much narrower - here PCIe (Gen4 x4 over OCuLink):
   every expert moved to it costs more than the lane's work.
 - A flat curve: neither PCIe nor the lane limits the speed; look at the GPU (or the SSD).

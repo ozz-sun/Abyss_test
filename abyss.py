@@ -2470,6 +2470,30 @@ BENCH_ADVICE = {
     "gpu": ("the GPU itself: the memory tiers keep up",
             f"{ME} --gpu-tune, and a report with this file: the kernels for this GPU may have room"),
 }
+# --calibrate measures the CUDA engine's lane only (issue #14): on HIP the advice names the setting itself
+BENCH_ADVICE_HIP = {
+    "cpu": f"{ME} --bench --deep's share sweep, then its best share as STRATA_GLM_PCIE_SHARE in the config's \"env\" "
+           "(--calibrate is CUDA-only), the CPU's power mode; on a PC with a Radeon iGPU the iGPU lane",
+    "pcie": "the GPU's slot (Gen4 x16 moves 4x what an x4 / OCuLink link does), STRATA_GLM_PCIE_SHARE in the config's "
+            "\"env\" (moves the share to the CPU lane; --bench --deep's sweep shows the best one)",
+}
+
+
+def plan_share(log_lines) -> float | None:
+    """The PCIe share the engine started with, from its CPU-lane line ("of 0..8 RAM-tier experts the CPU takes
+    k0 .. k8"): the sweep's share that gives the same plan (k = f - round(share f), as set_pcie_share builds it), else
+    the mean over f = 1..8 of (f - k) / f, as Glm5Model::pcie_share computes it; 1.0 with the lane off."""
+    for x in log_lines:
+        m = re.search(r"of 0\.\.8 RAM-tier experts the CPU takes((?: \d+){9})", x)
+        if m:
+            ks = [int(v) for v in m.group(1).split()]
+            for share in (0.0, 0.25, 0.5, 0.75, 1.0):
+                if all(ks[f] == f - math.floor(share * f + 0.5) for f in range(9)):
+                    return share
+            return sum((f - ks[f]) / f for f in range(1, 9)) / 8.0
+        if "CPU lane off" in x:
+            return 1.0
+    return None
 
 
 def bench_verdict(recs, lane_name: str = "CPU lane") -> tuple:
@@ -2800,7 +2824,7 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
         env["STRATA_GLM_GAP_PROF"] = "1"
     step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
     t0 = time.time()
-    shares = []
+    shares, own = [], []
     with open(log_path, "w", encoding="utf-8") as log:
         p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=log, text=True, env=env,
@@ -2841,11 +2865,18 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
                 say(f"  prefill {results[-1][2]:6.0f} tokens/s   a {n}-token prompt")
         if deep:                                            # what moves the speed: the missed experts' PCIe share
             say("  the PCIe / CPU-lane share (0 = every missed expert on the CPU lane, 1 = all copied to the GPU):")
-            for s in (0.0, 0.25, 0.5, 0.75, 1.0):
-                f = gen(chat(BENCH_TOPICS[0]), 128, f"pcie_frac={s} ")
+            # the engine's own share before and after the five, under the same conditions (issue #14: the sweep runs
+            # last, on warmer tiers and shorter answers than the decode above, so it is compared with these)
+            for s in (None, 0.0, 0.25, 0.5, 0.75, 1.0, None):
+                f = gen(chat(BENCH_TOPICS[0]), 128, "" if s is None else f"pcie_frac={s} ")
                 if f[0] == "DONE" and float(f[4]) > 0:
-                    shares.append((s, int(f[1]) / float(f[4]) * 1000.0))
-                    say(f"    share {s:.2f}: {shares[-1][1]:6.1f} tokens/s")
+                    v = int(f[1]) / float(f[4]) * 1000.0
+                    if s is None:
+                        own.append(v)
+                        say(f"    the engine's own share: {v:6.1f} tokens/s")
+                    else:
+                        shares.append((s, v))
+                        say(f"    share {s:.2f}: {v:6.1f} tokens/s")
         links = watch.stop()
         p.stdin.write("QUIT\n")
         p.stdin.flush()
@@ -2896,17 +2927,30 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
     lines += ["", "where a token's time goes (the engine's counters, decode answers):"] + [f"- {x}" for x in evidence]
     if verdict:
         what, moves = BENCH_ADVICE[verdict]
+        if cfg.get("backend") == "hip":
+            moves = BENCH_ADVICE_HIP.get(verdict, moves)
         lines += [f"- likely bottleneck: {what}", f"- what moves it: {moves}"]
     if shares:
         best = max(shares, key=lambda x: x[1])
         lines += ["", "PCIe / CPU-lane share sweep (--deep; 0 = all missed experts on the CPU lane, 1 = all over PCIe):"]
         lines += [f"  share {s:.2f}: {v:6.1f} tokens/s" + ("  <- fastest" if (s, v) == best else "")
                   for s, v in shares]
-        now = _mean(r["ms"] for r in dec_recs)
-        now = 1000.0 / now if now > 0 else _mean(dec)
+        start = plan_share(log_lines)
+        if own:
+            now = _mean(own)
+            lines.append(f"  the engine's own share{f' (~{start:.2f})' if start is not None else ''}: {now:6.1f} "
+                         f"tokens/s, the same answer before and after the sweep ({' / '.join(f'{v:.1f}' for v in own)})")
+            if len(own) == 2 and abs(own[0] - own[1]) > 0.1 * now:
+                lines.append("  (its two runs differ by more than 10%: the tiers were still warming, so read gaps of "
+                             "that size between the shares as noise)")
+        else:                                                # (no own-share runs: the decode answers above)
+            now = _mean(r["ms"] for r in dec_recs)
+            now = 1000.0 / now if now > 0 else _mean(dec)
         if best[1] > 1.05 * now:
-            lines.append(f"  share {best[0]:.2f} beats the engine's own choice ({now:.1f} tokens/s): {ME} --calibrate "
-                         "sets it for this PC")
+            how = (f"set \"STRATA_GLM_PCIE_SHARE\": \"{best[0]:.2f}\" in {cfg_path.name}'s \"env\" (--calibrate is "
+                   "CUDA-only)" if cfg.get("backend") == "hip" else
+                   f"{ME} --calibrate sets it for this PC (or STRATA_GLM_PCIE_SHARE={best[0]:.2f} in the config's \"env\")")
+            lines.append(f"  share {best[0]:.2f} beats the engine's own choice ({now:.1f} tokens/s): {how}")
         elif max(v for _, v in shares) > 1.25 * min(v for _, v in shares):
             slow = min(shares, key=lambda x: x[1])
             lines.append(f"  the engine's own choice is already the fastest; share {slow[0]:.2f} is "

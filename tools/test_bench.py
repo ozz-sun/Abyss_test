@@ -35,6 +35,20 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(recs[1]["ms"], 30.0)
         self.assertNotIn("spec", recs[1])
 
+    def test_plan_share_from_the_cpu_lane_line(self):
+        line = ("glm fast: CUDA0 CPU lane: 10 threads, an expert 0.357 ms on the CPU vs 0.322 ms over PCIe -> of 0..8 "
+                "RAM-tier experts the CPU takes {}")
+        self.assertEqual(A.plan_share([line.format("0 0 1 1 2 2 3 3 4")]), 0.5)    # issue #14: what share 0.5 gives
+        self.assertEqual(A.plan_share([line.format("0 1 1 2 3 4 4 5 6")]), 0.25)
+        self.assertAlmostEqual(A.plan_share([line.format("0 1 2 2 3 4 4 5 6")]), 0.2065, places=3)  # no sweep share
+        self.assertEqual(A.plan_share(["glm fast: CUDA0 CPU lane off: an expert 0.5 ms on the CPU vs 0.1 ms"]), 1.0)
+        self.assertIsNone(A.plan_share(["glm fast: loaded"]))
+
+    def test_hip_advice_does_not_name_calibrate_as_the_fix(self):
+        for k in ("cpu", "pcie"):
+            self.assertIn("STRATA_GLM_PCIE_SHARE", A.BENCH_ADVICE_HIP[k])
+            self.assertIn("CUDA-only", A.BENCH_ADVICE_HIP["cpu"])
+
     def test_verdicts(self):
         self.assertEqual(A.bench_verdict([stat(disk_ms=8.0)])[0], "ssd")
         self.assertEqual(A.bench_verdict([stat(lane_ms=18.0)])[0], "cpu")

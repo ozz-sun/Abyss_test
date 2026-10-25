@@ -64,8 +64,8 @@ Gen5 x16 | RAM 94 GB | SSD 4.9 GB/s | decode 56.4 tok/s | prompt 8k 960 tok/s | 
 | 判定 | 規則 | 速くする方法 |
 |---|---|---|
 | **ssd** | SSD の待ちが 1 トークンの 25% 以上 | GPU + RAM に収まる小さい量子化、RAM の層を増やす（`STRATA_GLM_RAM_GB`）、速い SSD |
-| **cpu** | レーンの稼働が 1 トークンの 80% 以上 | `./abyss.sh --calibrate`（レーンの分担とスレッド数）、CPU の電源モード、Radeon APU なら iGPU レーン |
-| **pcie** | 1 トークンで 10 個以上のエキスパートを PCIe で送っている | もっと良いスロット（Gen4 x16 は x4 / OCuLink の 4 倍運べる）、`--calibrate` |
+| **cpu** | レーンの稼働が 1 トークンの 80% 以上 | `./abyss.sh --calibrate`（レーンの分担とスレッド数。AMD では振り分けで一番速かった分担率を `STRATA_GLM_PCIE_SHARE` に）、CPU の電源モード、Radeon APU なら iGPU レーン |
+| **pcie** | 1 トークンで 10 個以上のエキスパートを PCIe で送っている | もっと良いスロット（Gen4 x16 は x4 / OCuLink の 4 倍運べる）、`--calibrate`（AMD では `STRATA_GLM_PCIE_SHARE`） |
 | **gpu** | 上のどれでもない（または `--deep` でドラフトモデルなしのとき、GPU の稼働率が 85% 以上） | `./abyss.sh --gpu-tune` と報告。この GPU 用のカーネルに改善の余地があるかもしれない |
 
 SSD で詰まっている例です（同じ PC で DeepSeek V4.1 Flash 1017 UD-IQ2_XXS、300 GB）。
@@ -81,7 +81,7 @@ SSD で詰まっている例です（同じ PC で DeepSeek V4.1 Flash 1017 UD-I
 
 ### `--deep`：分担率の振り分け
 
-GPU メモリにないエキスパートを、エンジンは 2 つの道に振り分けます。レーン（RAM から読んで CPU / iGPU で計算）と、PCIe（GPU に送って計算）です。`--deep` は、この分担率を 5 段階に変えて、同じ質問に答えさせます。
+GPU メモリにないエキスパートを、エンジンは 2 つの道に振り分けます。レーン（RAM から読んで CPU / iGPU で計算）と、PCIe（GPU に送って計算）です。`--deep` は、この分担率を 5 段階に変えて、同じ質問に答えさせます。その前後に 1 回ずつ、エンジン自身が選んだ分担率でも答えさせます。振り分けはベンチの最後に回るので、RAM の層が温まっていて、回答も短くなります。そのため、上の生成速度ではなく、同じ条件で測ったこの 2 回と比べます。
 
 ```
   share 0.00:   58.4 tokens/s  <- fastest
@@ -91,7 +91,7 @@ GPU メモリにないエキスパートを、エンジンは 2 つの道に振�
   the engine's own choice is already the fastest; share 1.00 is 4.8x slower - PCIe is the narrow path here
 ```
 
-- 一番速い分担率が、エンジンの既定の速度をはっきり上回る：`./abyss.sh --calibrate` で、この PC 向けに設定できます。
+- 一番速い分担率が、エンジン自身の分担率をはっきり上回る：NVIDIA なら `./abyss.sh --calibrate` で、この PC 向けに設定できます。AMD では `--calibrate` が使えないので、config の `"env"` に `"STRATA_GLM_PCIE_SHARE": "<分担率>"` を書いてください。
 - エンジンの既定がすでに最速で、変化が急：片方の道がずっと細いということです。この例では PCIe（OCuLink 経由の Gen4 x4）で、エキスパートを 1 つ PCIe に回すたびに、レーンで計算するより時間がかかります。
 - 変化がほとんどない：PCIe もレーンも速度を決めていません。GPU（か SSD）を見てください。
 
